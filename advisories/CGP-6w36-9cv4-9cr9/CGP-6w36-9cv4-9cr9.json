@@ -1,0 +1,48 @@
+{
+  "id": "CGP-6w36-9cv4-9cr9",
+  "schema_version": "1.6.0",
+  "summary": "Static synchronized getValidationProviderList() holds the JVM-wide class monitor across untrusted ServiceLoader iteration, enabling cross-tenant denial of service via a blocking provider constructor.",
+  "details": "### Root Cause\n\nIn `jakarta.validation.Validation`, the private inner class `GetValidationProviderListAction` declares its entry point as:\n\n```java\npublic static synchronized List<ValidationProvider<?>> getValidationProviderList() {  // L333\n```\n\nThe `static synchronized` modifier acquires the JVM-wide class monitor for `GetValidationProviderListAction.class`. The method body (lines 334–340) calls either `AccessController.doPrivileged(INSTANCE)` or `INSTANCE.run()` — both execute synchronously on the calling thread, so the class monitor is held for the entire duration of `run()`.\n\n`run()` (lines 347–374) reads the Thread Context ClassLoader (line 349) and, on a cache miss, calls `loadProviders(classloader)` (line 356). `loadProviders()` (lines 378–391) iterates a `ServiceLoader<ValidationProvider>` via `providerIterator.next()`, which invokes each declared provider's no-arg constructor. Only `ServiceConfigurationError` is caught; any blocking operation in a provider constructor (e.g., `Thread.sleep()`, an infinite loop, or network I/O) is not interrupted or bounded by any timeout mechanism.\n\nThere is no per-classloader lock striping. Even callers that would hit the cache (and return immediately) must first acquire the same global class monitor. The `clearCache()` method at line 342 is also `static synchronized` on the same monitor, meaning cache invalidation and provider discovery contend on the same global lock.\n\n### Affected Locations\n\n- `jakarta.validation.Validation.GetValidationProviderListAction.getValidationProviderList()` (line 333): the `static synchronized` declaration that acquires the JVM-wide class monitor and holds it across the full `ServiceLoader` iteration.\n\nThe cross-codebase hunt found one additional `static synchronized` method (`clearCache()` at line 342) on the same class monitor, confirming that cache invalidation also contends on the same global lock. No other `static synchronized` methods exist in the production source tree.\n\nThe taint path from an attacker-controlled META-INF/services entry to the global lock stall is:\n\n```\nattacker WAR META-INF/services/jakarta.validation.spi.ValidationProvider (lists EvilProvider)\n  → Thread TCCL set to attacker's webapp classloader\n    → getValidationProviderList() acquires class monitor [L333]\n      → run() [L347]\n        → loadProviders(tccl) [L356]\n          → ServiceLoader.iterator().next() [L383]\n            → EvilProvider constructor blocks indefinitely\n              → class monitor held indefinitely\n                → all other threads block on class monitor [L333]\n```\n\n### Attack Vectors\n\n**Cross-tenant denial of service via blocking provider constructor:**\nIn a multi-tenant container where `jakarta.validation-api` is loaded by a shared classloader (so all tenants resolve to the same `GetValidationProviderListAction.class` monitor), an attacker deploys a WAR containing a `META-INF/services/jakarta.validation.spi.ValidationProvider` entry listing a provider whose no-arg constructor blocks indefinitely (e.g., `Thread.sleep(Long.MAX_VALUE)` or a blocking network call). The first request into the attacker's webapp triggers `Validation.buildDefaultValidatorFactory()`; the thread enters the static monitor at line 333, calls `providerIterator.next()`, and never returns. Every other webapp's `Validation.buildDefaultValidatorFactory()` call blocks forever on the same monitor — cross-tenant denial of service with no privilege beyond the ability to deploy a WAR.\n\n- **Complexity:** single-step; attacker deploys a WAR with a blocking provider constructor\n- **Prerequisites:** `jakarta.validation-api` loaded by a classloader shared across tenants (so all tenants resolve to the same `GetValidationProviderListAction.class` monitor); attacker can deploy code reachable from some thread's TCCL (i.e., can deploy an application or plugin); victim tenants invoke default validation bootstrap after the attacker has entered the lock\n- **Targets:** availability of `Validation.buildDefaultValidatorFactory()` for all tenants sharing the same classloader\n\n**Benign-but-slow classloader robustness failure:**\nEven without a malicious actor, a provider whose constructor performs slow I/O (e.g., reading a remote configuration file) stalls all concurrent validation bootstrap calls across the JVM for the duration of that I/O, degrading availability under load.\n\n### Impact\n\n`getValidationProviderList()` is the only path into default provider resolution and is gated by a single JVM-global class monitor. A blocking provider constructor in any tenant's TCCL-visible classpath indefinitely stalls validation bootstrap for every other thread and tenant in the JVM. In multi-tenant application server deployments where `jakarta.validation-api` is in the shared lib/, this constitutes a cross-tenant availability weakness. Practical severity is low because the required deploy privilege already affords equivalent denial-of-service by simpler means; nonetheless it is a genuine cross-tenant availability weakness in shared-classloader contexts and a robustness issue for benign-but-slow classloaders.",
+  "severity": [
+    {
+      "type": "CVSS_V3",
+      "score": "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:C/C:N/I:N/A:L"
+    }
+  ],
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Maven",
+        "name": "jakarta.validation:jakarta.validation-api",
+        "purl": "pkg:maven/jakarta.validation/jakarta.validation-api"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "2.0.1"
+            },
+            {
+              "fixed": "4.0.0-M1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "cwe_ids": [
+          "CWE-557"
+        ],
+        "sink_locator": [
+          {
+            "class": "jakarta.validation.Validation.GetValidationProviderListAction",
+            "method": "getValidationProviderList()",
+            "file_line": "src/main/java/jakarta/validation/Validation.java:333"
+          }
+        ]
+      }
+    }
+  ],
+  "published": "2026-09-28T16:00:00Z",
+  "modified": "2026-09-28T16:00:00Z"
+}

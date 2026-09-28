@@ -1,0 +1,48 @@
+{
+  "id": "CGP-4p5c-894r-qqmc",
+  "schema_version": "1.6.0",
+  "summary": "PredicatedMap.readObject() restores the decorated map without re-validating entries against key/value predicates, allowing attacker-controlled streams to inject predicate-violating entries",
+  "details": "### Root Cause\n\n`PredicatedMap` in `org.apache.commons.collections4.map` decorates a `Map` to enforce key and value predicates on every entry. The class invariant is that every key-value pair satisfies the configured `keyPredicate` and `valuePredicate`. This invariant is enforced in the constructor (line 102: `map.forEach(this::validate)`) and in every mutator (`put`, `putAll`). However, the custom `readObject()` method at lines 155–158 of `src/main/java/org/apache/commons/collections4/map/PredicatedMap.java` does not re-validate restored entries:\n\n```java\nprivate void readObject(final ObjectInputStream in) throws IOException, ClassNotFoundException {\n    in.defaultReadObject();\n    map = (Map<K, V>) in.readObject(); // (1)\n}\n```\n\nAfter `in.defaultReadObject()` restores the `keyPredicate` and `valuePredicate` fields, and `in.readObject()` restores the decorated map, no code iterates over `map.entrySet()` to call `validate(e.getKey(), e.getValue())`. An attacker who controls the serialized byte stream can supply a map containing entries that violate the predicates.\n\n### Affected Locations\n\n- **`org.apache.commons.collections4.map.PredicatedMap.readObject(ObjectInputStream)`** (lines 155–158): Restores the decorated map from the stream without iterating over entries to re-invoke `validate(key, value)`. The constructor at line 102 performs this validation; `readObject` does not.\n\n### Attack Vectors\n\n**Vector 1 — Predicate-violating entry injection (documented PoC):**\nAn attacker crafts a serialized stream containing a `PredicatedMap` configured with `keyPredicate=NotNullPredicate` and a decorated map that contains a null key. After deserialization, the instance reports `containsKey(null) == true`, yet `put(null, ..)` still throws `IllegalArgumentException`. This is the documented PoC state: `keyPredicate=NotNullPredicate`, `containsKey(null)==true`, yet `put(null,..)` still throws. Downstream code that trusts the `PredicatedMap` type as a guarantee that all keys are non-null will silently operate on a map containing a null key.\n\n**Vector 2 — Logic-bug primitive for auth bypass / cache poisoning / TOCTOU:**\nApplications that deserialize a `PredicatedMap` and then skip validation because they trust the decorator's type contract (e.g., \"this came back as a `PredicatedMap<NotNull,NotNull>` so I don't need to null-check\") will silently process predicate-violating entries. For an attacker mapping an enterprise application, this is a logic-bug primitive that can turn a deserialization endpoint into auth bypass, cache poisoning, or TOCTOU without ever touching a gadget chain a JEP-290 filter would catch.\n\n### Impact\n\nIntegrity violation. A deserialized `PredicatedMap` can hold entries that its public type contract forbids. The application has no way to detect this without re-validating every entry, defeating the purpose of the decorator. Concrete downstream effects depend on the consuming code. The library-side defect is that `readObject()` restores the decorated map without re-asserting the constructor-time predicate validation. This is not remote code execution — no code executes during `readObject()`. The risk is downstream: applications that trust the `PredicatedMap` type as a correctness or security boundary will silently operate on predicate-violating state.\n\n### Trace\n\n1. Attacker supplies a crafted Java serialized byte stream to an application endpoint that deserializes `PredicatedMap`.\n2. Java's `ObjectInputStream.readObject()` is called on the stream.\n3. `PredicatedMap.readObject()` (line 155) calls `in.defaultReadObject()`, restoring `keyPredicate` and `valuePredicate` fields.\n4. `in.readObject()` (line 157) restores the decorated map, which may contain entries violating the predicates.\n5. No iteration over `map.entrySet()` occurs; `validate(key, value)` is never called for restored entries.\n6. The deserialized instance is returned to the application with predicate-violating entries.\n7. Downstream application code trusts the `PredicatedMap` type and skips validation, silently processing invalid entries.",
+  "severity": [
+    {
+      "type": "CVSS_V3",
+      "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:N"
+    }
+  ],
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Maven",
+        "name": "org.apache.commons:commons-collections4",
+        "purl": "pkg:maven/org.apache.commons/commons-collections4"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "4.0"
+            },
+            {
+              "fixed": "4.6.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "cwe_ids": [
+          "CWE-502"
+        ],
+        "sink_locator": [
+          {
+            "class": "org.apache.commons.collections4.map.PredicatedMap",
+            "method": "readObject(ObjectInputStream)",
+            "file_line": "src/main/java/org/apache/commons/collections4/map/PredicatedMap.java:155-158"
+          }
+        ]
+      }
+    }
+  ],
+  "published": "2026-09-28T16:00:00Z",
+  "modified": "2026-09-28T16:00:00Z"
+}

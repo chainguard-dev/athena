@@ -1,0 +1,1123 @@
+From d8dd23ab595340123a6cf7f799e254abb0d4b656 Mon Sep 28 16:00:00 2026
+From: Chainguard Bot <noreply@chainguard.dev>
+Date: Mon, 28 Sep 2026 16:00:00 +0000
+Subject: [PATCH] carry-forward:
+ 0001-fix-use-per-classloader-identity-keyed-cache-lock-in.patch
+
+Cgp-Finding: CGP-6w36-9cv4-9cr9
+---
+ .../java/jakarta/validation/Validation.java   | 226 ++++++-
+ .../BlockingValidationProvider.java           | 211 +++++++
+ .../ProviderResolutionLockExploitTest.java    | 585 ++++++++++++++++++
+ ...validation.spi.ValidationProvider-blocking |   2 +
+ 4 files changed, 1007 insertions(+), 17 deletions(-)
+ create mode 100644 src/test/java/jakarta/validation/BlockingValidationProvider.java
+ create mode 100644 src/test/java/jakarta/validation/ProviderResolutionLockExploitTest.java
+ create mode 100644 src/test/resources/META-INF/services/jakarta.validation.spi.ValidationProvider-blocking
+
+diff --git a/src/main/java/jakarta/validation/Validation.java b/src/main/java/jakarta/validation/Validation.java
+index c1c8581..cac9304 100755
+--- a/src/main/java/jakarta/validation/Validation.java
++++ b/src/main/java/jakarta/validation/Validation.java
+@@ -6,15 +6,19 @@
+  */
+ package jakarta.validation;
+ 
++import java.lang.ref.Reference;
++import java.lang.ref.ReferenceQueue;
+ import java.lang.ref.SoftReference;
++import java.lang.ref.WeakReference;
+ import java.security.AccessController;
+ import java.security.PrivilegedAction;
+ import java.util.ArrayList;
++import java.util.HashMap;
+ import java.util.Iterator;
+ import java.util.List;
++import java.util.Map;
+ import java.util.ServiceConfigurationError;
+ import java.util.ServiceLoader;
+-import java.util.WeakHashMap;
+ 
+ import jakarta.validation.bootstrap.GenericBootstrap;
+ import jakarta.validation.bootstrap.ProviderSpecificBootstrap;
+@@ -327,10 +331,32 @@ public class Validation {
+ 
+ 		//cache per classloader for an appropriate discovery
+ 		//keep them in a weak hash map to avoid memory leaks and allow proper hot redeployment
+-		private final WeakHashMap<ClassLoader, SoftReference<List<ValidationProvider<?>>>> providersPerClassloader =
+-				new WeakHashMap<>();
+-
+-		public static synchronized List<ValidationProvider<?>> getValidationProviderList() {
++		//
++		//CGP-6w36-9cv4-9cr9 (CWE-557 / CWE-697): the map is keyed by JVM reference IDENTITY of the
++		//classloader, NOT by ClassLoader.equals()/hashCode(). ClassLoader does not make those methods
++		//final, so an attacker who supplies their own ClassLoader subclass as their thread's TCCL (the
++		//same capability this weakness already relies on) could otherwise override equals()/hashCode()
++		//to alias an unrelated, well-behaved victim classloader's identity and read/poison the victim's
++		//cached provider list or steal its load lock. IdentityWeakClassLoaderMap uses == on the referent
++		//while keeping weak-reference GC semantics so a classloader is still collectible on hot redeploy.
++		private final IdentityWeakClassLoaderMap<SoftReference<List<ValidationProvider<?>>>> providersPerClassloader =
++				new IdentityWeakClassLoaderMap<>();
++
++		//CGP-6w36-9cv4-9cr9 (CWE-557): a per-classloader lock so that the potentially slow/blocking
++		//ServiceLoader iteration and provider-constructor execution for one classloader is serialized
++		//only against loads for the SAME classloader, never against unrelated classloaders (or cache
++		//reads/clears). We must never hold a lock that gates unrelated classloaders across loadProviders().
++		//Keyed by identity (see above) so a spoofing classloader cannot steal another classloader's lock;
++		//weak keys mirror providersPerClassloader so a classloader is never pinned in memory by its lock.
++		private final IdentityWeakClassLoaderMap<Object> loadLockPerClassloader = new IdentityWeakClassLoaderMap<>();
++
++		//Guards ONLY the fast, in-memory operations on providersPerClassloader and loadLockPerClassloader
++		//(the WeakHashMaps are not thread-safe for structural modification). It is held for the tiny
++		//duration of a get/put/clear and is NEVER held across loadProviders() / a provider constructor,
++		//so it cannot serialize unrelated classloaders behind a blocking provider constructor.
++		private final Object cacheLock = new Object();
++
++		public static List<ValidationProvider<?>> getValidationProviderList() {
+ 			if ( System.getSecurityManager() != null ) {
+ 				return AccessController.doPrivileged( INSTANCE );
+ 			}
+@@ -339,8 +365,13 @@ public class Validation {
+ 			}
+ 		}
+ 
+-		public static synchronized void clearCache() {
+-			INSTANCE.providersPerClassloader.clear();
++		public static void clearCache() {
++			// Cache invalidation touches only the shared maps under cacheLock; it must never wait on an
++			// unrelated classloader's in-progress (possibly blocking) provider load.
++			synchronized ( INSTANCE.cacheLock ) {
++				INSTANCE.providersPerClassloader.clear();
++				INSTANCE.loadLockPerClassloader.clear();
++			}
+ 		}
+ 
+ 		@Override
+@@ -353,7 +384,10 @@ public class Validation {
+ 				return cachedContextClassLoaderProviderList;
+ 			}
+ 
+-			List<ValidationProvider<?>> validationProviderList = loadProviders( classloader );
++			// Only cache the context-class-loader result if it actually yielded providers; an empty
++			// result means we fall back to Option #2, and (as in the original design) the empty
++			// intermediate result must NOT be cached, otherwise a later call would return it as a hit.
++			List<ValidationProvider<?>> validationProviderList = loadProvidersForClassloader( classloader, false );
+ 
+ 			// Option #2: if we cannot find any service files with the context class loader use the current class loader
+ 			if ( validationProviderList.isEmpty() ) {
+@@ -365,15 +399,67 @@ public class Validation {
+ 					// if already processed return the cached provider list
+ 					return cachedCurrentClassLoaderProviderList;
+ 				}
+-				validationProviderList = loadProviders( classloader );
++				// This is the final classloader we resolve against: cache its result (matching the
++				// original behaviour of caching the detected providers against the classloader in
++				// which they were found, even if empty).
++				validationProviderList = loadProvidersForClassloader( classloader, true );
+ 			}
+ 
+-			// cache the detected providers against the classloader in which they were found
+-			cacheValidationProviders( classloader, validationProviderList );
+-
+ 			return validationProviderList;
+ 		}
+ 
++		/**
++		 * Loads the providers for a single classloader, holding ONLY that classloader's own lock across
++		 * the (potentially slow/blocking) {@link #loadProviders(ClassLoader)} call. A load for a
++		 * different classloader uses a different lock object, so a blocking provider constructor in one
++		 * classloader can never stall provider resolution (or a cache read/clear) for another classloader
++		 * or tenant. The per-classloader lock also gives single-flight semantics: concurrent callers for
++		 * the same classloader do not redundantly re-run the ServiceLoader iteration, preserving the
++		 * per-classloader cache behaviour.
++		 *
++		 * @param cacheAlways when {@code true} the result is always cached against {@code classloader};
++		 *        when {@code false} the result is cached only if it is non-empty (so an empty
++		 *        context-class-loader result does not poison the cache before the current-class-loader
++		 *        fallback runs, matching the original resolution semantics).
++		 */
++		private List<ValidationProvider<?>> loadProvidersForClassloader(ClassLoader classloader, boolean cacheAlways) {
++			Object loadLock = getLoadLock( classloader );
++			synchronized ( loadLock ) {
++				// Re-check the cache under the per-classloader lock: another thread for THIS classloader
++				// may have populated it while we were waiting for the lock (single-flight).
++				List<ValidationProvider<?>> cached = getCachedValidationProviders( classloader );
++				if ( cached != null ) {
++					return cached;
++				}
++
++				// The slow / attacker-influenced ServiceLoader iteration happens here, guarded ONLY by
++				// this classloader's lock -- unrelated classloaders and clearCache() never contend on it.
++				List<ValidationProvider<?>> validationProviderList = loadProviders( classloader );
++
++				// cache the detected providers against the classloader in which they were found
++				if ( cacheAlways || !validationProviderList.isEmpty() ) {
++					cacheValidationProviders( classloader, validationProviderList );
++				}
++
++				return validationProviderList;
++			}
++		}
++
++		/**
++		 * Returns the dedicated lock object for {@code classloader}, creating it on first use. Runs under
++		 * {@link #cacheLock} only for the trivial map lookup/insert -- never across a provider load.
++		 */
++		private Object getLoadLock(ClassLoader classloader) {
++			synchronized ( cacheLock ) {
++				Object lock = loadLockPerClassloader.get( classloader );
++				if ( lock == null ) {
++					lock = new Object();
++					loadLockPerClassloader.put( classloader, lock );
++				}
++				return lock;
++			}
++		}
++
+ 		private List<ValidationProvider<?>> loadProviders(ClassLoader classloader) {
+ 			ServiceLoader<ValidationProvider> loader = ServiceLoader.load( ValidationProvider.class, classloader );
+ 			Iterator<ValidationProvider> providerIterator = loader.iterator();
+@@ -391,13 +477,119 @@ public class Validation {
+ 			return validationProviderList;
+ 		}
+ 
+-		private synchronized List<ValidationProvider<?>> getCachedValidationProviders(ClassLoader classLoader) {
+-			SoftReference<List<ValidationProvider<?>>> ref = providersPerClassloader.get( classLoader );
+-			return ref != null ? ref.get() : null;
++		private List<ValidationProvider<?>> getCachedValidationProviders(ClassLoader classLoader) {
++			// Fast in-memory read guarded by cacheLock only; establishes happens-before with the
++			// cacheValidationProviders() write on another thread. Never blocks on a provider load.
++			synchronized ( cacheLock ) {
++				SoftReference<List<ValidationProvider<?>>> ref = providersPerClassloader.get( classLoader );
++				return ref != null ? ref.get() : null;
++			}
++		}
++
++		private void cacheValidationProviders(ClassLoader classLoader, List<ValidationProvider<?>> providers) {
++			synchronized ( cacheLock ) {
++				providersPerClassloader.put( classLoader, new SoftReference<>( providers ) );
++			}
+ 		}
+ 
+-		private synchronized void cacheValidationProviders(ClassLoader classLoader, List<ValidationProvider<?>> providers) {
+-			providersPerClassloader.put( classLoader, new SoftReference<>( providers ) );
++		/**
++		 * A map keyed by the JVM reference IDENTITY of a {@link ClassLoader}, with weak keys so an
++		 * unreferenced classloader (and its associated value) can be garbage collected on hot
++		 * redeployment.
++		 * <p>
++		 * CGP-6w36-9cv4-9cr9 (CWE-557 / CWE-697): a plain {@code WeakHashMap<ClassLoader, V>} dispatches
++		 * lookups to the KEY's own {@link ClassLoader#equals(Object)} / {@link ClassLoader#hashCode()},
++		 * and {@code ClassLoader} does not declare either method {@code final}. An attacker who supplies
++		 * their own {@code ClassLoader} subclass as their thread context classloader (the exact capability
++		 * this weakness already relies on) could override those methods to alias an unrelated, well-behaved
++		 * victim classloader's identity, and thereby retrieve/share the victim's dedicated cache slot or
++		 * lock object — reintroducing the cross-classloader denial of service the per-classloader striping
++		 * was meant to eliminate. This map instead compares strictly by reference identity ({@code ==} /
++		 * {@link System#identityHashCode(Object)}), which an attacker cannot forge for an object it does
++		 * not itself hold a reference to.
++		 * <p>
++		 * A {@code null} classloader (the TCCL-is-null sentinel) is intentionally mapped to one single
++		 * shared slot, preserving the original {@code WeakHashMap} semantics that treat {@code null} as a
++		 * single value rather than a per-caller identity.
++		 * <p>
++		 * Not thread-safe on its own: every {@code get}/{@code put}/{@code clear} is performed by the
++		 * enclosing class under {@code cacheLock}, exactly as the replaced {@code WeakHashMap} was.
++		 */
++		private static final class IdentityWeakClassLoaderMap<V> {
++
++			//Weak, identity-comparing key wrapper. hashCode is captured at construction from the
++			//referent's identity hash so it stays stable even after the referent has been collected
++			//(WeakHashMap does the same via System.identityHashCode of the key at insert time).
++			private static final class IdentityWeakKey extends WeakReference<ClassLoader> {
++				private final int hash;
++
++				IdentityWeakKey(ClassLoader referent, ReferenceQueue<ClassLoader> queue) {
++					super( referent, queue );
++					this.hash = System.identityHashCode( referent );
++				}
++
++				@Override
++				public int hashCode() {
++					return hash;
++				}
++
++				@Override
++				public boolean equals(Object o) {
++					if ( this == o ) {
++						return true;
++					}
++					if ( !( o instanceof IdentityWeakKey ) ) {
++						return false;
++					}
++					ClassLoader mine = get();
++					ClassLoader theirs = ( (IdentityWeakKey) o ).get();
++					// Reference identity only; a collected referent (null) is never equal to another key
++					// unless it is literally the same key object (handled by the this == o check above).
++					return mine != null && mine == theirs;
++				}
++			}
++
++			private final Map<IdentityWeakKey, V> map = new HashMap<>();
++			private final ReferenceQueue<ClassLoader> staleKeys = new ReferenceQueue<>();
++			//single dedicated slot for the null-TCCL sentinel (preserves the original single-null-slot semantics)
++			private boolean hasNullValue;
++			private V nullValue;
++
++			V get(ClassLoader classLoader) {
++				if ( classLoader == null ) {
++					return hasNullValue ? nullValue : null;
++				}
++				expungeStaleEntries();
++				return map.get( new IdentityWeakKey( classLoader, null ) );
++			}
++
++			void put(ClassLoader classLoader, V value) {
++				if ( classLoader == null ) {
++					hasNullValue = true;
++					nullValue = value;
++					return;
++				}
++				expungeStaleEntries();
++				map.put( new IdentityWeakKey( classLoader, staleKeys ), value );
++			}
++
++			void clear() {
++				map.clear();
++				hasNullValue = false;
++				nullValue = null;
++				// drain the queue so previously-collected keys do not linger
++				while ( staleKeys.poll() != null ) {
++					// discard
++				}
++			}
++
++			//Remove entries whose classloader has been garbage collected, mirroring WeakHashMap's
++			//internal expunging so the map does not retain dead keys (and their values) indefinitely.
++			private void expungeStaleEntries() {
++				for ( Reference<? extends ClassLoader> stale; ( stale = staleKeys.poll() ) != null; ) {
++					map.remove( stale );
++				}
++			}
+ 		}
+ 	}
+ 
+diff --git a/src/test/java/jakarta/validation/BlockingValidationProvider.java b/src/test/java/jakarta/validation/BlockingValidationProvider.java
+new file mode 100644
+index 0000000..4824b55
+--- /dev/null
++++ b/src/test/java/jakarta/validation/BlockingValidationProvider.java
+@@ -0,0 +1,211 @@
++/*
++ * Jakarta Bean Validation API
++ *
++ * License: Apache License, Version 2.0
++ * See the license.txt file in the root directory or <http://www.apache.org/licenses/LICENSE-2.0>.
++ */
++package jakarta.validation;
++
++import java.io.InputStream;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
++
++import jakarta.validation.BootstrapConfiguration;
++import jakarta.validation.ClockProvider;
++import jakarta.validation.Configuration;
++import jakarta.validation.ConstraintValidatorFactory;
++import jakarta.validation.MessageInterpolator;
++import jakarta.validation.ParameterNameProvider;
++import jakarta.validation.TraversableResolver;
++import jakarta.validation.Validator;
++import jakarta.validation.ValidatorContext;
++import jakarta.validation.ValidatorFactory;
++import jakarta.validation.BlockingValidationProvider.DummyConfiguration;
++import jakarta.validation.spi.BootstrapState;
++import jakarta.validation.spi.ConfigurationState;
++import jakarta.validation.spi.ValidationProvider;
++import jakarta.validation.valueextraction.ValueExtractor;
++
++/**
++ * A {@link ValidationProvider} whose <em>no-arg constructor blocks</em> — exactly the attacker-supplied
++ * provider described by the CGP-6w36-9cv4-9cr9 execution trace. When this provider is discovered by the
++ * default resolver's {@code ServiceLoader} iteration, its constructor runs (on the calling thread) while
++ * {@code GetValidationProviderListAction.getValidationProviderList()} holds the JVM-wide
++ * {@code GetValidationProviderListAction.class} monitor, stalling every other thread that tries to
++ * bootstrap validation or clear the cache.
++ *
++ * <p>The constructor signals {@link #ENTERED} when it begins (so the exploit knows the class monitor is
++ * now held) and then waits on {@link #RELEASE} until the test explicitly releases it. A large self-timeout
++ * guards against ever leaving a hung thread behind if the test forgets to release.
++ */
++public class BlockingValidationProvider implements ValidationProvider<DummyConfiguration> {
++
++	/** Counts down as soon as the blocking constructor is entered (monitor now held by that thread). */
++	public static volatile CountDownLatch ENTERED = new CountDownLatch( 1 );
++
++	/** The constructor blocks until this latch is released by the test. */
++	public static volatile CountDownLatch RELEASE = new CountDownLatch( 1 );
++
++	/** Reset the coordination latches before a run. */
++	public static void reset() {
++		ENTERED = new CountDownLatch( 1 );
++		RELEASE = new CountDownLatch( 1 );
++	}
++
++	public BlockingValidationProvider() {
++		ENTERED.countDown();
++		try {
++			// Block indefinitely (bounded only by a large self-timeout so a mis-driven test cannot
++			// leave a hung thread behind). This is the "Thread.sleep(Long.MAX_VALUE)" / blocking-network-call
++			// behaviour from the advisory — the class monitor is held for the entire duration.
++			RELEASE.await( 60, TimeUnit.SECONDS );
++		}
++		catch ( InterruptedException e ) {
++			Thread.currentThread().interrupt();
++		}
++	}
++
++	@Override
++	public DummyConfiguration createSpecializedConfiguration(BootstrapState state) {
++		return null;
++	}
++
++	@Override
++	public DummyConfiguration createGenericConfiguration(BootstrapState state) {
++		return new DummyConfiguration();
++	}
++
++	@Override
++	public ValidatorFactory buildValidatorFactory(ConfigurationState configurationState) {
++		return new DummyValidatorFactory();
++	}
++
++	public static class DummyConfiguration implements Configuration<DummyConfiguration> {
++
++		@Override
++		public DummyConfiguration ignoreXmlConfiguration() {
++			return null;
++		}
++
++		@Override
++		public DummyConfiguration messageInterpolator(MessageInterpolator interpolator) {
++			return null;
++		}
++
++		@Override
++		public DummyConfiguration traversableResolver(TraversableResolver resolver) {
++			return null;
++		}
++
++		@Override
++		public DummyConfiguration constraintValidatorFactory(ConstraintValidatorFactory constraintValidatorFactory) {
++			return null;
++		}
++
++		@Override
++		public DummyConfiguration parameterNameProvider(ParameterNameProvider parameterNameProvider) {
++			return null;
++		}
++
++		@Override
++		public DummyConfiguration clockProvider(ClockProvider clockProvider) {
++			return null;
++		}
++
++		@Override
++		public DummyConfiguration addValueExtractor(ValueExtractor<?> extractor) {
++			return null;
++		}
++
++		@Override
++		public DummyConfiguration addMapping(InputStream stream) {
++			return null;
++		}
++
++		@Override
++		public DummyConfiguration addProperty(String name, String value) {
++			return null;
++		}
++
++		@Override
++		public MessageInterpolator getDefaultMessageInterpolator() {
++			return null;
++		}
++
++		@Override
++		public TraversableResolver getDefaultTraversableResolver() {
++			return null;
++		}
++
++		@Override
++		public ConstraintValidatorFactory getDefaultConstraintValidatorFactory() {
++			return null;
++		}
++
++		@Override
++		public ParameterNameProvider getDefaultParameterNameProvider() {
++			return null;
++		}
++
++		@Override
++		public ClockProvider getDefaultClockProvider() {
++			return null;
++		}
++
++		@Override
++		public BootstrapConfiguration getBootstrapConfiguration() {
++			return null;
++		}
++
++		@Override
++		public ValidatorFactory buildValidatorFactory() {
++			return new DummyValidatorFactory();
++		}
++	}
++
++	public static class DummyValidatorFactory implements ValidatorFactory {
++		@Override
++		public Validator getValidator() {
++			return null;
++		}
++
++		@Override
++		public ValidatorContext usingContext() {
++			return null;
++		}
++
++		@Override
++		public MessageInterpolator getMessageInterpolator() {
++			return null;
++		}
++
++		@Override
++		public TraversableResolver getTraversableResolver() {
++			return null;
++		}
++
++		@Override
++		public ConstraintValidatorFactory getConstraintValidatorFactory() {
++			return null;
++		}
++
++		@Override
++		public ParameterNameProvider getParameterNameProvider() {
++			return null;
++		}
++
++		@Override
++		public ClockProvider getClockProvider() {
++			return null;
++		}
++
++		@Override
++		public <T> T unwrap(Class<T> type) {
++			return null;
++		}
++
++		@Override
++		public void close() {
++		}
++	}
++}
+diff --git a/src/test/java/jakarta/validation/ProviderResolutionLockExploitTest.java b/src/test/java/jakarta/validation/ProviderResolutionLockExploitTest.java
+new file mode 100644
+index 0000000..0cc4764
+--- /dev/null
++++ b/src/test/java/jakarta/validation/ProviderResolutionLockExploitTest.java
+@@ -0,0 +1,585 @@
++/*
++ * Jakarta Bean Validation API
++ *
++ * License: Apache License, Version 2.0
++ * See the license.txt file in the root directory or <http://www.apache.org/licenses/LICENSE-2.0>.
++ */
++package jakarta.validation;
++
++import static org.testng.Assert.assertNotNull;
++import static org.testng.Assert.assertTrue;
++import static org.testng.Assert.fail;
++
++import java.io.IOException;
++import java.lang.reflect.Method;
++import java.net.URL;
++import java.net.URLClassLoader;
++import java.util.ArrayList;
++import java.util.Enumeration;
++import java.util.List;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicReference;
++
++import org.testng.annotations.Test;
++
++import jakarta.validation.spi.ValidationProvider;
++
++/**
++ * RED exploit for CGP-6w36-9cv4-9cr9 (CWE-557): the {@code static synchronized} entry points
++ * {@code GetValidationProviderListAction.getValidationProviderList()} (Validation.java:333) and
++ * {@code clearCache()} (Validation.java:342) hold the JVM-wide {@code GetValidationProviderListAction.class}
++ * monitor across untrusted {@code ServiceLoader} iteration / provider-constructor execution.
++ *
++ * <p>The exploit drives the exact sink: a thread whose TCCL resolves to
++ * {@link BlockingValidationProvider} calls {@code Validation.buildDefaultValidatorFactory()}
++ * (→ {@code getValidationProviderList()} L333 → {@code run()} → {@code loadProviders()} →
++ * {@code ServiceLoader.iterator().next()} → the blocking constructor). While that constructor holds
++ * the class monitor, three <em>victim</em> operations, each on their own thread, are attempted and
++ * must each complete within a small bound:
++ *
++ * <ol>
++ *   <li><b>Route (i) — fresh-classloader bootstrap</b> for a DIFFERENT ClassLoader B (cache miss).</li>
++ *   <li><b>Route (ii) — cache HIT</b> for a ClassLoader C whose providers were resolved and cached
++ *       <em>before</em> the attacker's blocking load began — a pure cache read that should never touch
++ *       {@code ServiceLoader} at all.</li>
++ *   <li><b>Route (iii) — cache invalidation</b> via the reflectively-invoked
++ *       {@code Validation.clearDefaultValidationProviderResolverCache()} (→ {@code clearCache()} L342).</li>
++ * </ol>
++ *
++ * On the unpatched tree every victim blocks on the class monitor for the full lifetime of the
++ * attacker's blocking constructor, so each timed wait times out and the corresponding assertion fails —
++ * the observable harmful effect (cross-tenant / cross-classloader denial of service). On a fixed tree
++ * (provider loading outside any lock that gates unrelated ClassLoaders, and {@code clearCache()}
++ * likewise) each victim completes promptly and the suite passes.
++ *
++ * <p>Self-protection: the attacker's blocking constructor is ALWAYS released in a {@code finally} block,
++ * and every wait is bounded, so the suite can never hang the runner regardless of pass/fail.
++ */
++public class ProviderResolutionLockExploitTest {
++
++	/**
++	 * How long a victim operation is given to complete while the attacker is blocked. On the unpatched
++	 * tree the victim is stuck on the class monitor and never completes within this bound; on a correct
++	 * fix the victim completes in milliseconds. Kept well below the attacker constructor's 60s self-timeout
++	 * so the timeout we observe is the LOCK, not the attacker releasing.
++	 */
++	private static final long VICTIM_BUDGET_MS = 5_000L;
++
++	/** Time to wait for the attacker to actually enter (and hold) the class monitor before probing victims. */
++	private static final long ATTACKER_ENTER_MS = 10_000L;
++
++	/**
++	 * Route (i): while the attacker holds the class monitor mid-{@code ServiceLoader}, a concurrent
++	 * {@code buildDefaultValidatorFactory()} for a DIFFERENT, well-behaved classloader (a cache miss)
++	 * must complete promptly. On the unpatched tree it blocks on the same class monitor.
++	 */
++	@Test
++	public void route_i_freshClassLoaderBootstrapBlockedByAttackersMonitor() throws Exception {
++		runWithAttackerHoldingMonitor( () -> {
++			// A fresh, well-behaved classloader (resolves to BarValidationProvider via the "-1" service file):
++			// this is a genuine cache-miss load, distinct from the attacker's classloader.
++			ClassLoader victimCl = new CustomValidationProviderClassLoader( "-1" );
++			ClassLoader saved = Thread.currentThread().getContextClassLoader();
++			Thread.currentThread().setContextClassLoader( victimCl );
++			try {
++				ValidatorFactory f = Validation.buildDefaultValidatorFactory();
++				assertNotNull( f );
++			}
++			finally {
++				Thread.currentThread().setContextClassLoader( saved );
++			}
++		}, "route (i) fresh-classloader buildDefaultValidatorFactory()" );
++	}
++
++	/**
++	 * Route (ii): a ClassLoader C whose provider list was resolved and cached BEFORE the attacker's
++	 * blocking load began. A later call for C is a pure cache HIT that should not touch {@code ServiceLoader}
++	 * at all — yet on the unpatched tree it must still first acquire the class monitor via
++	 * {@code getValidationProviderList()} and therefore blocks behind the attacker.
++	 */
++	@Test
++	public void route_ii_cacheHitBlockedByAttackersMonitor() throws Exception {
++		// Pre-populate the cache for a well-behaved classloader C, BEFORE any attacker is running.
++		final ClassLoader cachedCl = new CustomValidationProviderClassLoader( "-1" );
++		primeCache( cachedCl );
++
++		runWithAttackerHoldingMonitor( () -> {
++			ClassLoader saved = Thread.currentThread().getContextClassLoader();
++			Thread.currentThread().setContextClassLoader( cachedCl );
++			try {
++				// Pure cache hit: should return instantly regardless of the attacker's slow load.
++				ValidatorFactory f = Validation.buildDefaultValidatorFactory();
++				assertNotNull( f );
++			}
++			finally {
++				Thread.currentThread().setContextClassLoader( saved );
++			}
++		}, "route (ii) cache-HIT buildDefaultValidatorFactory()" );
++	}
++
++	/**
++	 * Route (iii): the reflectively-invoked {@code Validation.clearDefaultValidationProviderResolverCache()}
++	 * (→ {@code clearCache()} L342, {@code static synchronized} on the SAME monitor) must complete promptly.
++	 * On the unpatched tree it blocks behind the attacker's provider load — cache invalidation and provider
++	 * discovery contend on the same global lock.
++	 */
++	@Test
++	public void route_iii_clearCacheBlockedByAttackersMonitor() throws Exception {
++		final Method clearCache = Validation.class.getDeclaredMethod( "clearDefaultValidationProviderResolverCache" );
++		clearCache.setAccessible( true );
++
++		runWithAttackerHoldingMonitor( () -> {
++			try {
++				clearCache.invoke( null );
++			}
++			catch ( ReflectiveOperationException e ) {
++				throw new RuntimeException( e );
++			}
++		}, "route (iii) clearDefaultValidationProviderResolverCache()" );
++	}
++
++	/**
++	 * Preservation (Plan item d): while an UNRELATED classloader's provider constructor blocks (holding
++	 * only its own per-classloader lock on a fixed tree), two distinct, well-behaved classloaders must
++	 * each concurrently resolve and cache their OWN correct provider — not merely "did not hang". A
++	 * "-1"-suffixed classloader (TCCL) must resolve to {@link BarValidationProvider}; a classloader whose
++	 * TCCL cannot load the service file must fall back to the current classloader and resolve to
++	 * {@link FooValidationProvider}. This proves the narrowed locking preserves per-classloader
++	 * correctness and cache visibility under concurrent multi-classloader access.
++	 *
++	 * <p>On the unpatched tree this also blocks (both victims contend on the class monitor), so it fails
++	 * RED alongside the three routes above; on the fix it returns the correct, distinct provider per
++	 * classloader.
++	 */
++	@Test
++	public void preservation_concurrentClassLoadersResolveTheirOwnCorrectProvider() throws Exception {
++		final Runnable barResolver = () -> {
++			// TCCL resolves the "-1" service file -> BarValidationProvider (cache miss, fresh load).
++			ClassLoader victimCl = new CustomValidationProviderClassLoader( "-1" );
++			ClassLoader saved = Thread.currentThread().getContextClassLoader();
++			Thread.currentThread().setContextClassLoader( victimCl );
++			try {
++				ValidatorFactory f = Validation.buildDefaultValidatorFactory();
++				assertNotNull( f );
++				assertTrue(
++						f instanceof BarValidationProvider.DummyValidatorFactory,
++						"the '-1' classloader must resolve to BarValidationProvider, got: " + f
++				);
++			}
++			finally {
++				Thread.currentThread().setContextClassLoader( saved );
++			}
++		};
++
++		final Runnable fooResolver = () -> {
++			// TCCL cannot load any service file -> falls back to the current classloader -> FooValidationProvider.
++			ClassLoader victimCl = new URLClassLoader( new URL[] { }, null );
++			ClassLoader saved = Thread.currentThread().getContextClassLoader();
++			Thread.currentThread().setContextClassLoader( victimCl );
++			try {
++				ValidatorFactory f = Validation.buildDefaultValidatorFactory();
++				assertNotNull( f );
++				assertTrue(
++						f instanceof FooValidationProvider.DummyValidatorFactory,
++						"the fallback classloader must resolve to FooValidationProvider, got: " + f
++				);
++			}
++			finally {
++				Thread.currentThread().setContextClassLoader( saved );
++			}
++		};
++
++		runWithAttackerHoldingMonitor( () -> {
++			runConcurrently( barResolver, fooResolver );
++		}, "preservation: two well-behaved classloaders resolving concurrently" );
++	}
++
++	/**
++	 * Route (iv) — attacker-authored ClassLoader identity collision (Plan re-entry; the gap the
++	 * Bypass-Hunt stage demonstrated against the round-1 patch). The per-classloader lock-striping fix
++	 * identifies "the same classloader" via {@code WeakHashMap<ClassLoader, ...>} lookups, which dispatch
++	 * to {@link ClassLoader#hashCode()}/{@link ClassLoader#equals(Object)} — methods {@code ClassLoader}
++	 * does NOT make {@code final}. An attacker who supplies their own {@code ClassLoader} subclass as their
++	 * TCCL (the identical capability routes (i)-(iii) already rely on) can override those two methods to
++	 * alias one specific, unrelated, well-behaved victim ClassLoader's identity. The attacker's
++	 * {@code getLoadLock(attackerCl)} lookup then returns the VICTIM's own dedicated load-lock object
++	 * instead of a fresh one, and the attacker's blocking provider constructor runs while holding it.
++	 *
++	 * <p>Consequently the victim's OWN later, completely independent {@code buildDefaultValidatorFactory()}
++	 * call (same victim classloader, a genuine fresh/cache-miss load, unrelated to the attacker in every way
++	 * the fix's design intends to isolate) blocks on {@code synchronized(lockV)} for the attacker's full
++	 * blocking window — the exact cross-classloader / cross-tenant denial of service the fix was meant to
++	 * eliminate, reproduced through a gap in the fix's OWN replacement locking mechanism.
++	 *
++	 * <p>SECURITY PROPERTY (RED polarity): an UNRELATED attacker classloader's blocking provider
++	 * constructor must never gate the victim's independent bootstrap. This test asserts the victim
++	 * completes within {@link #VICTIM_BUDGET_MS}; on the round-1 patch (0082eb8) it does NOT — the
++	 * assertion fails (RED). A fix that keys the per-classloader lock/cache by JVM reference identity
++	 * (rather than the attacker-overridable {@code equals()}/{@code hashCode()}) makes the victim complete
++	 * promptly and turns this GREEN. The blocking constructor is always released in {@code finally}.
++	 */
++	@Test
++	public void route_iv_identityCollisionStealsVictimsLoadLock() throws Exception {
++		BlockingValidationProvider.reset();
++		final ClassLoader mainSaved = Thread.currentThread().getContextClassLoader();
++
++		// Victim: a real, well-behaved ClassLoader with no parent/URLs, so its TCCL (Option #1) lookup
++		// finds nothing and it falls back to Option #2. loadProvidersForClassloader() still records the
++		// victim's OWN dedicated load-lock object in loadLockPerClassloader (getLoadLock runs
++		// unconditionally, regardless of cache outcome).
++		final ClassLoader victimCl = new URLClassLoader( new URL[0], null );
++
++		// Prime step: establish victimCl's real loadLockPerClassloader entry via one full, successful
++		// (non-blocking) bootstrap, before any attacker is involved.
++		primeCache( victimCl );
++
++		// Attacker: a ClassLoader the attacker fully authors (same capability as the accepted RED
++		// exploit's CustomValidationProviderClassLoader), whose hashCode()/equals() collide ONLY with
++		// victimCl's identity, and whose service file resolves to the blocking provider.
++		final ClassLoader attackerCl = new CollidingBlockingClassLoader( victimCl );
++
++		final AtomicReference<Throwable> attackerErr = new AtomicReference<>();
++		Thread attacker = new Thread( () -> {
++			Thread.currentThread().setContextClassLoader( attackerCl );
++			try {
++				// getLoadLock(attackerCl) -> the poisoned hashCode()/equals() make this WeakHashMap
++				// lookup return VICTIM's lockV; the blocking constructor then runs while holding lockV.
++				Validation.buildDefaultValidatorFactory();
++			}
++			catch ( Throwable th ) {
++				attackerErr.set( th );
++			}
++		}, "attacker-colliding-classloader" );
++		attacker.setDaemon( true );
++
++		final AtomicReference<Throwable> victimErr = new AtomicReference<>();
++		Thread victimThread = new Thread( () -> {
++			ClassLoader saved = Thread.currentThread().getContextClassLoader();
++			Thread.currentThread().setContextClassLoader( victimCl );
++			try {
++				// A fresh (cache-miss) bootstrap for victimCl -- must acquire the SAME lockV the attacker
++				// stole. A correctly-isolated fix keys the lock by identity, so an unrelated classloader's
++				// blocking constructor can never gate this call.
++				assertNotNull( Validation.buildDefaultValidatorFactory() );
++			}
++			catch ( Throwable th ) {
++				victimErr.set( th );
++			}
++			finally {
++				Thread.currentThread().setContextClassLoader( saved );
++			}
++		}, "victim-real-classloader" );
++		victimThread.setDaemon( true );
++
++		try {
++			attacker.start();
++			assertTrue(
++					BlockingValidationProvider.ENTERED.await( ATTACKER_ENTER_MS, TimeUnit.MILLISECONDS ),
++					"attacker never entered the blocking provider constructor; cannot demonstrate the collision"
++			);
++			if ( attackerErr.get() != null ) {
++				throw new AssertionError( "attacker failed before holding the stolen lock", attackerErr.get() );
++			}
++
++			victimThread.start();
++			victimThread.join( VICTIM_BUDGET_MS );
++
++			// SECURITY PROPERTY: the victim's own, unrelated bootstrap must NOT be blocked by the
++			// attacker's classloader. On the round-1 patch it is still stuck on the stolen lockV -> RED.
++			if ( victimThread.isAlive() ) {
++				fail(
++						"route (iv): victim-real-classloader's own independent buildDefaultValidatorFactory() "
++						+ "was still blocked after " + VICTIM_BUDGET_MS + " ms because an UNRELATED "
++						+ "attacker-authored classloader (colliding hashCode()/equals()) stole the victim's "
++						+ "per-classloader load lock and is holding it inside a blocking provider constructor. "
++						+ "This is the same cross-classloader denial of service of CGP-6w36-9cv4-9cr9 "
++						+ "(CWE-557): the lock-striping key must not depend on ClassLoader's own overridable "
++						+ "equals()/hashCode() -- it must use JVM reference identity."
++				);
++			}
++
++			if ( victimErr.get() != null ) {
++				throw new AssertionError( "route (iv): victim completed with an unexpected error", victimErr.get() );
++			}
++		}
++		finally {
++			BlockingValidationProvider.RELEASE.countDown();
++			attacker.join( VICTIM_BUDGET_MS );
++			victimThread.join( VICTIM_BUDGET_MS );
++			Thread.currentThread().setContextClassLoader( mainSaved );
++			try {
++				Method clearCache = Validation.class.getDeclaredMethod( "clearDefaultValidationProviderResolverCache" );
++				clearCache.setAccessible( true );
++				clearCache.invoke( null );
++			}
++			catch ( ReflectiveOperationException ignore ) {
++				// best-effort cleanup only
++			}
++		}
++	}
++
++	/** Runs the given tasks on their own threads and asserts each completes within the victim budget. */
++	private void runConcurrently(Runnable... tasks) {
++		final List<Thread> threads = new ArrayList<>();
++		final AtomicReference<Throwable> firstErr = new AtomicReference<>();
++		for ( Runnable task : tasks ) {
++			Thread t = new Thread( () -> {
++				try {
++					task.run();
++				}
++				catch ( Throwable th ) {
++					firstErr.compareAndSet( null, th );
++				}
++			} );
++			t.setDaemon( true );
++			threads.add( t );
++			t.start();
++		}
++		for ( Thread t : threads ) {
++			try {
++				t.join( VICTIM_BUDGET_MS );
++			}
++			catch ( InterruptedException e ) {
++				Thread.currentThread().interrupt();
++				fail( "interrupted waiting for a concurrent resolver" );
++			}
++			if ( t.isAlive() ) {
++				fail( "a well-behaved concurrent resolver was still blocked after " + VICTIM_BUDGET_MS
++						+ " ms while an unrelated classloader's provider constructor was in progress" );
++			}
++		}
++		if ( firstErr.get() != null ) {
++			throw new AssertionError( "a concurrent resolver resolved the wrong provider or failed", firstErr.get() );
++		}
++	}
++
++	// --------------------------------------------------------------------------------------------
++	// Harness
++	// --------------------------------------------------------------------------------------------
++
++	/**
++	 * Resolve and cache providers for {@code cl} on a dedicated thread (with {@code cl} as TCCL), so the
++	 * next call for {@code cl} is a pure cache hit. Runs while no attacker is active.
++	 */
++	private void primeCache(ClassLoader cl) throws Exception {
++		final AtomicReference<Throwable> err = new AtomicReference<>();
++		Thread t = new Thread( () -> {
++			ClassLoader saved = Thread.currentThread().getContextClassLoader();
++			Thread.currentThread().setContextClassLoader( cl );
++			try {
++				assertNotNull( Validation.buildDefaultValidatorFactory() );
++			}
++			catch ( Throwable th ) {
++				err.set( th );
++			}
++			finally {
++				Thread.currentThread().setContextClassLoader( saved );
++			}
++		}, "cache-primer" );
++		t.setDaemon( true );
++		t.start();
++		t.join( VICTIM_BUDGET_MS );
++		if ( t.isAlive() ) {
++			fail( "priming the cache should not block (no attacker active yet)" );
++		}
++		if ( err.get() != null ) {
++			throw new AssertionError( "priming the cache failed", err.get() );
++		}
++	}
++
++	/**
++	 * Starts the attacker on its own thread (TCCL → blocking provider), waits until its constructor has
++	 * entered (and is therefore holding the class monitor), then runs {@code victim} on a separate thread
++	 * and asserts it completes within {@link #VICTIM_BUDGET_MS}. Always releases the attacker in a finally.
++	 */
++	private void runWithAttackerHoldingMonitor(Runnable victim, String victimDescription) throws Exception {
++		BlockingValidationProvider.reset();
++		final ClassLoader mainSaved = Thread.currentThread().getContextClassLoader();
++
++		final AtomicReference<Throwable> attackerErr = new AtomicReference<>();
++		final ClassLoader attackerCl = new CustomValidationProviderClassLoader( "-blocking" );
++
++		Thread attacker = new Thread( () -> {
++			Thread.currentThread().setContextClassLoader( attackerCl );
++			try {
++				// Enters getValidationProviderList() [L333], acquires the class monitor, and blocks inside
++				// the BlockingValidationProvider constructor invoked by ServiceLoader.iterator().next() [L383].
++				Validation.buildDefaultValidatorFactory();
++			}
++			catch ( Throwable th ) {
++				attackerErr.set( th );
++			}
++		}, "attacker-blocking-provider" );
++		attacker.setDaemon( true );
++
++		final AtomicReference<Throwable> victimErr = new AtomicReference<>();
++		Thread victimThread = new Thread( () -> {
++			try {
++				victim.run();
++			}
++			catch ( Throwable th ) {
++				victimErr.set( th );
++			}
++		}, "victim" );
++		victimThread.setDaemon( true );
++
++		try {
++			attacker.start();
++
++			// Wait for the attacker to actually be inside the blocking constructor (monitor held).
++			assertTrue(
++					BlockingValidationProvider.ENTERED.await( ATTACKER_ENTER_MS, TimeUnit.MILLISECONDS ),
++					"attacker never entered the blocking provider constructor; cannot demonstrate lock contention"
++			);
++			if ( attackerErr.get() != null ) {
++				throw new AssertionError( "attacker failed before holding the monitor", attackerErr.get() );
++			}
++
++			// Now the class monitor is held by the attacker for the lifetime of its constructor.
++			victimThread.start();
++			victimThread.join( VICTIM_BUDGET_MS );
++
++			// SECURITY PROPERTY: the victim must NOT be blocked by an unrelated classloader's slow provider
++			// constructor. On the unpatched tree it is still stuck on the class monitor here -> RED.
++			if ( victimThread.isAlive() ) {
++				fail(
++						victimDescription + " was still blocked after " + VICTIM_BUDGET_MS + " ms while an "
++						+ "UNRELATED classloader's provider constructor held the GetValidationProviderListAction "
++						+ "class monitor. This is the cross-classloader denial of service of CGP-6w36-9cv4-9cr9 "
++						+ "(CWE-557): the static synchronized getValidationProviderList()/clearCache() hold a "
++						+ "JVM-wide monitor across untrusted ServiceLoader iteration."
++				);
++			}
++
++			if ( victimErr.get() != null ) {
++				throw new AssertionError( victimDescription + " completed with an unexpected error", victimErr.get() );
++			}
++		}
++		finally {
++			// Release the attacker so nothing hangs, no matter what happened above.
++			BlockingValidationProvider.RELEASE.countDown();
++			attacker.join( VICTIM_BUDGET_MS );
++			victimThread.join( VICTIM_BUDGET_MS );
++			Thread.currentThread().setContextClassLoader( mainSaved );
++			// Leave the shared cache clean for other tests / other routes.
++			try {
++				Method clearCache = Validation.class.getDeclaredMethod( "clearDefaultValidationProviderResolverCache" );
++				clearCache.setAccessible( true );
++				clearCache.invoke( null );
++			}
++			catch ( ReflectiveOperationException ignore ) {
++				// best-effort cleanup only
++			}
++		}
++	}
++
++	/**
++	 * A classloader that maps the {@code ValidationProvider} service file to a suffixed variant, mirroring
++	 * {@code ValidationTest.CustomValidationProviderClassLoader}. Suffix {@code "-blocking"} resolves to
++	 * {@link BlockingValidationProvider}; {@code "-1"} resolves to {@code BarValidationProvider}.
++	 */
++	private static class CustomValidationProviderClassLoader extends ClassLoader {
++		private static final String SERVICES_FILE = "META-INF/services/" + ValidationProvider.class.getName();
++		private final String[] serviceFileSuffixes;
++
++		CustomValidationProviderClassLoader(String... suffixes) {
++			super( CustomValidationProviderClassLoader.class.getClassLoader() );
++			this.serviceFileSuffixes = suffixes;
++		}
++
++		@Override
++		public Enumeration<URL> getResources(String name) throws IOException {
++			List<URL> urls = new ArrayList<>();
++			if ( SERVICES_FILE.equals( name ) && serviceFileSuffixes != null ) {
++				for ( String suffix : serviceFileSuffixes ) {
++					Enumeration<URL> e = super.getResources( name + suffix );
++					while ( e.hasMoreElements() ) {
++						urls.add( e.nextElement() );
++					}
++				}
++			}
++			else {
++				Enumeration<URL> e = super.getResources( name );
++				while ( e.hasMoreElements() ) {
++					urls.add( e.nextElement() );
++				}
++			}
++			final java.util.Iterator<URL> it = urls.iterator();
++			return new Enumeration<URL>() {
++				@Override
++				public boolean hasMoreElements() {
++					return it.hasNext();
++				}
++
++				@Override
++				public URL nextElement() {
++					return it.next();
++				}
++			};
++		}
++	}
++
++	/**
++	 * Route (iv) attacker: a {@code ClassLoader} the attacker fully authors (same capability as
++	 * {@link CustomValidationProviderClassLoader}, used as the attacker's own TCCL) whose service file
++	 * resolves to {@link BlockingValidationProvider}, and whose {@code hashCode()}/{@code equals()} are
++	 * overridden to collide ONLY with one specific victim {@code ClassLoader} instance's identity. This
++	 * defeats any {@code WeakHashMap}/{@code HashMap}-keyed lock-striping/cache-keying that trusts the
++	 * key's own {@code equals()}/{@code hashCode()} — {@code ClassLoader} places no restriction on
++	 * overriding these methods.
++	 */
++	private static class CollidingBlockingClassLoader extends ClassLoader {
++		private static final String SERVICES_FILE = "META-INF/services/" + ValidationProvider.class.getName();
++		private final ClassLoader collideWith;
++		private final int collideHash;
++
++		CollidingBlockingClassLoader(ClassLoader collideWith) {
++			super( CollidingBlockingClassLoader.class.getClassLoader() );
++			this.collideWith = collideWith;
++			this.collideHash = collideWith.hashCode();
++		}
++
++		@Override
++		public int hashCode() {
++			return collideHash;
++		}
++
++		@Override
++		public boolean equals(Object o) {
++			// Precise collision: "equal" only to the targeted victim, so this attacker-authored
++			// classloader cannot accidentally alias an unrelated third classloader's cache/lock entry
++			// (e.g. the shared "current classloader" fallback).
++			return o == collideWith;
++		}
++
++		@Override
++		public Enumeration<URL> getResources(String name) throws IOException {
++			List<URL> urls = new ArrayList<>();
++			if ( SERVICES_FILE.equals( name ) ) {
++				Enumeration<URL> e = super.getResources( name + "-blocking" );
++				while ( e.hasMoreElements() ) {
++					urls.add( e.nextElement() );
++				}
++			}
++			else {
++				Enumeration<URL> e = super.getResources( name );
++				while ( e.hasMoreElements() ) {
++					urls.add( e.nextElement() );
++				}
++			}
++			final java.util.Iterator<URL> it = urls.iterator();
++			return new Enumeration<URL>() {
++				@Override
++				public boolean hasMoreElements() {
++					return it.hasNext();
++				}
++
++				@Override
++				public URL nextElement() {
++					return it.next();
++				}
++			};
++		}
++	}
++}
+diff --git a/src/test/resources/META-INF/services/jakarta.validation.spi.ValidationProvider-blocking b/src/test/resources/META-INF/services/jakarta.validation.spi.ValidationProvider-blocking
+new file mode 100644
+index 0000000..8eee283
+--- /dev/null
++++ b/src/test/resources/META-INF/services/jakarta.validation.spi.ValidationProvider-blocking
+@@ -0,0 +1,2 @@
++# loaded via CustomValidationProviderClassLoader used as thread context class loader (RED exploit)
++jakarta.validation.BlockingValidationProvider
+-- 
+2.55.0
+

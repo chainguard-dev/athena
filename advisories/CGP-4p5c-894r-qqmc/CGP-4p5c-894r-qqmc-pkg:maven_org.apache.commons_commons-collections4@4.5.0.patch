@@ -1,0 +1,648 @@
+From f418b12305ed8e3fcabd7fac7a3f1008c388716c Mon Sep 28 16:00:00 2026
+From: Verify Agent <verify-agent@chainguard.dev>
+Date: Mon, 28 Sep 2026 16:00:00 +0000
+Subject: [PATCH] fix CGP-4p5c-894r-qqmc: revalidate Predicated* on
+ deserialization
+
+PredicatedMap and PredicatedCollection (CWE-502) decorate a Map or
+Collection to enforce configured key/value/element predicates on
+every entry added through the public constructor and mutators
+(put, putAll, add, addAll, checkSetValue), each of which calls the
+shared validate()/checkSetValue() chokepoint. The class invariant is
+that no entry or element can violate its configured predicate.
+
+The root cause is that this invariant was never enforced on the
+deserialization path. PredicatedMap.readObject() called
+in.defaultReadObject() and then restored the decorated map via
+in.readObject() without iterating its entries to re-invoke
+validate(key, value). PredicatedCollection declared no readObject()
+at all, so default deserialization restored the predicate and the
+decorated collection with zero validation. Because readObject acts
+as an alternate constructor that Java's serialization machinery can
+drive directly from an attacker-controlled byte stream, an attacker
+who supplies a crafted stream containing a PredicatedMap or
+PredicatedCollection (or any of their subclasses, including
+PredicatedSortedMap and PredicatedSet/Bag/List/Queue/SortedSet/
+NavigableSet/SortedBag/MultiSet) whose backing store already holds a
+predicate-violating entry gets back a live, application-reachable
+instance that silently violates its own type contract.
+
+The fix closes this gap by making readObject converge on the same
+validate()/checkSetValue() chokepoint the constructor and mutators
+already use, instead of duplicating predicate logic.
+PredicatedMap.readObject() now calls map.forEach(this::validate)
+after restoring the map, which re-checks both the keyPredicate and
+valuePredicate slots (validate() already null-checks each predicate,
+so a map configured with only one slot set does not NPE) and is
+inherited unchanged by PredicatedSortedMap. A new
+PredicatedCollection.readObject() iterates the restored collection
+via the protected decorated() accessor (the backing field is
+private) and calls validate(item) for each element, which is
+inherited by all of its subclasses. In both cases an
+IllegalArgumentException raised by validate()/checkSetValue()
+propagates out of readObject(), so ObjectInputStream.readObject()
+aborts and no partially- or fully-populated invalid instance is ever
+returned to the caller.
+
+The regression test PredicatedDeserializationExploitTest crafts
+attacker-controlled serialized streams (by reflectively swapping a
+validated instance's backing store for one holding a null before
+serializing, since the safe constructor cannot itself produce a
+violating instance) and asserts that deserializing each one either
+throws the specific IllegalArgumentException or, if it must proceed,
+returns nothing exposing the offending entry. It covers the
+documented PoC (PredicatedMap with a null key under
+NotNullPredicate), the previously-unexercised valuePredicate slot,
+PredicatedSortedMap driven directly, four PredicatedCollection
+subclasses, and the PredicatedCollection base class, plus positive
+and preservation controls proving legitimate predicate-satisfying
+instances -- including ones built with a custom Predicate
+implementation and non-default Map/Collection backings -- continue
+to round-trip and still enforce their predicate afterward.
+
+CGP: CGP-4p5c-894r-qqmc
+Cgp-Finding: CGP-4p5c-894r-qqmc
+---
+ .../collection/PredicatedCollection.java      |  31 ++
+ .../collections4/map/PredicatedMap.java       |   9 +
+ .../PredicatedDeserializationExploitTest.java | 501 ++++++++++++++++++
+ 3 files changed, 541 insertions(+)
+ create mode 100644 src/test/java/org/apache/commons/collections4/PredicatedDeserializationExploitTest.java
+
+diff --git a/src/main/java/org/apache/commons/collections4/collection/PredicatedCollection.java b/src/main/java/org/apache/commons/collections4/collection/PredicatedCollection.java
+index 588c86a08..5cfca603f 100644
+--- a/src/main/java/org/apache/commons/collections4/collection/PredicatedCollection.java
++++ b/src/main/java/org/apache/commons/collections4/collection/PredicatedCollection.java
+@@ -16,6 +16,8 @@
+  */
+ package org.apache.commons.collections4.collection;
+ 
++import java.io.IOException;
++import java.io.ObjectInputStream;
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.Collections;
+@@ -425,4 +427,33 @@ public class PredicatedCollection<E> extends AbstractCollectionDecorator<E> {
+         }
+     }
+ 
++    /**
++     * Deserializes the collection using default deserialization, then re-validates every restored
++     * element against the configured predicate.
++     * <p>
++     * Security fix (CGP-4p5c-894r-qqmc, CWE-502): {@code readObject} is an alternate construction
++     * path that bypasses the validating constructor. This class (and its subclasses, none of which
++     * declare their own {@code readObject}) previously relied on default deserialization, which
++     * restored the decorated collection without re-asserting the predicate. That let an
++     * attacker-controlled stream inject predicate-violating elements the constructor and every public
++     * mutator would reject. This method re-establishes the class invariant by running every restored
++     * element through the SAME {@link #validate(Object)} chokepoint the constructor and mutators use;
++     * a violation throws {@link IllegalArgumentException}, which propagates out to the
++     * {@link ObjectInputStream#readObject()} caller rather than handing back a live,
++     * predicate-violating instance.
++     *
++     * @param in  the input stream
++     * @throws IOException if an error occurs while reading from the stream
++     * @throws ClassNotFoundException if an object read from the stream cannot be loaded
++     */
++    private void readObject(final ObjectInputStream in) throws IOException, ClassNotFoundException {
++        in.defaultReadObject();
++        final Collection<E> restored = decorated();
++        if (restored != null) {
++            for (final E item : restored) {
++                validate(item);
++            }
++        }
++    }
++
+ }
+diff --git a/src/main/java/org/apache/commons/collections4/map/PredicatedMap.java b/src/main/java/org/apache/commons/collections4/map/PredicatedMap.java
+index 6bc6a883b..11cdca1e3 100644
+--- a/src/main/java/org/apache/commons/collections4/map/PredicatedMap.java
++++ b/src/main/java/org/apache/commons/collections4/map/PredicatedMap.java
+@@ -155,6 +155,15 @@ public class PredicatedMap<K, V>
+     private void readObject(final ObjectInputStream in) throws IOException, ClassNotFoundException {
+         in.defaultReadObject();
+         map = (Map<K, V>) in.readObject(); // (1)
++        // Security fix (CGP-4p5c-894r-qqmc, CWE-502): readObject is an alternate construction path
++        // that bypasses the validating constructor. Re-assert the class invariant by running every
++        // restored entry through the SAME validate() chokepoint the constructor and mutators use, so
++        // an attacker-controlled stream cannot inject predicate-violating entries. A violation throws
++        // IllegalArgumentException, which propagates out to the ObjectInputStream.readObject() caller
++        // rather than handing back a live, predicate-violating instance.
++        if (map != null) {
++            map.forEach(this::validate);
++        }
+     }
+ 
+     /**
+diff --git a/src/test/java/org/apache/commons/collections4/PredicatedDeserializationExploitTest.java b/src/test/java/org/apache/commons/collections4/PredicatedDeserializationExploitTest.java
+new file mode 100644
+index 000000000..850995b22
+--- /dev/null
++++ b/src/test/java/org/apache/commons/collections4/PredicatedDeserializationExploitTest.java
+@@ -0,0 +1,501 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.commons.collections4;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.junit.jupiter.api.Assertions.fail;
++
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.ObjectInputStream;
++import java.io.ObjectOutputStream;
++import java.io.Serializable;
++import java.lang.reflect.Field;
++import java.util.ArrayDeque;
++import java.util.ArrayList;
++import java.util.Collection;
++import java.util.HashMap;
++import java.util.HashSet;
++import java.util.LinkedList;
++import java.util.Map;
++import java.util.TreeMap;
++import java.util.TreeSet;
++
++import org.apache.commons.collections4.bag.HashBag;
++import org.apache.commons.collections4.bag.PredicatedBag;
++import org.apache.commons.collections4.bag.PredicatedSortedBag;
++import org.apache.commons.collections4.bag.TreeBag;
++import org.apache.commons.collections4.collection.PredicatedCollection;
++import org.apache.commons.collections4.functors.NotNullPredicate;
++import org.apache.commons.collections4.list.PredicatedList;
++import org.apache.commons.collections4.map.PredicatedMap;
++import org.apache.commons.collections4.map.PredicatedSortedMap;
++import org.apache.commons.collections4.multiset.HashMultiSet;
++import org.apache.commons.collections4.multiset.PredicatedMultiSet;
++import org.apache.commons.collections4.queue.PredicatedQueue;
++import org.apache.commons.collections4.set.PredicatedNavigableSet;
++import org.apache.commons.collections4.set.PredicatedSet;
++import org.apache.commons.collections4.set.PredicatedSortedSet;
++import org.junit.jupiter.api.Test;
++
++/**
++ * Exploit harness for CGP-4p5c-894r-qqmc (CWE-502).
++ *
++ * <p>{@code PredicatedMap.readObject()} restores the decorated map without re-validating its entries
++ * against the configured key/value predicates, and the whole {@code PredicatedCollection} family has
++ * no {@code readObject} at all, so default deserialization restores the decorated collection with no
++ * validation. An attacker who controls the serialized byte stream can therefore inject
++ * predicate-violating entries/elements that the constructor and every public mutator would reject,
++ * producing a "split-brain" instance: a {@code Predicated*} typed object whose type contract
++ * guarantees (e.g. "no null keys") are silently violated.</p>
++ *
++ * <p>Each test below crafts an <em>attacker-controlled</em> serialized stream. Because the safe
++ * constructor/factory always calls {@code validate()}, a violating instance cannot be built through
++ * the public API; the harness instead builds a valid instance, then reflectively swaps its backing
++ * map/collection field for one holding a predicate-violating entry BEFORE serializing it. This
++ * faithfully models a hostile serializer that emits {@code predicate=NotNullPredicate} together with
++ * a decorated store containing a null &mdash; exactly the bytes {@code writeObject}/{@code
++ * defaultWriteObject} produce for such a doctored object, and exactly what an attacker who never runs
++ * our constructor can hand to {@code ObjectInputStream.readObject()}.</p>
++ *
++ * <p><strong>Security invariant asserted (from the Plan):</strong> once construction of a
++ * {@code Predicated*} instance completes by ANY route &mdash; including Java deserialization &mdash;
++ * every entry/element it exposes must satisfy its configured predicate(s). So each test drives the
++ * real {@code ObjectInputStream.readObject()} sink with the crafted stream and requires that NO live
++ * instance holding the violating entry is returned:</p>
++ * <ul>
++ *   <li>If deserialization succeeds and the returned instance reports the violating entry present
++ *       (e.g. {@code containsKey(null)==true} under {@code NotNullPredicate}), the harmful integrity
++ *       violation happened &mdash; the test FAILS (RED on the unpatched build).</li>
++ *   <li>If deserialization is refused with the SPECIFIC {@link IllegalArgumentException} that the
++ *       shared {@code validate()}/{@code checkSetValue()} chokepoint raises, that payload was blocked
++ *       &mdash; the test PASSES (GREEN once fixed).</li>
++ * </ul>
++ *
++ * <p>The suite therefore exits non-zero on the unpatched build (invariant broken) and zero once a
++ * fix re-validates restored contents in {@code readObject}. No catch-all is used: any exception other
++ * than {@code IllegalArgumentException} means the sink was not driven correctly and is reported as a
++ * harness failure, never as "blocked".</p>
++ */
++public class PredicatedDeserializationExploitTest {
++
++    // ------------------------------------------------------------------
++    // Serialization helpers
++    // ------------------------------------------------------------------
++
++    private static byte[] serialize(final Object o) throws Exception {
++        final ByteArrayOutputStream baos = new ByteArrayOutputStream();
++        try (ObjectOutputStream oos = new ObjectOutputStream(baos)) {
++            oos.writeObject(o);
++        }
++        return baos.toByteArray();
++    }
++
++    /** Drives the REAL sink: {@code ObjectInputStream.readObject()} on attacker-supplied bytes. */
++    private static Object deserialize(final byte[] bytes) throws Exception {
++        try (ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(bytes))) {
++            return ois.readObject();
++        }
++    }
++
++    /**
++     * Reflectively assigns {@code value} to the field named {@code fieldName} declared anywhere in the
++     * class hierarchy of {@code target}. Used to inject a predicate-violating backing store into an
++     * already-validated decorator, so the object serializes into a malicious stream WITHOUT ever
++     * passing through the validating constructor.
++     */
++    private static void injectField(final Object target, final String fieldName, final Object value)
++            throws Exception {
++        Class<?> c = target.getClass();
++        while (c != null) {
++            try {
++                final Field f = c.getDeclaredField(fieldName);
++                f.setAccessible(true);
++                f.set(target, value);
++                return;
++            } catch (final NoSuchFieldException nsfe) {
++                c = c.getSuperclass();
++            }
++        }
++        throw new NoSuchFieldException(fieldName + " not found on " + target.getClass());
++    }
++
++    // ------------------------------------------------------------------
++    // Assertion helpers that encode the RED/GREEN polarity
++    // ------------------------------------------------------------------
++
++    /**
++     * Deserializes the crafted stream and asserts the invariant for a MAP-family instance: either
++     * the stream is refused with IllegalArgumentException (fixed), or the returned instance must NOT
++     * report the violating key/value present (which never happens on the vulnerable build).
++     *
++     * @param nullKey   true if the injected violation is a null key, false if a null value.
++     */
++    private static void assertMapStreamRejectsViolation(final byte[] malicious, final String label,
++            final Object violatingKey, final boolean nullKey) throws Exception {
++        final Object obj;
++        try {
++            obj = deserialize(malicious);
++        } catch (final IllegalArgumentException ex) {
++            // SECURE post-fix behavior: the shared validate() chokepoint refused the payload during
++            // readObject() with the specific IllegalArgumentException. GREEN. (No catch-all: any other
++            // exception escapes this handler and surfaces as a harness failure, never "blocked".)
++            return;
++        }
++        @SuppressWarnings("unchecked")
++        final Map<Object, Object> m = (Map<Object, Object>) obj;
++        // HARMFUL EFFECT: a predicate-violating entry survived deserialization (RED on the unpatched
++        // build). Post-fix this line is unreachable because readObject() throws above.
++        final boolean leaked = nullKey ? m.containsKey(violatingKey) : m.containsValue(null);
++        fail(label + ": INTEGRITY VIOLATION - deserialized " + obj.getClass().getSimpleName()
++                + " configured with NotNullPredicate was NOT rejected during readObject(); "
++                + "predicate-violating entry present=" + leaked + " (containsKey(null)/containsValue(null)), "
++                + "size=" + m.size() + ", yet its own put/validate would reject it. "
++                + "readObject() must re-validate restored entries via the shared validate() chokepoint.");
++    }
++
++    /**
++     * Deserializes the crafted stream and asserts the invariant for a COLLECTION-family instance.
++     */
++    private static void assertCollectionStreamRejectsViolation(final byte[] malicious,
++            final String label) throws Exception {
++        final Object obj;
++        try {
++            obj = deserialize(malicious);
++        } catch (final IllegalArgumentException ex) {
++            // SECURE post-fix behavior: the shared validate() chokepoint refused the payload during
++            // readObject() with the specific IllegalArgumentException. GREEN. (No catch-all.)
++            return;
++        }
++        @SuppressWarnings("unchecked")
++        final Collection<Object> c = (Collection<Object>) obj;
++        // HARMFUL EFFECT: a predicate-violating element survived deserialization (RED on the unpatched
++        // build). Post-fix this line is unreachable because readObject() throws above.
++        fail(label + ": INTEGRITY VIOLATION - deserialized " + obj.getClass().getSimpleName()
++                + " configured with NotNullPredicate was NOT rejected during readObject(); "
++                + "null element present=" + c.contains(null) + " (contains(null)), size=" + c.size()
++                + ", yet add(null) would reject it. readObject() must re-validate restored elements "
++                + "via the shared validate() chokepoint.");
++    }
++
++    // ------------------------------------------------------------------
++    // Malicious-stream builders (attacker's serializer, not our constructor)
++    // ------------------------------------------------------------------
++
++    /** A valid PredicatedMap whose backing map is then swapped for one carrying a null key. */
++    private static byte[] craftMapNullKeyStream() throws Exception {
++        final PredicatedMap<Object, Object> pm =
++                PredicatedMap.predicatedMap(new HashMap<>(),
++                        NotNullPredicate.notNullPredicate(), null);
++        final HashMap<Object, Object> hostile = new HashMap<>();
++        hostile.put(null, "attacker");           // null KEY violates keyPredicate=NotNull
++        injectField(pm, "map", hostile);
++        return serialize(pm);
++    }
++
++    /** Mirror route: value-predicate-only PredicatedMap with a null VALUE. */
++    private static byte[] craftMapNullValueStream() throws Exception {
++        final PredicatedMap<Object, Object> pm =
++                PredicatedMap.predicatedMap(new HashMap<>(),
++                        null, NotNullPredicate.notNullPredicate());
++        final HashMap<Object, Object> hostile = new HashMap<>();
++        hostile.put("k", null);                   // null VALUE violates valuePredicate=NotNull
++        injectField(pm, "map", hostile);
++        return serialize(pm);
++    }
++
++    /** PredicatedSortedMap driven directly (inherits the vulnerable readObject). */
++    private static byte[] craftSortedMapNullValueStream() throws Exception {
++        // key predicate null so a null value (not key) is the only violation; keys stay comparable.
++        final PredicatedSortedMap<Object, Object> pm =
++                PredicatedSortedMap.predicatedSortedMap(new TreeMap<>(),
++                        null, NotNullPredicate.notNullPredicate());
++        final TreeMap<Object, Object> hostile = new TreeMap<>();
++        hostile.put("k", null);                   // null VALUE violates valuePredicate=NotNull
++        injectField(pm, "map", hostile);
++        return serialize(pm);
++    }
++
++    /** Any PredicatedCollection whose backing collection is swapped for one carrying a null. */
++    private static byte[] craftCollectionNullElementStream(final Object decorator,
++            final Collection<Object> hostileBacking) throws Exception {
++        hostileBacking.add(null);                 // null element violates NotNull
++        injectField(decorator, "collection", hostileBacking);
++        return serialize(decorator);
++    }
++
++    // ------------------------------------------------------------------
++    // Exploits
++    // ------------------------------------------------------------------
++
++    /** Documented PoC verbatim: PredicatedMap + keyPredicate=NotNullPredicate + null key. */
++    @Test
++    public void exploitPredicatedMapNullKey() throws Exception {
++        final byte[] malicious = craftMapNullKeyStream();
++        assertMapStreamRejectsViolation(malicious, "PredicatedMap(keyPredicate=NotNull) + null key",
++                null, true);
++    }
++
++    /** Mirror route the PoC did not cover: value predicate violated, key predicate absent. */
++    @Test
++    public void exploitPredicatedMapNullValue() throws Exception {
++        final byte[] malicious = craftMapNullValueStream();
++        assertMapStreamRejectsViolation(malicious,
++                "PredicatedMap(valuePredicate=NotNull) + null value", "k", false);
++    }
++
++    /** PredicatedSortedMap driven directly, not inferred from PredicatedMap via inheritance. */
++    @Test
++    public void exploitPredicatedSortedMapNullValue() throws Exception {
++        final byte[] malicious = craftSortedMapNullValueStream();
++        assertMapStreamRejectsViolation(malicious,
++                "PredicatedSortedMap(valuePredicate=NotNull) + null value", "k", false);
++    }
++
++    /** PredicatedSet (collection-family subclass #1). */
++    @Test
++    public void exploitPredicatedSetNullElement() throws Exception {
++        final PredicatedSet<Object> ps =
++                PredicatedSet.predicatedSet(new HashSet<>(), NotNullPredicate.notNullPredicate());
++        final byte[] malicious = craftCollectionNullElementStream(ps, new HashSet<>());
++        assertCollectionStreamRejectsViolation(malicious, "PredicatedSet + null element");
++    }
++
++    /** PredicatedBag (collection-family subclass #2, distinct family). */
++    @Test
++    public void exploitPredicatedBagNullElement() throws Exception {
++        final PredicatedBag<Object> pb =
++                PredicatedBag.predicatedBag(new HashBag<>(), NotNullPredicate.notNullPredicate());
++        final byte[] malicious = craftCollectionNullElementStream(pb, new HashBag<>());
++        assertCollectionStreamRejectsViolation(malicious, "PredicatedBag + null element");
++    }
++
++    /** PredicatedList (collection-family subclass #3). */
++    @Test
++    public void exploitPredicatedListNullElement() throws Exception {
++        final PredicatedList<Object> pl =
++                PredicatedList.predicatedList(new ArrayList<>(), NotNullPredicate.notNullPredicate());
++        final byte[] malicious = craftCollectionNullElementStream(pl, new ArrayList<>());
++        assertCollectionStreamRejectsViolation(malicious, "PredicatedList + null element");
++    }
++
++    /** PredicatedQueue (collection-family subclass #4). */
++    @Test
++    public void exploitPredicatedQueueNullElement() throws Exception {
++        final PredicatedQueue<Object> pq =
++                PredicatedQueue.predicatedQueue(new LinkedList<>(), NotNullPredicate.notNullPredicate());
++        final byte[] malicious = craftCollectionNullElementStream(pq, new LinkedList<>());
++        assertCollectionStreamRejectsViolation(malicious, "PredicatedQueue + null element");
++    }
++
++    /** PredicatedCollection base class driven directly. */
++    @Test
++    public void exploitPredicatedCollectionBaseNullElement() throws Exception {
++        final PredicatedCollection<Object> pc = PredicatedCollection.predicatedCollection(
++                new ArrayList<>(), NotNullPredicate.notNullPredicate());
++        final byte[] malicious = craftCollectionNullElementStream(pc, new ArrayList<>());
++        assertCollectionStreamRejectsViolation(malicious, "PredicatedCollection (base) + null element");
++    }
++
++    // ------------------------------------------------------------------
++    // Positive control: a LEGITIMATE, predicate-satisfying instance must keep round-tripping.
++    // This stays GREEN before and after the fix; a fix that rejects it is a regression, not a win.
++    // ------------------------------------------------------------------
++
++    @Test
++    public void positiveControlValidMapRoundTrips() throws Exception {
++        final PredicatedMap<Object, Object> pm =
++                PredicatedMap.predicatedMap(new HashMap<>(),
++                        NotNullPredicate.notNullPredicate(), NotNullPredicate.notNullPredicate());
++        pm.put("k", "v");
++        final byte[] bytes = serialize(pm);
++        @SuppressWarnings("unchecked")
++        final Map<Object, Object> restored = (Map<Object, Object>) deserialize(bytes);
++        assertTrue(restored.containsKey("k") && "v".equals(restored.get("k")),
++                "legitimate predicate-satisfying PredicatedMap must survive round-trip unchanged");
++    }
++
++    // ------------------------------------------------------------------
++    // Preservation positive controls (Plan "Must-not-break"): a freshly built VALID instance of every
++    // Predicated* type, using a CUSTOM (non-library) Predicate implementation and a non-default backing
++    // Map/Collection where the type permits, must still serialize, deserialize to an equivalent
++    // instance, and keep enforcing the predicate on subsequent mutation. These stay GREEN before and
++    // after the fix; a fix whose re-validation loop rejects a legitimate instance breaks one of them.
++    // ------------------------------------------------------------------
++
++    /** A custom, test-local Serializable predicate (NOT one of the library's Predicate implementors). */
++    private static final class NonBlankStringPredicate implements Predicate<Object>, Serializable {
++        private static final long serialVersionUID = 1L;
++        @Override
++        public boolean evaluate(final Object object) {
++            return object instanceof String && !((String) object).trim().isEmpty();
++        }
++    }
++
++    @SuppressWarnings("unchecked")
++    private static <T> T roundTrip(final T o) throws Exception {
++        return (T) deserialize(serialize(o));
++    }
++
++    /** PredicatedMap with a custom predicate + non-default TreeMap backing; both slots set. */
++    @Test
++    public void preservationPredicatedMapCustomPredicateTreeMap() throws Exception {
++        final Predicate<Object> p = new NonBlankStringPredicate();
++        final PredicatedMap<Object, Object> pm =
++                PredicatedMap.predicatedMap(new TreeMap<>(), p, p);
++        pm.put("key", "value");
++        final Map<Object, Object> restored = roundTrip(pm);
++        assertEquals("value", restored.get("key"), "valid TreeMap-backed PredicatedMap must round-trip");
++        // predicate still enforced after deserialization
++        assertThrows(IllegalArgumentException.class, () -> restored.put(" ", "v"));
++    }
++
++    /** PredicatedSortedMap with a custom predicate + TreeMap backing. */
++    @Test
++    public void preservationPredicatedSortedMapCustomPredicate() throws Exception {
++        final Predicate<Object> p = new NonBlankStringPredicate();
++        final PredicatedSortedMap<Object, Object> pm =
++                PredicatedSortedMap.predicatedSortedMap(new TreeMap<>(), p, p);
++        pm.put("key", "value");
++        final Map<Object, Object> restored = roundTrip(pm);
++        assertEquals("value", restored.get("key"), "valid PredicatedSortedMap must round-trip");
++        assertThrows(IllegalArgumentException.class, () -> restored.put("k2", " "));
++    }
++
++    /** PredicatedMap with ONLY the key predicate set (value slot null == "no check"): must not NPE. */
++    @Test
++    public void preservationPredicatedMapNullValuePredicateSlot() throws Exception {
++        final PredicatedMap<Object, Object> pm =
++                PredicatedMap.predicatedMap(new HashMap<>(), new NonBlankStringPredicate(), null);
++        pm.put("k", null); // legal: value slot has no check
++        final Map<Object, Object> restored = roundTrip(pm);
++        assertTrue(restored.containsKey("k"), "PredicatedMap with only key predicate must round-trip");
++        assertThrows(IllegalArgumentException.class, () -> restored.put(" ", "x"));
++    }
++
++    /** PredicatedMap with ONLY the value predicate set (key slot null == "no check"): must not NPE. */
++    @Test
++    public void preservationPredicatedMapNullKeyPredicateSlot() throws Exception {
++        final PredicatedMap<Object, Object> pm =
++                PredicatedMap.predicatedMap(new HashMap<>(), null, new NonBlankStringPredicate());
++        pm.put(null, "v"); // legal: key slot has no check
++        final Map<Object, Object> restored = roundTrip(pm);
++        assertTrue(restored.containsValue("v"), "PredicatedMap with only value predicate must round-trip");
++        assertThrows(IllegalArgumentException.class, () -> restored.put("k2", " "));
++    }
++
++    /** PredicatedCollection base class with a custom predicate + non-default LinkedList backing. */
++    @Test
++    public void preservationPredicatedCollectionBase() throws Exception {
++        final PredicatedCollection<Object> pc =
++                PredicatedCollection.predicatedCollection(new LinkedList<>(), new NonBlankStringPredicate());
++        pc.add("ok");
++        final Collection<Object> restored = roundTrip(pc);
++        assertTrue(restored.contains("ok"), "valid PredicatedCollection must round-trip");
++        assertThrows(IllegalArgumentException.class, () -> restored.add(" "));
++    }
++
++    /** PredicatedSet with a custom predicate + non-default TreeSet backing. */
++    @Test
++    public void preservationPredicatedSet() throws Exception {
++        final PredicatedSet<Object> ps =
++                PredicatedSet.predicatedSet(new TreeSet<>(), new NonBlankStringPredicate());
++        ps.add("ok");
++        final Collection<Object> restored = roundTrip(ps);
++        assertTrue(restored.contains("ok"), "valid PredicatedSet must round-trip");
++        assertThrows(IllegalArgumentException.class, () -> restored.add(" "));
++    }
++
++    /** PredicatedSortedSet with a custom predicate + TreeSet backing. */
++    @Test
++    public void preservationPredicatedSortedSet() throws Exception {
++        final PredicatedSortedSet<Object> ps =
++                PredicatedSortedSet.predicatedSortedSet(new TreeSet<>(), new NonBlankStringPredicate());
++        ps.add("ok");
++        final Collection<Object> restored = roundTrip(ps);
++        assertTrue(restored.contains("ok"), "valid PredicatedSortedSet must round-trip");
++        assertThrows(IllegalArgumentException.class, () -> restored.add(" "));
++    }
++
++    /** PredicatedNavigableSet with a custom predicate + TreeSet backing. */
++    @Test
++    public void preservationPredicatedNavigableSet() throws Exception {
++        final PredicatedNavigableSet<Object> ps =
++                PredicatedNavigableSet.predicatedNavigableSet(new TreeSet<>(), new NonBlankStringPredicate());
++        ps.add("ok");
++        final Collection<Object> restored = roundTrip(ps);
++        assertTrue(restored.contains("ok"), "valid PredicatedNavigableSet must round-trip");
++        assertThrows(IllegalArgumentException.class, () -> restored.add(" "));
++    }
++
++    /** PredicatedList with a custom predicate + non-default LinkedList backing. */
++    @Test
++    public void preservationPredicatedList() throws Exception {
++        final PredicatedList<Object> pl =
++                PredicatedList.predicatedList(new LinkedList<>(), new NonBlankStringPredicate());
++        pl.add("ok");
++        final Collection<Object> restored = roundTrip(pl);
++        assertTrue(restored.contains("ok"), "valid PredicatedList must round-trip");
++        assertThrows(IllegalArgumentException.class, () -> restored.add(" "));
++    }
++
++    /** PredicatedQueue with a custom predicate + non-default ArrayDeque backing. */
++    @Test
++    public void preservationPredicatedQueue() throws Exception {
++        final PredicatedQueue<Object> pq =
++                PredicatedQueue.predicatedQueue(new ArrayDeque<>(), new NonBlankStringPredicate());
++        pq.add("ok");
++        final Collection<Object> restored = roundTrip(pq);
++        assertTrue(restored.contains("ok"), "valid PredicatedQueue must round-trip");
++        assertThrows(IllegalArgumentException.class, () -> restored.add(" "));
++    }
++
++    /** PredicatedBag with a custom predicate + non-default TreeBag backing. */
++    @Test
++    public void preservationPredicatedBag() throws Exception {
++        final PredicatedBag<Object> pb =
++                PredicatedBag.predicatedBag(new TreeBag<>(), new NonBlankStringPredicate());
++        pb.add("ok");
++        final Collection<Object> restored = roundTrip(pb);
++        assertTrue(restored.contains("ok"), "valid PredicatedBag must round-trip");
++        assertThrows(IllegalArgumentException.class, () -> restored.add(" "));
++    }
++
++    /** PredicatedSortedBag with a custom predicate + TreeBag backing. */
++    @Test
++    public void preservationPredicatedSortedBag() throws Exception {
++        final PredicatedSortedBag<Object> pb =
++                PredicatedSortedBag.predicatedSortedBag(new TreeBag<>(), new NonBlankStringPredicate());
++        pb.add("ok");
++        final Collection<Object> restored = roundTrip(pb);
++        assertTrue(restored.contains("ok"), "valid PredicatedSortedBag must round-trip");
++        assertThrows(IllegalArgumentException.class, () -> restored.add(" "));
++    }
++
++    /** PredicatedMultiSet with a custom predicate + HashMultiSet backing. */
++    @Test
++    public void preservationPredicatedMultiSet() throws Exception {
++        final PredicatedMultiSet<Object> pm =
++                PredicatedMultiSet.predicatedMultiSet(new HashMultiSet<>(), new NonBlankStringPredicate());
++        pm.add("ok");
++        final Collection<Object> restored = roundTrip(pm);
++        assertTrue(restored.contains("ok"), "valid PredicatedMultiSet must round-trip");
++        assertThrows(IllegalArgumentException.class, () -> restored.add(" "));
++    }
++}
+-- 
+2.55.0
+

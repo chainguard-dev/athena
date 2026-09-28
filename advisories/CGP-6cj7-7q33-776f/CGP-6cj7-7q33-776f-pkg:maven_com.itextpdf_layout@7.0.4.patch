@@ -1,0 +1,556 @@
+From 1e275ea4418c4e5fa5b72bdb29825afccc7663b6 Mon Sep 28 16:00:00 2026
+From: vuln-patch-bot <vuln-patch@chainguard.dev>
+Date: Mon, 28 Sep 2026 16:00:00 +0000
+Subject: [PATCH] fix CGP-6cj7-7q33-776f: harden hyphenation PatternParser
+ against XXE
+
+com.itextpdf.layout.hyphenation.PatternParser.createParser() built a
+JAXP SAXParserFactory (CWE-611 XML External Entity injection, with a
+related CWE-776 entity-expansion DoS exposure) that only disabled
+"http://apache.org/xml/features/nonvalidating/load-external-dtd". It
+did not disable external general entities, external parameter
+entities, or XInclude, and set no bound on entity expansion. Because
+DOCTYPE declarations were still accepted, an attacker able to supply
+or influence a hyphenation-pattern XML document (via
+Hyphenator.getHyphenationTree, HyphenationTree.loadPatterns, or
+PatternParser.parse and their FileInputStream-opening overloads)
+could embed an internal DTD subset that declares an external general
+or parameter entity, causing the parser to read local files, make
+outbound requests (SSRF), exfiltrate data out-of-band via parameter
+entities, or exhaust memory/CPU via unbounded entity expansion
+("billion laughs").
+
+The fix hardens the single chokepoint, createParser(), which is
+shared by every caller that reaches parser.parse(source) (the
+PatternParser constructor and getExternalClasses()): it explicitly
+sets external-general-entities=false, external-parameter-entities=
+false, keeps load-external-dtd=false, enables
+javax.xml.XMLConstants.FEATURE_SECURE_PROCESSING to bound entity
+expansion, and calls setXIncludeAware(false) to close the
+independent XInclude fetch path. A blanket disallow-doctype-decl was
+deliberately not used because 19 bundled hyphenation resources
+declare a benign, subset-less "<!DOCTYPE hyphenation-info SYSTEM
+hyphenation.dtd>" that must keep parsing without ever being fetched;
+the chosen feature set rejects hostile DOCTYPE content while still
+accepting that declaration. Any failure to apply one of these
+features continues to propagate out of createParser() as a thrown
+RuntimeException, so the parser is never returned under-hardened.
+
+The regression test class
+com.itextpdf.layout.hyphenation.PatternParserXxeTest drives the real
+sink through the PatternParser constructor, parse(InputStream,String),
+parse(String), and the public Hyphenator.getHyphenationTree(...) API
+entry points. It asserts that the documented file-read payload
+(file:///etc/passwd), a planted-secret file-read via both the
+InputStream and FileInputStream-opening entry points, an SSRF
+payload, and an out-of-band parameter-entity fetch are all rejected
+with no external effect observed, that a billion-laughs bomb is
+rejected promptly, that a raw XInclude-only payload with no DOCTYPE
+does not resolve, and that the benign bundled DOCTYPE form and a
+full bundled-style document driven through a caller-defined
+IPatternConsumer still parse successfully.
+
+CGP: CGP-6cj7-7q33-776f
+Cgp-Finding: CGP-6cj7-7q33-776f
+---
+ .../layout/hyphenation/PatternParser.java     |  22 +
+ .../hyphenation/PatternParserXxeTest.java     | 453 ++++++++++++++++++
+ 2 files changed, 475 insertions(+)
+ create mode 100644 layout/src/test/java/com/itextpdf/layout/hyphenation/PatternParserXxeTest.java
+
+diff --git a/layout/src/main/java/com/itextpdf/layout/hyphenation/PatternParser.java b/layout/src/main/java/com/itextpdf/layout/hyphenation/PatternParser.java
+index 5fc43bf3e..99d74c132 100644
+--- a/layout/src/main/java/com/itextpdf/layout/hyphenation/PatternParser.java
++++ b/layout/src/main/java/com/itextpdf/layout/hyphenation/PatternParser.java
+@@ -114,7 +114,29 @@ public class PatternParser extends DefaultHandler {
+             SAXParserFactory factory = SAXParserFactory.newInstance();
+             factory.setNamespaceAware(true);
+             factory.setValidating(false);
++            // XXE hardening (CGP-6cj7-7q33-776f, CWE-611 / CWE-776).
++            //
++            // Hyphenation pattern XML must never be able to make the parser fetch or resolve an
++            // external resource (via an external DTD subset, an external general or parameter
++            // entity, or an XInclude directive) over ANY URI scheme, nor expand entities without
++            // bound. A blanket "disallow-doctype-decl" is deliberately NOT used here: 19 bundled
++            // hyphenation resources declare a benign, subset-less
++            // <!DOCTYPE hyphenation-info SYSTEM "hyphenation.dtd"> that must keep parsing (the DTD
++            // itself is never fetched because load-external-dtd is off). Instead we neutralise
++            // every external-fetch and unbounded-expansion capability while still tolerating that
++            // benign DOCTYPE form.
++            //
++            // Any failure to apply one of these controls propagates out of this method as the
++            // RuntimeException below (fail-closed): the parser is never returned under-hardened.
+             factory.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
++            factory.setFeature("http://xml.org/sax/features/external-general-entities", false);
++            factory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
++            // Bound entity expansion so the internal-entity-only "billion laughs" bomb is rejected
++            // promptly rather than exhausting the JVM.
++            factory.setFeature(javax.xml.XMLConstants.FEATURE_SECURE_PROCESSING, true);
++            // XInclude is an external-fetch path independent of entity resolution; keep it off
++            // explicitly rather than relying on the default.
++            factory.setXIncludeAware(false);
+             return factory.newSAXParser().getXMLReader();
+         } catch (Exception e) {
+             throw new RuntimeException("Couldn't create XMLReader: " + e.getMessage());
+diff --git a/layout/src/test/java/com/itextpdf/layout/hyphenation/PatternParserXxeTest.java b/layout/src/test/java/com/itextpdf/layout/hyphenation/PatternParserXxeTest.java
+new file mode 100644
+index 000000000..b77fd95c8
+--- /dev/null
++++ b/layout/src/test/java/com/itextpdf/layout/hyphenation/PatternParserXxeTest.java
+@@ -0,0 +1,453 @@
++/*
++    Exploit harness for CGP-6cj7-7q33-776f (CWE-611 / CWE-776):
++    XXE + entity-expansion DoS in com.itextpdf.layout.hyphenation.PatternParser.
++
++    This test drives the EXACT vulnerable sink -- PatternParser.createParser() ->
++    parser.parse(source) -- through its real public callers (HyphenationTree.loadPatterns
++    and Hyphenator.getHyphenationTree), feeding attacker-controlled hyphenation-pattern XML.
++
++    Each test asserts the SECURITY PROPERTY (no external resource is fetched / resolved,
++    and unbounded entity expansion is rejected promptly). On the UNPATCHED build the
++    property is violated (external entities resolve, outbound requests fire, billion-laughs
++    expands), so the assertions FAIL and the suite exits NON-ZERO (RED). Once the parser is
++    hardened the property holds and the suite exits ZERO (GREEN). The patch phase re-runs
++    this exact command to observe RED->GREEN.
++ */
++package com.itextpdf.layout.hyphenation;
++
++import com.itextpdf.test.annotations.type.UnitTest;
++
++import java.io.ByteArrayInputStream;
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.net.InetSocketAddress;
++import java.net.ServerSocket;
++import java.net.Socket;
++import java.nio.charset.StandardCharsets;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.concurrent.CopyOnWriteArrayList;
++import java.util.concurrent.atomic.AtomicBoolean;
++
++import org.junit.Assert;
++import org.junit.Test;
++import org.junit.experimental.categories.Category;
++
++@Category(UnitTest.class)
++public class PatternParserXxeTest {
++
++    // The sensitive value that MUST NOT be exfiltrated via an external entity.
++    private static final String SECRET = "TOP_SECRET_XXE_MARKER_9f3a2b";
++
++    /**
++     * A pattern consumer that records every token the SAX handler routes to it. If an
++     * external entity resolves, its inlined content lands here -- that is the concrete,
++     * observable file-read effect.
++     */
++    private static final class CapturingConsumer implements IPatternConsumer {
++        final List<String> captured = new ArrayList<>();
++        public void addClass(String chargroup) { captured.add(chargroup); }
++        public void addException(String word, List hyphenatedword) { captured.add(word); }
++        public void addPattern(String pattern, String values) { captured.add(pattern); }
++        String all() {
++            StringBuilder sb = new StringBuilder();
++            for (int i = 0; i < captured.size(); i++) {
++                if (i > 0) { sb.append('|'); }
++                sb.append(captured.get(i));
++            }
++            return sb.toString();
++        }
++    }
++
++    /**
++     * A dead-simple loopback HTTP server. Any inbound connection is recorded (proving an
++     * outbound fetch fired -- SSRF / OOB) and answered with a harmless empty DTD so the
++     * parser does not blow up before we can observe the hit.
++     */
++    private static final class Sink implements Runnable, AutoCloseable {
++        final ServerSocket server;
++        final List<String> requestLines = new CopyOnWriteArrayList<>();
++        final AtomicBoolean stop = new AtomicBoolean(false);
++        final Thread thread;
++
++        Sink() throws IOException {
++            server = new ServerSocket();
++            server.setReuseAddress(true);
++            server.bind(new InetSocketAddress("127.0.0.1", 0));
++            server.setSoTimeout(500);
++            thread = new Thread(this, "xxe-sink");
++            thread.setDaemon(true);
++            thread.start();
++        }
++
++        int port() { return server.getLocalPort(); }
++        boolean wasHit() { return !requestLines.isEmpty(); }
++
++        public void run() {
++            while (!stop.get()) {
++                try (Socket s = server.accept()) {
++                    byte[] buf = new byte[1024];
++                    int n = s.getInputStream().read(buf);
++                    if (n > 0) {
++                        requestLines.add(new String(buf, 0, n, StandardCharsets.ISO_8859_1).split("\r\n")[0]);
++                    }
++                    // Return an empty but well-formed DTD body.
++                    OutputStream out = s.getOutputStream();
++                    byte[] body = "<!-- -->".getBytes(StandardCharsets.ISO_8859_1);
++                    out.write(("HTTP/1.0 200 OK\r\nContent-Length: " + body.length + "\r\n\r\n").getBytes(StandardCharsets.ISO_8859_1));
++                    out.write(body);
++                    out.flush();
++                } catch (IOException ignored) {
++                    // accept timeout or client reset -- keep looping
++                }
++            }
++        }
++
++        public void close() {
++            stop.set(true);
++            try { server.close(); } catch (IOException ignored) {}
++        }
++    }
++
++    private static InputStream xml(String s) {
++        return new ByteArrayInputStream(s.getBytes(StandardCharsets.UTF_8));
++    }
++
++    // ---------------------------------------------------------------------------------------
++    // Attack 1 via the DOCUMENTED public execution trace:
++    //   Hyphenator.getHyphenationTree(InputStream,String)
++    //     -> HyphenationTree.loadPatterns(InputStream,String)
++    //       -> new PatternParser(this) -> createParser() -> parser.parse(source)
++    // The HyphenationTree IS the IPatternConsumer, so leaked file contents land in its
++    // exception stoplist -- observable via findPattern / the tree state. We assert the raw
++    // secret text never became a hyphenation token.
++    // ---------------------------------------------------------------------------------------
++    @Test
++    public void externalGeneralEntity_fileRead_viaHyphenatorPublicApi_mustNotResolve() throws Exception {
++        File secret = File.createTempFile("xxe-hyph", ".txt");
++        secret.deleteOnExit();
++        try (OutputStream os = new FileOutputStream(secret)) {
++            // A single alphabetic token so it is stored as a hyphenation pattern verbatim.
++            os.write("SECRETPATTERNZZ".getBytes(StandardCharsets.UTF_8));
++        }
++        String uri = secret.toURI().toString();
++        String doc =
++                "<!DOCTYPE hyphenation-info [<!ENTITY xxe SYSTEM \"" + uri + "\">]>" +
++                "<hyphenation-info><classes>sS\neE\ncC\nrR\ntT\npP\naA\nnN\nzZ</classes>" +
++                "<patterns>&xxe;</patterns></hyphenation-info>";
++
++        // Public API entry point -- exactly the trace in ## Analyze.
++        HyphenationTree tree = Hyphenator.getHyphenationTree(xml(doc), "attack.xml");
++
++        // HARMFUL EFFECT: if the entity resolved, the secret text is now a stored pattern.
++        // getPattern() keeps the token verbatim (only strips digits) and does not case-fold at
++        // store time, so the stored key is the exact uppercase token.
++        boolean leaked = tree != null && !tree.findPattern("SECRETPATTERNZZ").isEmpty();
++        Assert.assertFalse(
++                "XXE file read succeeded through Hyphenator.getHyphenationTree public API: the "
++                        + "external-entity file contents became a hyphenation pattern in the tree",
++                leaked);
++    }
++
++    // ---------------------------------------------------------------------------------------
++    // Attack 1: local file disclosure via external general entity (the flagship harmful effect)
++    // ---------------------------------------------------------------------------------------
++    @Test
++    public void externalGeneralEntity_fileRead_mustNotResolve() throws Exception {
++        File secret = File.createTempFile("xxe-secret", ".txt");
++        secret.deleteOnExit();
++        try (OutputStream os = new FileOutputStream(secret)) {
++            os.write(SECRET.getBytes(StandardCharsets.UTF_8));
++        }
++        String uri = secret.toURI().toString(); // file:/...
++
++        CapturingConsumer consumer = new CapturingConsumer();
++        // <classes> first so hasClasses==true and getExternalClasses() (classes.xml) is skipped.
++        String doc =
++                "<!DOCTYPE hyphenation-info [<!ENTITY xxe SYSTEM \"" + uri + "\">]>" +
++                "<hyphenation-info><classes>aA</classes>" +
++                "<exceptions>&xxe;</exceptions></hyphenation-info>";
++
++        driveThroughPatternParser(consumer, doc);
++
++        // HARMFUL EFFECT: the secret file's contents were inlined and reached the consumer.
++        boolean leaked = consumer.all().contains(SECRET);
++        Assert.assertFalse(
++                "XXE file read succeeded: secret file contents were resolved and exposed via the "
++                        + "hyphenation PatternParser consumer (captured=[" + consumer.all() + "])",
++                leaked);
++    }
++
++    /**
++     * Drives the payload through PatternParser directly (public constructor + parse), the
++     * innermost real path to the sink. Returns true if parse() threw.
++     */
++    private static boolean driveThroughPatternParser(CapturingConsumer consumer, String doc) {
++        try {
++            PatternParser pp = new PatternParser(consumer);
++            pp.parse(xml(doc), "attack.xml");
++            return false;
++        } catch (HyphenationException expected) {
++            return true;
++        }
++    }
++
++    // Documented payload verbatim: file:///etc/passwd via external general entity.
++    @Test
++    public void documented_fileReadPayload_mustNotResolveEtcPasswd() {
++        CapturingConsumer consumer = new CapturingConsumer();
++        String doc =
++                "<!DOCTYPE foo [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]>" +
++                "<hyphenation-info><classes>aA</classes>" +
++                "<exceptions>&xxe;</exceptions></hyphenation-info>";
++        driveThroughPatternParser(consumer, doc);
++        // /etc/passwd on this VM always contains the root entry -- if resolved, it leaks here.
++        boolean leaked = consumer.all().contains("root:");
++        Assert.assertFalse(
++                "XXE resolved file:///etc/passwd through the hyphenation parser (captured=["
++                        + consumer.all() + "])",
++                leaked);
++    }
++
++    // ---------------------------------------------------------------------------------------
++    // Attack 2: SSRF via external general entity -- observe an actual outbound request fire.
++    // ---------------------------------------------------------------------------------------
++    @Test
++    public void externalGeneralEntity_ssrf_mustNotFetch() throws Exception {
++        try (Sink sink = new Sink()) {
++            CapturingConsumer consumer = new CapturingConsumer();
++            String url = "http://127.0.0.1:" + sink.port() + "/latest/meta-data/";
++            String doc =
++                    "<!DOCTYPE foo [<!ENTITY xxe SYSTEM \"" + url + "\">]>" +
++                    "<hyphenation-info><classes>aA</classes>" +
++                    "<exceptions>&xxe;</exceptions></hyphenation-info>";
++            driveThroughPatternParser(consumer, doc);
++            Thread.sleep(150); // let the accept loop record any hit
++            Assert.assertFalse(
++                    "SSRF: hyphenation PatternParser made an outbound request to a general-entity URL "
++                            + "(server saw: " + sink.requestLines + ")",
++                    sink.wasHit());
++        }
++    }
++
++    // ---------------------------------------------------------------------------------------
++    // Attack 3: OOB exfiltration via external PARAMETER entity -- external DTD is fetched.
++    // ---------------------------------------------------------------------------------------
++    @Test
++    public void externalParameterEntity_oob_mustNotFetch() throws Exception {
++        try (Sink sink = new Sink()) {
++            CapturingConsumer consumer = new CapturingConsumer();
++            String url = "http://127.0.0.1:" + sink.port() + "/evil.dtd";
++            String doc =
++                    "<!DOCTYPE foo [<!ENTITY % ext SYSTEM \"" + url + "\"> %ext;]>" +
++                    "<hyphenation-info><classes>aA</classes></hyphenation-info>";
++            driveThroughPatternParser(consumer, doc);
++            Thread.sleep(150);
++            Assert.assertFalse(
++                    "OOB XXE: hyphenation PatternParser fetched an external parameter-entity DTD "
++                            + "(server saw: " + sink.requestLines + ")",
++                    sink.wasHit());
++        }
++    }
++
++    // ---------------------------------------------------------------------------------------
++    // Attack 4: billion-laughs entity-expansion DoS (internal entities only, no network).
++    // Assert PROMPT rejection: a hardened parser refuses the DOCTYPE / bounds expansion and
++    // returns quickly; the unpatched parser expands (or errors only after work) so the
++    // "rejected promptly with an exception" property is violated.
++    // ---------------------------------------------------------------------------------------
++    @Test
++    public void billionLaughs_mustBeRejectedPromptly() throws Exception {
++        final String doc =
++                "<!DOCTYPE lolz [\n" +
++                " <!ENTITY lol \"lol\">\n" +
++                " <!ENTITY lol1 \"&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;\">\n" +
++                " <!ENTITY lol2 \"&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;\">\n" +
++                " <!ENTITY lol3 \"&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;\">\n" +
++                " <!ENTITY lol4 \"&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;\">\n" +
++                " <!ENTITY lol5 \"&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;\">\n" +
++                " <!ENTITY lol6 \"&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;\">\n" +
++                " <!ENTITY lol7 \"&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;\">\n" +
++                " <!ENTITY lol8 \"&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;\">\n" +
++                " <!ENTITY lol9 \"&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;\">\n" +
++                "]><lolz>&lol9;</lolz>";
++
++        final AtomicBoolean rejected = new AtomicBoolean(false);
++        final AtomicBoolean completedNoError = new AtomicBoolean(false);
++        Thread worker = new Thread(new Runnable() {
++            public void run() {
++                CapturingConsumer consumer = new CapturingConsumer();
++                try {
++                    PatternParser pp = new PatternParser(consumer);
++                    pp.parse(xml(doc), "lolz.xml");
++                    completedNoError.set(true); // parsed the bomb without refusing it
++                } catch (Throwable t) {
++                    rejected.set(true); // refused (SAX error / OOM guard / expansion limit)
++                }
++            }
++        }, "billion-laughs");
++        worker.setDaemon(true);
++        worker.start();
++        // A hardened parser refuses almost instantly. Give a generous 8s ceiling; the
++        // unpatched parser is still grinding on expansion at that point.
++        worker.join(8000);
++
++        boolean promptlyRejected = rejected.get() && !worker.isAlive();
++        Assert.assertTrue(
++                "Billion-laughs was NOT rejected promptly: worker still running or expansion "
++                        + "proceeded (rejected=" + rejected.get() + ", completedNoError="
++                        + completedNoError.get() + ", stillAlive=" + worker.isAlive() + ")",
++                promptlyRejected);
++    }
++
++    // ---------------------------------------------------------------------------------------
++    // Attack 5 (NON-ENUMERATED completeness route): XInclude file read, NO DOCTYPE at all.
++    // The parser is namespace-aware; if XInclude processing is not explicitly disabled this
++    // is an independent external-fetch path a DOCTYPE-only fix does not close.
++    // ---------------------------------------------------------------------------------------
++    @Test
++    public void xincludeFileRead_noDoctype_mustNotResolve() throws Exception {
++        File secret = File.createTempFile("xxe-xinclude", ".txt");
++        secret.deleteOnExit();
++        try (OutputStream os = new FileOutputStream(secret)) {
++            os.write(SECRET.getBytes(StandardCharsets.UTF_8));
++        }
++        String uri = secret.toURI().toString();
++
++        CapturingConsumer consumer = new CapturingConsumer();
++        String doc =
++                "<hyphenation-info xmlns:xi=\"http://www.w3.org/2001/XInclude\">" +
++                "<classes>aA</classes>" +
++                "<exceptions><xi:include href=\"" + uri + "\" parse=\"text\"/></exceptions>" +
++                "</hyphenation-info>";
++        driveThroughPatternParser(consumer, doc);
++
++        boolean leaked = consumer.all().contains(SECRET);
++        Assert.assertFalse(
++                "XInclude file read succeeded through the hyphenation parser (captured=["
++                        + consumer.all() + "])",
++                leaked);
++    }
++
++    // ---------------------------------------------------------------------------------------
++    // Attack 1 via a FileInputStream-opening entry point (PatternParser.parse(String) and
++    // HyphenationTree.loadPatterns(String)) so the fix is proven for the file-path overloads
++    // too, not only the InputStream ones.
++    // ---------------------------------------------------------------------------------------
++    @Test
++    public void externalGeneralEntity_fileRead_viaFilePathEntryPoint_mustNotResolve() throws Exception {
++        File secret = File.createTempFile("xxe-secret-fp", ".txt");
++        secret.deleteOnExit();
++        try (OutputStream os = new FileOutputStream(secret)) {
++            os.write(SECRET.getBytes(StandardCharsets.UTF_8));
++        }
++        String uri = secret.toURI().toString();
++
++        String doc =
++                "<!DOCTYPE hyphenation-info [<!ENTITY xxe SYSTEM \"" + uri + "\">]>" +
++                "<hyphenation-info><classes>aA</classes>" +
++                "<exceptions>&xxe;</exceptions></hyphenation-info>";
++
++        File attackFile = File.createTempFile("attack", ".xml");
++        attackFile.deleteOnExit();
++        try (OutputStream os = new FileOutputStream(attackFile)) {
++            os.write(doc.getBytes(StandardCharsets.UTF_8));
++        }
++
++        CapturingConsumer consumer = new CapturingConsumer();
++        try {
++            PatternParser pp = new PatternParser(consumer);
++            pp.parse(attackFile.getAbsolutePath()); // opens FileInputStream internally
++        } catch (Exception expected) {
++            // rejected -- fine
++        }
++
++        boolean leaked = consumer.all().contains(SECRET);
++        Assert.assertFalse(
++                "XXE file read succeeded through PatternParser.parse(String) file-path entry point "
++                        + "(captured=[" + consumer.all() + "])",
++                leaked);
++    }
++
++    // ---------------------------------------------------------------------------------------
++    // POSITIVE CONTROL (preservation): the exact benign DOCTYPE that 19 bundled hyphenation
++    // resources use MUST keep parsing successfully -- before AND after the fix. This pins the
++    // preservation boundary: a fix that blanket-rejects every DOCTYPE would break this and
++    // regress real functionality. It stays GREEN on both the unpatched and patched builds.
++    // ---------------------------------------------------------------------------------------
++    @Test
++    public void benignDoctype_hyphenationDtd_mustStillParse() {
++        CapturingConsumer consumer = new CapturingConsumer();
++        // Bare external SYSTEM DTD reference, NO internal subset, NO custom entities --
++        // identical to hyph/.../en_US.xml. load-external-dtd=false means it is never fetched.
++        String doc =
++                "<?xml version=\"1.0\" encoding=\"US-ASCII\"?>" +
++                "<!DOCTYPE hyphenation-info SYSTEM \"hyphenation.dtd\">" +
++                "<hyphenation-info>" +
++                "<classes>aA\nbB</classes>" +
++                "<exceptions>as-so-ciate</exceptions>" +
++                "<patterns>a1b2c</patterns>" +
++                "</hyphenation-info>";
++        try {
++            PatternParser pp = new PatternParser(consumer);
++            pp.parse(xml(doc), "en_US.xml");
++        } catch (Exception e) {
++            Assert.fail("Preservation regression: the benign hyphenation.dtd DOCTYPE form used by "
++                    + "bundled resources failed to parse: " + e);
++        }
++        Assert.assertFalse("Benign document should have produced hyphenation tokens",
++                consumer.captured.isEmpty());
++    }
++
++    /**
++     * A caller-defined (third-party style) IPatternConsumer implementation -- NOT the test's
++     * CapturingConsumer and NOT a JDK type -- driven through the public
++     * PatternParser(IPatternConsumer) constructor + parse(InputStream,String) API. Records each
++     * element category separately so we can prove every legitimate category still flows through
++     * after the fix.
++     */
++    private static final class CountingConsumer implements IPatternConsumer {
++        int classes;
++        int exceptions;
++        int patterns;
++        public void addClass(String chargroup) { classes++; }
++        public void addException(String word, List hyphenatedword) { exceptions++; }
++        public void addPattern(String pattern, String values) { patterns++; }
++    }
++
++    // ---------------------------------------------------------------------------------------
++    // POSITIVE CONTROL (preservation): a full, realistic bundled-style hyphenation document --
++    // the exact benign "hyphenation-info"/"hyphenation.dtd" SYSTEM DOCTYPE the shipped
++    // resources (e.g. en.xml) use, with classes, exceptions (including a <hyphen> element) and
++    // patterns -- MUST keep parsing successfully through the public PatternParser API with a
++    // caller-supplied custom IPatternConsumer. Confirms the fix did NOT narrow legitimate
++    // hyphenation parsing, the public signatures/thrown types are unchanged, and a third-party
++    // consumer implementation is still driven correctly. GREEN before AND after the fix.
++    // ---------------------------------------------------------------------------------------
++    @Test
++    public void benignBundledStyleDoc_customConsumer_mustStillParse() throws Exception {
++        String doc =
++                "<?xml version=\"1.0\" encoding=\"US-ASCII\"?>" +
++                "<!DOCTYPE hyphenation-info SYSTEM \"hyphenation.dtd\">" +
++                "<hyphenation-info>" +
++                "<hyphen-char value=\"-\"/>" +
++                "<classes>aA\nbB\ncC\ndD\neE</classes>" +
++                "<exceptions>as-so-ciate<hyphen pre=\"\" no=\"\" post=\"\"/>bc</exceptions>" +
++                "<patterns>a1bc2d3e</patterns>" +
++                "</hyphenation-info>";
++
++        CountingConsumer consumer = new CountingConsumer();
++        PatternParser pp = new PatternParser(consumer); // public constructor, unchanged signature
++        pp.parse(xml(doc), "en.xml");                   // public parse(InputStream,String), unchanged
++
++        Assert.assertTrue("Preservation regression: classes were not parsed from a benign "
++                + "bundled-style hyphenation document", consumer.classes > 0);
++        Assert.assertTrue("Preservation regression: exceptions were not parsed from a benign "
++                + "bundled-style hyphenation document", consumer.exceptions > 0);
++        Assert.assertTrue("Preservation regression: patterns were not parsed from a benign "
++                + "bundled-style hyphenation document", consumer.patterns > 0);
++    }
++}
+-- 
+2.55.0
+

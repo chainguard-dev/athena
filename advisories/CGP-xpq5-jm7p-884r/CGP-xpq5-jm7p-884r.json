@@ -1,0 +1,48 @@
+{
+  "id": "CGP-xpq5-jm7p-884r",
+  "schema_version": "1.6.0",
+  "summary": "Signature stripping authentication bypass via generic parse() accepting unsigned tokens when key is configured.",
+  "details": "### Root Cause\nThe parser's signature-verification block is gated solely on the presence of a non-empty third segment (`base64UrlEncodedDigest != null`). If an attacker strips the third segment (sending a token with a trailing dot but no signature), the entire signature-verification block is skipped, even if a key is configured. The parser then returns an unsigned `DefaultJwt` containing attacker-controlled claims.\n\n### Attack Vectors\nAn unauthenticated remote attacker can send an unsigned token (e.g., `eyJhbGciOiJub25lIn0.eyJzdWIiOiJhZG1pbiJ9.`) to an application using the generic `parse()` method. The parser accepts the token and returns the claims as authentic, enabling complete authentication bypass.\n\n### Remediation\nThrow a `MalformedJwtException` or `SignatureException` if `base64UrlEncodedDigest == null` and a key, keyBytes, or signingKeyResolver is configured.",
+  "severity": [
+    {
+      "type": "CVSS_V3",
+      "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+    }
+  ],
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Maven",
+        "name": "io.jsonwebtoken:jjwt",
+        "purl": "pkg:maven/io.jsonwebtoken/jjwt"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0.1"
+            },
+            {
+              "fixed": "0.12.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "cwe_ids": [
+          "CWE-347"
+        ],
+        "sink_locator": [
+          {
+            "class": "io.jsonwebtoken.impl.DefaultJwtParser",
+            "method": "parse(String)",
+            "file_line": "src/main/java/io/jsonwebtoken/impl/DefaultJwtParser.java:237-239,280,416-420"
+          }
+        ]
+      }
+    }
+  ],
+  "published": "2026-09-28T16:00:00Z",
+  "modified": "2026-09-28T16:00:00Z"
+}

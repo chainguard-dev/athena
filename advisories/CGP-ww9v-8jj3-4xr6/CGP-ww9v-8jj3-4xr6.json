@@ -1,0 +1,48 @@
+{
+  "id": "CGP-ww9v-8jj3-4xr6",
+  "schema_version": "1.6.0",
+  "summary": "DashboardHandler in mockserver-netty concatenates unsanitized URL path onto classpath prefix, enabling path traversal to read arbitrary classpath resources.",
+  "details": "### Root Cause\n\n`DashboardHandler.renderDashboard()` (lines 50–79 of `mockserver-netty/src/main/java/org/mockserver/dashboard/DashboardHandler.java`) concatenates the attacker-controlled URL suffix directly onto a fixed classpath prefix:\n\n```java\nString path = substringAfter(request.getPath().getValue(), PATH_PREFIX + \"/dashboard\");\nif (path.isEmpty() || path.equals(\"/\")) {\n    path = \"/index.html\";\n}\ntry (InputStream contentStream = DashboardHandler.class.getResourceAsStream(\"/org/mockserver/dashboard\" + path)) {\n```\n\nThere is no call to normalize the path, strip `..` sequences, or validate that the resolved resource falls within the `/org/mockserver/dashboard` subtree. The MIME type is looked up from the file extension after the last `.`, but this lookup does not gate access — if the extension is not in the MIME map, `MIME_MAP.get(extension)` returns `null`, which is passed as the `Content-Type` header, but the resource bytes are still returned.\n\n### Affected Locations\n\n- `org.mockserver.dashboard.DashboardHandler.renderDashboard(ChannelHandlerContext, HttpRequest)` (lines 50–79): the sink where the unsanitized path is concatenated and passed to `getResourceAsStream()`.\n\n### Attack Vectors\n\n- **Directory traversal via `..` sequences**: When MockServer runs with an exploded classpath (IDE, exploded WAR, Spring Boot devtools), a request such as `GET /mockserver/dashboard/../../../../application.properties` causes `getResourceAsStream(\"/org/mockserver/dashboard/../../../../application.properties\")` to resolve to `application.properties` at the classpath root, returning its contents to the attacker.\n- **Encoded traversal variants**: URL-encoded or double-encoded `..` sequences (e.g., `%2e%2e`, `%2e%2e%2f`) may bypass simple string-level checks if any intermediate layer decodes them before the path reaches `getResourceAsStream()`.\n- **Arbitrary classpath resource disclosure**: Accessible resources include `application.properties`, `logback.xml`, JKS keystores, `.class` bytecode, and any other file on the classpath.\n- **Packed JAR limitation**: When running purely from a packed JAR, the `ZipFile` lookup is exact-string, so `..` sequences typically do not resolve across JAR entry boundaries, limiting exploitability to exploded-directory deployments.\n\n### Impact\n\nAn unauthenticated remote attacker can read arbitrary classpath resources — including application configuration files, credentials, keystores, and bytecode — when MockServer is deployed with an exploded classpath. Confidentiality impact is high in affected deployment configurations; integrity and availability are not directly affected.\n\n### Trace\n\n`HttpRequestHandler.channelRead0()` receives `GET /mockserver/dashboard/...` → `dashboardHandler.renderDashboard(ctx, request)` → `path = substringAfter(request.getPath().getValue(), '/mockserver/dashboard')` (attacker-controlled, no sanitization) → `DashboardHandler.class.getResourceAsStream('/org/mockserver/dashboard' + path)` → bytes streamed back to client.",
+  "severity": [
+    {
+      "type": "CVSS_V3",
+      "score": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N/E:X/RL:X/RC:R"
+    }
+  ],
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Maven",
+        "name": "org.mock-server:mockserver-netty",
+        "purl": "pkg:maven/org.mock-server/mockserver-netty"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "5.4.1"
+            },
+            {
+              "fixed": "6.0.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "cwe_ids": [
+          "CWE-22"
+        ],
+        "sink_locator": [
+          {
+            "class": "org.mockserver.dashboard.DashboardHandler",
+            "method": "renderDashboard(ChannelHandlerContext,HttpRequest)",
+            "file_line": "mockserver-netty/src/main/java/org/mockserver/dashboard/DashboardHandler.java:50-79"
+          }
+        ]
+      }
+    }
+  ],
+  "published": "2026-09-28T16:00:00Z",
+  "modified": "2026-09-28T16:00:00Z"
+}

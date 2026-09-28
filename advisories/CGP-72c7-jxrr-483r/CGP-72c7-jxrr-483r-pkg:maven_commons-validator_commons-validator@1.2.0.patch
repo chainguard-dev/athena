@@ -1,0 +1,287 @@
+From b9e5a76220abe26a20ca58531e8fa4e3de4363ce Mon Sep 28 16:00:00 2026
+From: patch-forge <patch@chainguard.dev>
+Date: Mon, 28 Sep 2026 16:00:00 +0000
+Subject: [PATCH] fix: bound domain-segment array writes in
+ UrlValidator/EmailValidator
+
+Vuln-ID: CGP-72c7-jxrr-483r
+Cgp-Finding: CGP-72c7-jxrr-483r
+---
+ .../commons/validator/EmailValidator.java     |   9 +
+ .../commons/validator/UrlValidator.java       |   9 +
+ .../validator/UrlEmailLabelDosTest.java       | 210 ++++++++++++++++++
+ .../commons/validator/ValidatorTestSuite.java |   1 +
+ 4 files changed, 229 insertions(+)
+ create mode 100644 src/test/org/apache/commons/validator/UrlEmailLabelDosTest.java
+
+diff --git a/src/share/org/apache/commons/validator/EmailValidator.java b/src/share/org/apache/commons/validator/EmailValidator.java
+index 675ce1d7..2463b04d 100644
+--- a/src/share/org/apache/commons/validator/EmailValidator.java
++++ b/src/share/org/apache/commons/validator/EmailValidator.java
+@@ -201,6 +201,15 @@ public class EmailValidator {
+         while (match) {
+             match = atomMatcher.match(ATOM_PATTERN, domain);
+             if (match) {
++                // CWE-129/CWE-400: bound the loop index against the array's
++                // actual capacity before every write. A domain with more labels
++                // than domainSegment can hold (e.g. 11+ labels) would otherwise
++                // overrun the fixed array and throw an uncaught
++                // ArrayIndexOutOfBoundsException, crashing the caller (DoS).
++                // Fail closed to the boolean contract instead.
++                if (i < 0 || i >= domainSegment.length) {
++                    return false;
++                }
+                 domainSegment[i] = atomMatcher.group(1);
+                 int l = domainSegment[i].length() + 1;
+                 domain =
+diff --git a/src/share/org/apache/commons/validator/UrlValidator.java b/src/share/org/apache/commons/validator/UrlValidator.java
+index 86d1d882..eb664318 100644
+--- a/src/share/org/apache/commons/validator/UrlValidator.java
++++ b/src/share/org/apache/commons/validator/UrlValidator.java
+@@ -364,6 +364,15 @@ public class UrlValidator implements Serializable {
+             while (match) {
+                 match = atomMatcher.match(ATOM_PATTERN, hostIP);
+                 if (match) {
++                    // CWE-129/CWE-400: bound the loop index against the array's
++                    // actual capacity before every write. A hostname with more
++                    // labels than domainSegment can hold (e.g. 11+ labels) would
++                    // otherwise overrun the fixed array and throw an uncaught
++                    // ArrayIndexOutOfBoundsException, crashing the caller (DoS).
++                    // Fail closed to the boolean contract instead.
++                    if (segmentCount < 0 || segmentCount >= domainSegment.length) {
++                        return false;
++                    }
+                     domainSegment[segmentCount] = atomMatcher.group(1);
+                     segmentLength = domainSegment[segmentCount].length() + 1;
+                     hostIP =
+diff --git a/src/test/org/apache/commons/validator/UrlEmailLabelDosTest.java b/src/test/org/apache/commons/validator/UrlEmailLabelDosTest.java
+new file mode 100644
+index 00000000..8078516f
+--- /dev/null
++++ b/src/test/org/apache/commons/validator/UrlEmailLabelDosTest.java
+@@ -0,0 +1,210 @@
++/*
++ * Exploit harness for CGP-72c7-jxrr-483r (CWE-400 / CWE-129):
++ * ArrayIndexOutOfBoundsException DoS in domain-segment parsing.
++ *
++ * UrlValidator.isValidAuthority and EmailValidator.isValidSymbolicDomain each
++ * allocate a fixed String[10] and write one entry per dot-separated label with
++ * no bound check on the loop index. A hostname/domain with 11+ labels overruns
++ * the array and throws an uncaught ArrayIndexOutOfBoundsException that
++ * propagates out of the public validator entry points, crashing the caller.
++ *
++ * These tests DRIVE the real runtime sink through all four public entry points
++ * (UrlValidator.isValid, GenericValidator.isUrl, EmailValidator.getInstance().isValid,
++ * GenericValidator.isEmail) and assert the concrete harmful effect on the UNPATCHED
++ * build: the specific ArrayIndexOutOfBoundsException escapes as an uncaught crash.
++ *
++ * Once the sink is bounded (fail-closed to a boolean), these same calls must
++ * return a boolean with NO exception -- that is the RED->GREEN flip the patch
++ * stage produces by re-running this suite.
++ */
++
++package org.apache.commons.validator;
++
++import junit.framework.Test;
++import junit.framework.TestCase;
++import junit.framework.TestSuite;
++
++public class UrlEmailLabelDosTest extends TestCase {
++
++    // OSV documented payloads (verbatim). Both have 11 dot-separated labels in
++    // the host/domain portion (10 x "a" + "com"), one past the fixed capacity 10.
++    private static final String URL_11_LABELS   = "http://a.a.a.a.a.a.a.a.a.a.com/";
++    private static final String EMAIL_11_LABELS = "test@a.a.a.a.a.a.a.a.a.a.com";
++
++    // Legitimate positive controls: label count at/below the existing capacity.
++    private static final String URL_OK   = "http://www.example.com/";
++    private static final String EMAIL_OK = "user@mail.example.com";
++
++    public UrlEmailLabelDosTest(String testName) {
++        super(testName);
++    }
++
++    public static Test suite() {
++        return new TestSuite(UrlEmailLabelDosTest.class);
++    }
++
++    // Build "http://a.a.....a.com/" with the given number of single-char labels
++    // BEFORE the ".com" TLD, so total host label count = labelsBeforeTld + 1.
++    private static String urlWithLabels(int labelsBeforeTld) {
++        StringBuffer sb = new StringBuffer("http://");
++        for (int i = 0; i < labelsBeforeTld; i++) {
++            sb.append("a.");
++        }
++        sb.append("com/");
++        return sb.toString();
++    }
++
++    private static String emailWithLabels(int labelsBeforeTld) {
++        StringBuffer sb = new StringBuffer("test@");
++        for (int i = 0; i < labelsBeforeTld; i++) {
++            sb.append("a.");
++        }
++        sb.append("com");
++        return sb.toString();
++    }
++
++    // ------------------------------------------------------------------
++    // Outcome capture: run the validator call and record what happened,
++    // distinguishing the AIOOBE crash (the harmful effect) from a clean
++    // boolean return. We deliberately catch ONLY ArrayIndexOutOfBoundsException
++    // to record the exploit's specific effect; any other Throwable is rethrown
++    // so it cannot masquerade as "blocked".
++    // ------------------------------------------------------------------
++    private interface BoolCall {
++        boolean run();
++    }
++
++    private static final class Outcome {
++        final boolean returnedCleanly;
++        final boolean value;
++        final ArrayIndexOutOfBoundsException aioobe;
++        Outcome(boolean returnedCleanly, boolean value, ArrayIndexOutOfBoundsException e) {
++            this.returnedCleanly = returnedCleanly;
++            this.value = value;
++            this.aioobe = e;
++        }
++    }
++
++    private static Outcome invoke(BoolCall call) {
++        try {
++            boolean v = call.run();
++            return new Outcome(true, v, null);
++        } catch (ArrayIndexOutOfBoundsException e) {
++            return new Outcome(false, false, e);
++        }
++    }
++
++    // RED->GREEN assertion. The security invariant is: an over-capacity label
++    // count must resolve to the validator's boolean contract, never to a
++    // thread-crashing ArrayIndexOutOfBoundsException.
++    //
++    //  - UNPATCHED build: the sink overruns the fixed String[10] and an
++    //    ArrayIndexOutOfBoundsException escapes -> o.aioobe != null -> this
++    //    assertion FAILS -> test is RED, demonstrating the DoS crash.
++    //  - PATCHED build: the sink is bounded and isValid/isUrl/isEmail returns a
++    //    boolean cleanly -> o.aioobe == null -> this assertion PASSES -> GREEN.
++    //
++    // We assert on the SPECIFIC ArrayIndexOutOfBoundsException (captured in
++    // invoke()); any other Throwable is rethrown and never swallowed, so a
++    // natural error can never masquerade as a pass.
++    private static void assertNoDosCrash(String label, Outcome o) {
++        if (!o.returnedCleanly) {
++            fail(label + ": ArrayIndexOutOfBoundsException escaped the sink -- "
++                + "over-capacity label count crashed the request thread (DoS). "
++                + "Detail: " + o.aioobe);
++        }
++        // Reaching here means a boolean was returned with no crash (the secure,
++        // fail-closed outcome). Value itself is not asserted: whether an
++        // over-capacity host is rejected as false is the patch's choice; the
++        // invariant is only that NO unchecked exception propagates.
++    }
++
++    // ==================================================================
++    // Primary exploits: OSV documented payloads, direct validator entry points
++    // ==================================================================
++
++    // UrlValidator.isValid -> isValidAuthority sink (UrlValidator.java:367)
++    public void testUrlValidator_isValid_11labels_crashes() {
++        final UrlValidator v = new UrlValidator(UrlValidator.ALLOW_ALL_SCHEMES);
++        Outcome o = invoke(new BoolCall() {
++            public boolean run() { return v.isValid(URL_11_LABELS); }
++        });
++        assertNoDosCrash("UrlValidator.isValid(" + URL_11_LABELS + ")", o);
++    }
++
++    // EmailValidator.getInstance().isValid -> isValidSymbolicDomain sink
++    // (EmailValidator.java:204)
++    public void testEmailValidator_isValid_11labels_crashes() {
++        final EmailValidator v = EmailValidator.getInstance();
++        Outcome o = invoke(new BoolCall() {
++            public boolean run() { return v.isValid(EMAIL_11_LABELS); }
++        });
++        assertNoDosCrash("EmailValidator.isValid(" + EMAIL_11_LABELS + ")", o);
++    }
++
++    // ==================================================================
++    // Non-enumerated delegation routes (GenericValidator) -- same sinks,
++    // reached through the static wrapper entry points the OSV trace did not walk.
++    // ==================================================================
++
++    // GenericValidator.isUrl -> static UrlValidator.isValid -> isValidAuthority
++    public void testGenericValidator_isUrl_11labels_crashes() {
++        Outcome o = invoke(new BoolCall() {
++            public boolean run() { return GenericValidator.isUrl(URL_11_LABELS); }
++        });
++        assertNoDosCrash("GenericValidator.isUrl(" + URL_11_LABELS + ")", o);
++    }
++
++    // GenericValidator.isEmail -> EmailValidator.getInstance().isValid -> isValidSymbolicDomain
++    public void testGenericValidator_isEmail_11labels_crashes() {
++        Outcome o = invoke(new BoolCall() {
++            public boolean run() { return GenericValidator.isEmail(EMAIL_11_LABELS); }
++        });
++        assertNoDosCrash("GenericValidator.isEmail(" + EMAIL_11_LABELS + ")", o);
++    }
++
++    // ==================================================================
++    // Completeness / invariant coverage: a label count FAR beyond 11 (600),
++    // proving the crash is general to unbounded label counts. A fix that only
++    // special-cases "handle up to 11" would still crash here.
++    // ==================================================================
++
++    public void testUrlValidator_isValid_600labels_crashes() {
++        final String payload = urlWithLabels(600); // 601 host labels total
++        final UrlValidator v = new UrlValidator(UrlValidator.ALLOW_ALL_SCHEMES);
++        Outcome o = invoke(new BoolCall() {
++            public boolean run() { return v.isValid(payload); }
++        });
++        assertNoDosCrash("UrlValidator.isValid(<601-label host>)", o);
++    }
++
++    public void testEmailValidator_isValid_600labels_crashes() {
++        final String payload = emailWithLabels(600); // 601 domain labels total
++        final EmailValidator v = EmailValidator.getInstance();
++        Outcome o = invoke(new BoolCall() {
++            public boolean run() { return v.isValid(payload); }
++        });
++        assertNoDosCrash("EmailValidator.isValid(<601-label domain>)", o);
++    }
++
++    // ==================================================================
++    // Positive controls: legitimate, well-formed multi-label host/domain at or
++    // below the existing capacity must validate true through BOTH the direct
++    // validator and the GenericValidator wrapper -- pre-patch these already pass,
++    // and the patch must preserve them (must-not-break property).
++    // ==================================================================
++
++    public void testPositiveControl_validUrl_stillValid() {
++        UrlValidator v = new UrlValidator(UrlValidator.ALLOW_ALL_SCHEMES);
++        assertTrue("well-formed URL must validate true (direct)", v.isValid(URL_OK));
++        assertTrue("well-formed URL must validate true (GenericValidator)",
++                   GenericValidator.isUrl(URL_OK));
++    }
++
++    public void testPositiveControl_validEmail_stillValid() {
++        EmailValidator v = EmailValidator.getInstance();
++        assertTrue("well-formed email must validate true (direct)", v.isValid(EMAIL_OK));
++        assertTrue("well-formed email must validate true (GenericValidator)",
++                   GenericValidator.isEmail(EMAIL_OK));
++    }
++}
+diff --git a/src/test/org/apache/commons/validator/ValidatorTestSuite.java b/src/test/org/apache/commons/validator/ValidatorTestSuite.java
+index 05d635d3..032c9bd3 100644
+--- a/src/test/org/apache/commons/validator/ValidatorTestSuite.java
++++ b/src/test/org/apache/commons/validator/ValidatorTestSuite.java
+@@ -64,6 +64,7 @@ public class ValidatorTestSuite extends TestCase {
+        suite.addTest(ShortTest.suite());
+        suite.addTest(TypeTest.suite());
+        suite.addTest(UrlTest.suite());
++       suite.addTestSuite(UrlEmailLabelDosTest.class);
+        suite.addTest(ValidatorTest.suite());
+        suite.addTest(VarTest.suite());
+ 
+-- 
+2.55.0
+

@@ -1,0 +1,507 @@
+From 8d606f8643d715f203fc75a428dc39f5ce67a9d5 Mon Sep 28 16:00:00 2026
+From: vuln-patch <patch@chainguard.dev>
+Date: Mon, 28 Sep 2026 16:00:00 +0000
+Subject: [PATCH] fix CGP-xpq5-jm7p-884r: reject signature-stripped JWTs when
+ keyed
+
+This addresses a CWE-347 signature-stripping authentication bypass in
+io.jsonwebtoken.impl.DefaultJwtParser.parse(String jwt). The parser
+gated its entire signature-verification block solely on the presence
+of a non-empty third (signature) segment in the compact JWT string
+(base64UrlEncodedDigest != null). An attacker who strips the
+signature segment while keeping the trailing dot (for example
+"eyJhbGciOiJub25lIn0.eyJzdWIiOiJhZG1pbiJ9.") makes that check false,
+so the entire verification block -- including any configured Key,
+key bytes, or SigningKeyResolver -- was skipped, and the parser
+returned the attacker-controlled claims or body as authentic. This
+is a complete authentication bypass reachable from every public
+parse* entry point (parse(String), parse(String, JwtHandler),
+parsePlaintextJwt, parseClaimsJwt, parsePlaintextJws, parseClaimsJws),
+since they all funnel through the same parse(String) chokepoint.
+
+The root cause is that presence of the signature segment -- entirely
+attacker-controlled input -- was the sole gate deciding whether
+verification ran, rather than verification being unconditionally
+required whenever the parser has verification material configured.
+
+The fix adds a guard at that single parse(String) chokepoint: if the
+signature segment is absent (base64UrlEncodedDigest == null) and the
+parser has verification material configured (a Key, key bytes, or a
+SigningKeyResolver, via the new private isVerificationMaterialConfigured()
+helper), it throws a SignatureException before any Header, Claims, or
+body is constructed from the untrusted string. Because the guard sits
+before object construction and before the pre-existing algorithm/`alg`
+branch, it protects all six public entry points uniformly and does not
+depend on the attacker-controlled `alg` header value. A parser with no
+verification material configured is unaffected and continues to accept
+genuinely unsigned tokens (the documented "unsecured JWS" use case).
+
+The regression test, io.jsonwebtoken.SignatureStrippingExploitTest,
+exercises all six public entry points and all three verification-
+material configurations (Key, key bytes, SigningKeyResolver) with
+hand-built stripped-signature tokens, asserting each now throws
+MalformedJwtException or SignatureException instead of returning
+unverified content; it also adds positive-control tests proving
+genuinely unsigned tokens still parse when no verification material
+is configured, and that validly-signed tokens -- including through a
+caller-defined custom SigningKeyResolver -- still verify correctly.
+Five pre-existing tests in JwtParserTest and JwtsTest are updated
+because moving the rejection earlier (before body construction)
+changes an unsigned-plus-keyed token's exception from the later,
+weaker UnsupportedJwtException to the chokepoint's SignatureException;
+rejection of the unsigned token is preserved in every case.
+
+CGP: CGP-xpq5-jm7p-884r
+Cgp-Finding: CGP-xpq5-jm7p-884r
+---
+ .../jsonwebtoken/impl/DefaultJwtParser.java   |  27 ++
+ .../io/jsonwebtoken/JwtParserTest.groovy      |  25 +-
+ .../groovy/io/jsonwebtoken/JwtsTest.groovy    |   9 +-
+ .../SignatureStrippingExploitTest.groovy      | 298 ++++++++++++++++++
+ 4 files changed, 349 insertions(+), 10 deletions(-)
+ create mode 100644 src/test/groovy/io/jsonwebtoken/SignatureStrippingExploitTest.groovy
+
+diff --git a/src/main/java/io/jsonwebtoken/impl/DefaultJwtParser.java b/src/main/java/io/jsonwebtoken/impl/DefaultJwtParser.java
+index 4e4b9c7..5a8e2c8 100644
+--- a/src/main/java/io/jsonwebtoken/impl/DefaultJwtParser.java
++++ b/src/main/java/io/jsonwebtoken/impl/DefaultJwtParser.java
+@@ -242,6 +242,22 @@ public class DefaultJwtParser implements JwtParser {
+             throw new MalformedJwtException("JWT string '" + jwt + "' is missing a body/payload.");
+         }
+ 
++        // Signature-stripping guard (CGP-xpq5-jm7p-884r / CWE-347): if this parser has verification
++        // material configured (a Key, key bytes, or a SigningKeyResolver), a compact string whose
++        // signature segment is absent has NOT been cryptographically verified, so its
++        // header/claims/body must never be handed back to the caller. Presence of the third segment
++        // is attacker-controlled input; it must not be the sole gate that decides whether
++        // verification runs. Enforce this at the single parse(String) chokepoint -- before any
++        // Header/Claims/body is constructed -- so every public entry point (parse(String),
++        // parse(String, JwtHandler), parsePlaintextJwt, parseClaimsJwt, parsePlaintextJws,
++        // parseClaimsJws) is covered uniformly, and independently of the header's claimed 'alg'.
++        if (base64UrlEncodedDigest == null && isVerificationMaterialConfigured()) {
++            String msg = "JWT string has no signature segment, but this parser is configured with a " +
++                         "signing key / key bytes / SigningKeyResolver. The signature cannot be verified, " +
++                         "so the JWT is not trusted and must not be accepted.";
++            throw new SignatureException(msg);
++        }
++
+         // =============== Header =================
+         Header header = null;
+ 
+@@ -465,6 +481,17 @@ public class DefaultJwtParser implements JwtParser {
+         }
+     }
+ 
++    /**
++     * Returns {@code true} if this parser has any verification material configured -- a {@link Key},
++     * key bytes (from {@code setSigningKey(byte[])}/{@code setSigningKey(String)}), or a
++     * {@link SigningKeyResolver}. When any of these is set, an incoming compact JWT whose signature
++     * segment is absent has not been (and cannot be) cryptographically verified and must be rejected
++     * rather than trusted (CGP-xpq5-jm7p-884r / CWE-347).
++     */
++    private boolean isVerificationMaterialConfigured() {
++        return this.key != null || !Objects.isEmpty(this.keyBytes) || this.signingKeyResolver != null;
++    }
++
+     /*
+      * @since 0.5 mostly to allow testing overrides
+      */
+diff --git a/src/test/groovy/io/jsonwebtoken/JwtParserTest.groovy b/src/test/groovy/io/jsonwebtoken/JwtParserTest.groovy
+index f3a0368..e867285 100644
+--- a/src/test/groovy/io/jsonwebtoken/JwtParserTest.groovy
++++ b/src/test/groovy/io/jsonwebtoken/JwtParserTest.groovy
+@@ -426,11 +426,17 @@ class JwtParserTest {
+ 
+         String compact = Jwts.builder().setPayload(payload).compact()
+ 
++        // Behavior change for CGP-xpq5-jm7p-884r / CWE-347: with a signing key configured, an
++        // unsigned (stripped-signature) token is now rejected at the signature-verification
++        // chokepoint with SignatureException BEFORE any body is constructed, instead of the old,
++        // weaker UnsupportedJwtException raised later by the handler adapter. The security intent
++        // (reject an unsigned token when verification material is configured) is preserved and
++        // strengthened.
+         try {
+             Jwts.parser().setSigningKey(key).parsePlaintextJws(compact)
+             fail()
+-        } catch (UnsupportedJwtException e) {
+-            assertEquals e.getMessage(), 'Unsigned plaintext JWTs are not supported.'
++        } catch (SignatureException e) {
++            assertTrue e.getMessage().contains('has no signature segment')
+         }
+     }
+ 
+@@ -443,11 +449,12 @@ class JwtParserTest {
+ 
+         String compact = Jwts.builder().setSubject(subject).compact()
+ 
++        // Behavior change for CGP-xpq5-jm7p-884r / CWE-347: see testParsePlaintextJwsWithPlaintextJwt.
+         try {
+             Jwts.parser().setSigningKey(key).parsePlaintextJws(compact)
+             fail()
+-        } catch (UnsupportedJwtException e) {
+-            assertEquals e.getMessage(), 'Unsigned Claims JWTs are not supported.'
++        } catch (SignatureException e) {
++            assertTrue e.getMessage().contains('has no signature segment')
+         }
+     }
+ 
+@@ -539,11 +546,12 @@ class JwtParserTest {
+ 
+         String compact = Jwts.builder().setPayload(payload).compact()
+ 
++        // Behavior change for CGP-xpq5-jm7p-884r / CWE-347: see testParsePlaintextJwsWithPlaintextJwt.
+         try {
+             Jwts.parser().setSigningKey(key).parseClaimsJws(compact)
+             fail()
+-        } catch (UnsupportedJwtException e) {
+-            assertEquals e.getMessage(), 'Unsigned plaintext JWTs are not supported.'
++        } catch (SignatureException e) {
++            assertTrue e.getMessage().contains('has no signature segment')
+         }
+     }
+ 
+@@ -556,11 +564,12 @@ class JwtParserTest {
+ 
+         String compact = Jwts.builder().setSubject(subject).compact()
+ 
++        // Behavior change for CGP-xpq5-jm7p-884r / CWE-347: see testParsePlaintextJwsWithPlaintextJwt.
+         try {
+             Jwts.parser().setSigningKey(key).parseClaimsJws(compact)
+             fail()
+-        } catch (UnsupportedJwtException e) {
+-            assertEquals e.getMessage(), 'Unsigned Claims JWTs are not supported.'
++        } catch (SignatureException e) {
++            assertTrue e.getMessage().contains('has no signature segment')
+         }
+     }
+ 
+diff --git a/src/test/groovy/io/jsonwebtoken/JwtsTest.groovy b/src/test/groovy/io/jsonwebtoken/JwtsTest.groovy
+index 9a344f0..608161d 100644
+--- a/src/test/groovy/io/jsonwebtoken/JwtsTest.groovy
++++ b/src/test/groovy/io/jsonwebtoken/JwtsTest.groovy
+@@ -563,11 +563,16 @@ class JwtsTest {
+ 
+         String notSigned = Jwts.builder().setSubject("Foo").compact();
+ 
++        // Behavior change for CGP-xpq5-jm7p-884r / CWE-347: with a signing key configured, an
++        // unsigned (stripped-signature) token is now rejected at the signature-verification
++        // chokepoint with SignatureException before any body is constructed, instead of the old,
++        // weaker UnsupportedJwtException raised later by the handler adapter. parseClaimsJws still
++        // fails for unsigned JWTs (issue #20 intent), and now fails for the right security reason.
+         try {
+             Jwts.parser().setSigningKey(key).parseClaimsJws(notSigned);
+             fail('parseClaimsJws must fail for unsigned JWTs')
+-        } catch (UnsupportedJwtException expected) {
+-            assertEquals expected.message, 'Unsigned Claims JWTs are not supported.'
++        } catch (SignatureException expected) {
++            assertTrue expected.message.contains('has no signature segment')
+         }
+     }
+ 
+diff --git a/src/test/groovy/io/jsonwebtoken/SignatureStrippingExploitTest.groovy b/src/test/groovy/io/jsonwebtoken/SignatureStrippingExploitTest.groovy
+new file mode 100644
+index 0000000..98db0f7
+--- /dev/null
++++ b/src/test/groovy/io/jsonwebtoken/SignatureStrippingExploitTest.groovy
+@@ -0,0 +1,298 @@
++/*
++ * Copyright (C) 2014 jsonwebtoken.io
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package io.jsonwebtoken
++
++import io.jsonwebtoken.impl.TextCodec
++import org.junit.Test
++
++import javax.crypto.spec.SecretKeySpec
++import java.security.Key
++import java.security.SecureRandom
++
++import static org.junit.Assert.fail
++
++/**
++ * Exploit harness for CGP-xpq5-jm7p-884r (CWE-347 signature-stripping authentication bypass).
++ *
++ * Root cause: DefaultJwtParser.parse(String jwt) gates the ENTIRE signature-verification block
++ * solely on `base64UrlEncodedDigest != null`. An attacker strips the third (signature) segment
++ * (sending "header.payload." -- a trailing dot, empty third segment). The digest is then null, the
++ * verification block is skipped, and the parser returns a DefaultJwt / DefaultJws carrying the
++ * attacker's claims as authentic -- even though a Key, key bytes, or SigningKeyResolver is
++ * configured. This is a complete authentication bypass.
++ *
++ * Security invariant proven here (from ## Plan): a parser with verification material configured
++ * MUST NEVER hand back a Header/Claims/body derived from a compact string whose signature segment
++ * was absent-and-unverified, through ANY of the six public entry points, regardless of the
++ * attacker-controlled `alg` header value or whether the body is JSON claims or plain text.
++ *
++ * Each test drives the REAL runtime sink (DefaultJwtParser.parse(String)) via a public JwtParser
++ * entry point. On the UNPATCHED build every stripped-signature token is ACCEPTED, so the harmful
++ * effect (attacker claims / body returned unverified) fires and the test FAILS the run (fail()).
++ * A correct fix makes the parser throw MalformedJwtException or SignatureException from that sink
++ * BEFORE any body is constructed -- which each test catches as "this payload was refused" and the
++ * run then exits 0 (GREEN). The exploit asserts the SECURITY PROPERTY, so RED => non-zero exit.
++ *
++ * Only the SPECIFIC exception types a fix raises (MalformedJwtException / SignatureException) are
++ * treated as "refused"; no broad catch is used, so a natural/unexpected error cannot masquerade as
++ * a block.
++ */
++class SignatureStrippingExploitTest {
++
++    private static final SecureRandom RANDOM = new SecureRandom()
++
++    /** A random HMAC key so the parser genuinely has verification material configured. */
++    private static byte[] randomKeyBytes() {
++        byte[] key = new byte[64]
++        RANDOM.nextBytes(key)
++        return key
++    }
++
++    /**
++     * Build a stripped-signature compact token: base64url(header) "." base64url(payload) "." with an
++     * EMPTY third segment (the attacker strips the signature but keeps the trailing dot so the parser
++     * still counts exactly two '.' separators). Constructed by hand so no builder can refuse to
++     * produce the malformed token.
++     */
++    private static String strippedToken(String headerJson, String payload) {
++        return TextCodec.BASE64URL.encode(headerJson) + '.' +
++                TextCodec.BASE64URL.encode(payload) + '.'
++    }
++
++    // The OSV's literal documented payload, tested verbatim:
++    // eyJhbGciOiJub25lIn0.eyJzdWIiOiJhZG1pbiJ9.  ->  header {"alg":"none"}, payload {"sub":"admin"}
++    private static final String OSV_LITERAL_PAYLOAD = 'eyJhbGciOiJub25lIn0.eyJzdWIiOiJhZG1pbiJ9.'
++
++    // ---------------------------------------------------------------------------------------------
++    // Route 1 (ENUMERATED): OSV literal payload, verbatim, via parse(String), key bytes configured.
++    // ---------------------------------------------------------------------------------------------
++    @Test
++    void testOsvLiteralPayloadViaParseStringWithKeyBytes() {
++        try {
++            Jwt jwt = Jwts.parser().setSigningKey(randomKeyBytes()).parse(OSV_LITERAL_PAYLOAD)
++            // HARMFUL EFFECT: an unsigned, unverified token was accepted and its claims handed back
++            // as authentic while a signing key is configured -> authentication bypass.
++            Claims claims = (Claims) jwt.getBody()
++            fail("VULNERABLE (CWE-347): parse(String) accepted the OSV stripped-signature token and " +
++                    "returned unverified claims sub=" + claims.getSubject() +
++                    " even though a signing key is configured.")
++        } catch (MalformedJwtException | SignatureException refused) {
++            // Correct fix: the sink refused the stripped-signature token. This payload passed.
++        }
++    }
++
++    // ---------------------------------------------------------------------------------------------
++    // Route 2 (ENUMERATED config form): parse(String) with a Key object (setSigningKey(Key)).
++    // Same JSON-claims payload as the OSV; different verification-material configuration.
++    // ---------------------------------------------------------------------------------------------
++    @Test
++    void testStrippedSignatureViaParseStringWithKeyObject() {
++        Key key = new SecretKeySpec(randomKeyBytes(), "HmacSHA256")
++        String token = strippedToken('{"alg":"HS256"}', '{"sub":"admin"}')
++        try {
++            Jwt jwt = Jwts.parser().setSigningKey(key).parse(token)
++            Claims claims = (Claims) jwt.getBody()
++            fail("VULNERABLE (CWE-347): parse(String) with a Key object configured accepted a " +
++                    "stripped-signature token and returned unverified claims sub=" + claims.getSubject())
++        } catch (MalformedJwtException | SignatureException refused) {
++        }
++    }
++
++    // ---------------------------------------------------------------------------------------------
++    // Route 3 (NON-ENUMERATED entry point + config form): parseClaimsJwt() with key bytes.
++    // The OSV only named parse(String); a narrow call-site patch that only guards parse(String)'s
++    // JSON-claims branch would leave this convenience method exploitable.
++    // ---------------------------------------------------------------------------------------------
++    @Test
++    void testStrippedSignatureViaParseClaimsJwtWithKeyBytes() {
++        String token = strippedToken('{"alg":"none"}', '{"sub":"admin"}')
++        try {
++            Jwt<Header, Claims> jwt = Jwts.parser().setSigningKey(randomKeyBytes()).parseClaimsJwt(token)
++            Claims claims = jwt.getBody()
++            fail("VULNERABLE (CWE-347): parseClaimsJwt() accepted a stripped-signature token and " +
++                    "returned unverified claims sub=" + claims.getSubject() +
++                    " even though a signing key is configured.")
++        } catch (MalformedJwtException | SignatureException refused) {
++        }
++    }
++
++    // ---------------------------------------------------------------------------------------------
++    // Route 4 (NON-ENUMERATED entry point + NON-JSON body): parsePlaintextJwt() with a plain-text
++    // (non-JSON) payload, key bytes configured. Exercises the DefaultJwt-plaintext construction path
++    // that the OSV's JSON-claims example never touched.
++    // ---------------------------------------------------------------------------------------------
++    @Test
++    void testStrippedSignatureViaParsePlaintextJwtWithKeyBytes() {
++        // Non-JSON body: does not start with '{' / end with '}', so it becomes a plaintext body.
++        String token = strippedToken('{"alg":"none"}', 'attacker-controlled-plaintext')
++        try {
++            Jwt<Header, String> jwt = Jwts.parser().setSigningKey(randomKeyBytes()).parsePlaintextJwt(token)
++            String body = jwt.getBody()
++            fail("VULNERABLE (CWE-347): parsePlaintextJwt() accepted a stripped-signature token and " +
++                    "returned unverified plaintext body '" + body + "' even though a signing key is configured.")
++        } catch (MalformedJwtException | SignatureException refused) {
++        }
++    }
++
++    // ---------------------------------------------------------------------------------------------
++    // Route 5 (NON-ENUMERATED config form): setSigningKeyResolver(...) with a CUSTOM resolver.
++    // Because the digest is null the entire signature block is skipped, so the resolver is NEVER
++    // invoked -- yet the attacker's claims come back trusted. We assert BOTH the harmful effect
++    // (claims returned) AND the tell-tale that the resolver was never asked for a key.
++    // ---------------------------------------------------------------------------------------------
++    @Test
++    void testStrippedSignatureViaSigningKeyResolver() {
++        final boolean[] resolverInvoked = [false]
++        SigningKeyResolver resolver = new SigningKeyResolverAdapter() {
++            @Override
++            Key resolveSigningKey(JwsHeader header, Claims claims) {
++                resolverInvoked[0] = true
++                return new SecretKeySpec(randomKeyBytes(), "HmacSHA256")
++            }
++
++            @Override
++            Key resolveSigningKey(JwsHeader header, String plaintext) {
++                resolverInvoked[0] = true
++                return new SecretKeySpec(randomKeyBytes(), "HmacSHA256")
++            }
++        }
++        String token = strippedToken('{"alg":"HS256"}', '{"sub":"admin"}')
++        try {
++            Jwt jwt = Jwts.parser().setSigningKeyResolver(resolver).parse(token)
++            Claims claims = (Claims) jwt.getBody()
++            fail("VULNERABLE (CWE-347): parse(String) with a SigningKeyResolver configured accepted " +
++                    "a stripped-signature token and returned unverified claims sub=" + claims.getSubject() +
++                    " (resolver invoked=" + resolverInvoked[0] + " -- verification was skipped entirely).")
++        } catch (MalformedJwtException | SignatureException refused) {
++        }
++    }
++
++    // ---------------------------------------------------------------------------------------------
++    // Route 6 (NON-ENUMERATED entry point): parse(String, JwtHandler) with a custom handler.
++    // Proves the guard must live at the shared chokepoint so it also covers the handler-dispatch
++    // entry point, not only the direct parse(String) callers.
++    // ---------------------------------------------------------------------------------------------
++    @Test
++    void testStrippedSignatureViaParseWithCustomHandler() {
++        String token = strippedToken('{"alg":"none"}', '{"sub":"admin"}')
++        JwtHandler<String> handler = new JwtHandlerAdapter<String>() {
++            @Override
++            String onClaimsJwt(Jwt<Header, Claims> jwt) {
++                return jwt.getBody().getSubject()
++            }
++        }
++        try {
++            String subject = Jwts.parser().setSigningKey(randomKeyBytes()).parse(token, handler)
++            fail("VULNERABLE (CWE-347): parse(String, JwtHandler) dispatched a stripped-signature " +
++                    "token to onClaimsJwt and returned unverified subject '" + subject +
++                    "' even though a signing key is configured.")
++        } catch (MalformedJwtException | SignatureException refused) {
++        }
++    }
++
++    // =============================================================================================
++    // PRESERVATION (positive-control) tests -- prove the guard's blast radius stays INSIDE the
++    // untrusted-input boundary (Plan "Must-not-break"). The guard fires ONLY when the signature
++    // segment is absent AND verification material is configured; every legitimate path below must
++    // still succeed unchanged.
++    // =============================================================================================
++
++    /**
++     * (a) No key/keyBytes/signingKeyResolver configured -> a genuinely unsigned compact JWT
++     * (RFC 7519 unsecured JWS, empty third segment) still parses successfully via parse(String),
++     * parseClaimsJwt(), and parsePlaintextJwt(). The guard must NOT fire when no verification
++     * material is configured.
++     */
++    @Test
++    void testUnsignedTokenStillParsesWhenNoVerificationMaterialConfigured() {
++        String claimsToken = strippedToken('{"alg":"none"}', '{"sub":"guest"}')
++        Jwt jwt = Jwts.parser().parse(claimsToken)
++        assert ((Claims) jwt.getBody()).getSubject() == 'guest'
++
++        Jwt<Header, Claims> claimsJwt = Jwts.parser().parseClaimsJwt(claimsToken)
++        assert claimsJwt.getBody().getSubject() == 'guest'
++
++        String plaintextToken = strippedToken('{"alg":"none"}', 'legitimate-unsigned-plaintext')
++        Jwt<Header, String> plaintextJwt = Jwts.parser().parsePlaintextJwt(plaintextToken)
++        assert plaintextJwt.getBody() == 'legitimate-unsigned-plaintext'
++    }
++
++    /**
++     * (b) With key bytes configured, a validly-signed token still verifies and parses end-to-end via
++     * parse(String) and parseClaimsJws().
++     */
++    @Test
++    void testValidlySignedTokenStillVerifiesWithKeyBytes() {
++        byte[] key = randomKeyBytes()
++        String signed = Jwts.builder().setSubject('legit').signWith(SignatureAlgorithm.HS256, key).compact()
++
++        Jwt parsed = Jwts.parser().setSigningKey(key).parse(signed)
++        assert ((Claims) parsed.getBody()).getSubject() == 'legit'
++
++        Jws<Claims> jws = Jwts.parser().setSigningKey(key).parseClaimsJws(signed)
++        assert jws.getBody().getSubject() == 'legit'
++    }
++
++    /**
++     * (b') With a Key object configured, a validly-signed token still verifies via parse(String).
++     */
++    @Test
++    void testValidlySignedTokenStillVerifiesWithKeyObject() {
++        byte[] keyBytes = randomKeyBytes()
++        Key key = new SecretKeySpec(keyBytes, 'HmacSHA256')
++        String signed = Jwts.builder().setSubject('legit').signWith(SignatureAlgorithm.HS256, key).compact()
++
++        Jwt parsed = Jwts.parser().setSigningKey(key).parse(signed)
++        assert ((Claims) parsed.getBody()).getSubject() == 'legit'
++    }
++
++    /**
++     * (b'') With key bytes configured, a validly-signed PLAINTEXT JWS still verifies and parses via
++     * parsePlaintextJws() (the non-JSON body path).
++     */
++    @Test
++    void testValidlySignedPlaintextJwsStillVerifiesWithKeyBytes() {
++        byte[] key = randomKeyBytes()
++        String signed = Jwts.builder().setPayload('legit-plaintext')
++                .signWith(SignatureAlgorithm.HS256, key).compact()
++
++        Jws<String> jws = Jwts.parser().setSigningKey(key).parsePlaintextJws(signed)
++        assert jws.getBody() == 'legit-plaintext'
++    }
++
++    /**
++     * (c) With a CUSTOM (test-defined) SigningKeyResolver configured, a validly-signed token still
++     * causes the resolver to be invoked and its returned key honored -- the fix must not
++     * short-circuit resolver invocation for legitimate signed input.
++     */
++    @Test
++    void testValidlySignedTokenStillInvokesCustomSigningKeyResolver() {
++        final byte[] key = randomKeyBytes()
++        final boolean[] resolverInvoked = [false]
++        SigningKeyResolver resolver = new SigningKeyResolverAdapter() {
++            @Override
++            byte[] resolveSigningKeyBytes(JwsHeader header, Claims claims) {
++                resolverInvoked[0] = true
++                return key
++            }
++        }
++        String signed = Jwts.builder().setSubject('legit').signWith(SignatureAlgorithm.HS256, key).compact()
++
++        Jws<Claims> jws = Jwts.parser().setSigningKeyResolver(resolver).parseClaimsJws(signed)
++        assert jws.getBody().getSubject() == 'legit'
++        assert resolverInvoked[0]  // resolver WAS asked for the key on the legitimate signed path
++    }
++}
+-- 
+2.55.0
+

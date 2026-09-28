@@ -1,0 +1,399 @@
+From 8eb23ffac1f093ae1e9f890194e3a1c6a5c8bbcd Mon Sep 28 16:00:00 2026
+From: patch-forge <patch@chainguard.dev>
+Date: Mon, 28 Sep 2026 16:00:00 +0000
+Subject: [PATCH] fix: stop cleaner thread clearing the map on interrupt
+
+Vuln-ID: CGP-57cr-9rvh-qh62
+Cgp-Finding: CGP-57cr-9rvh-qh62
+---
+ .../weaklockfree/WeakConcurrentMap.java       |   9 +-
+ .../CleanerInterruptDataLossExploitTest.java  | 354 ++++++++++++++++++
+ 2 files changed, 361 insertions(+), 2 deletions(-)
+ create mode 100644 src/test/java/com/blogspot/mydailyjava/weaklockfree/CleanerInterruptDataLossExploitTest.java
+
+diff --git a/src/main/java/com/blogspot/mydailyjava/weaklockfree/WeakConcurrentMap.java b/src/main/java/com/blogspot/mydailyjava/weaklockfree/WeakConcurrentMap.java
+index 1f0e61c..0948c8f 100644
+--- a/src/main/java/com/blogspot/mydailyjava/weaklockfree/WeakConcurrentMap.java
++++ b/src/main/java/com/blogspot/mydailyjava/weaklockfree/WeakConcurrentMap.java
+@@ -136,11 +136,16 @@ public class WeakConcurrentMap<K, V> extends ReferenceQueue<K> implements Runnab
+     @Override
+     public void run() {
+         try {
+-            while (true) {
++            while (!Thread.interrupted()) {
+                 target.remove(remove());
+             }
+         } catch (InterruptedException ignored) {
+-            clear();
++            // Terminate cleanly on interruption WITHOUT clearing the backing map.
++            // Clearing here would silently drop every live (strongly-reachable-keyed) entry,
++            // not just stale ones (CGP-57cr-9rvh-qh62 / CWE-404). Restore the interrupt status
++            // per the Java interruption contract so callers/frameworks that inspect the flag
++            // after run() returns still observe the interruption.
++            Thread.currentThread().interrupt();
+         }
+     }
+ 
+diff --git a/src/test/java/com/blogspot/mydailyjava/weaklockfree/CleanerInterruptDataLossExploitTest.java b/src/test/java/com/blogspot/mydailyjava/weaklockfree/CleanerInterruptDataLossExploitTest.java
+new file mode 100644
+index 0000000..061c332
+--- /dev/null
++++ b/src/test/java/com/blogspot/mydailyjava/weaklockfree/CleanerInterruptDataLossExploitTest.java
+@@ -0,0 +1,354 @@
++package com.blogspot.mydailyjava.weaklockfree;
++
++import org.junit.Test;
++
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++
++import static org.hamcrest.CoreMatchers.*;
++import static org.hamcrest.MatcherAssert.assertThat;
++
++/**
++ * Exploit harness for CGP-57cr-9rvh-qh62 (CWE-404).
++ *
++ * <p>The cleaner loop {@code WeakConcurrentMap.run()} catches the {@link InterruptedException}
++ * that {@code ReferenceQueue.remove()} raises when the executing thread is interrupted, and calls
++ * {@code clear()} — which empties the backing {@code ConcurrentHashMap}, dropping every LIVE
++ * (strongly-reachable-keyed) entry, not just the stale ones. Any actor able to interrupt the thread
++ * running {@code run()} (via {@code getCleanerThread().interrupt()}, an externally-owned
++ * {@code new Thread(map)}, or {@code ExecutorService.shutdownNow()}) triggers total, silent data
++ * loss.
++ *
++ * <p>The security invariant these tests pin (from the ## Plan contract): interrupting the thread
++ * executing {@code run()}, by ANY route, must terminate that thread cleanly WITHOUT removing any
++ * live entry from the map/set/detached-thread-local. Each attack below therefore asserts the live
++ * entries SURVIVE the interrupt — which is TRUE once fixed and FALSE (entries gone) on the
++ * unpatched tree, so the run exits non-zero on the vulnerable build (RED) and zero once patched
++ * (GREEN).
++ *
++ * <p>Every attack also asserts the executing thread still terminates ({@code isAlive()==false}) —
++ * the companion bound: a "fix" that loops forever swaps data loss for a thread leak. That assertion
++ * holds on both the vulnerable and the fixed tree; it is not the property that distinguishes them.
++ *
++ * <p>Keys/values are held in local variables for the whole test so they are provably NOT eligible
++ * for GC at the moment of interruption — anything missing afterwards was removed by {@code clear()},
++ * not collected by the GC.
++ */
++public class CleanerInterruptDataLossExploitTest {
++
++    /** Let a freshly-started cleaner thread reach its blocking {@code remove()} call. */
++    private static final long SETTLE_MS = 300L;
++    /** Give an interrupted thread time to run its catch block and terminate. */
++    private static final long JOIN_MS = 2000L;
++
++    private static void join(Thread t) throws InterruptedException {
++        t.join(JOIN_MS);
++    }
++
++    // ------------------------------------------------------------------
++    // A caller-defined, non-JDK key/value type (identity-based, like the map requires).
++    // ------------------------------------------------------------------
++    private static final class CustomKey {
++        final int id;
++        CustomKey(int id) { this.id = id; }
++    }
++
++    private static final class CustomValue {
++        final String payload;
++        CustomValue(String payload) { this.payload = payload; }
++    }
++
++    // ==================================================================
++    // Route 1 — documented exploit (OSV Vector 1): internal cleaner thread,
++    // interrupted via getCleanerThread().interrupt(). All three top-level classes.
++    // ==================================================================
++
++    @Test
++    public void weakConcurrentMap_internalCleanerThread_interruptMustNotDropLiveEntries() throws Exception {
++        WeakConcurrentMap<Object, Object> map = new WeakConcurrentMap<Object, Object>(true);
++        Thread cleaner = map.getCleanerThread();
++        assertThat(cleaner, not(nullValue(Thread.class)));
++
++        Object key1 = new Object(), value1 = new Object();
++        Object key2 = new Object(), value2 = new Object();
++        Object key3 = new Object(), value3 = new Object();
++        map.put(key1, value1);
++        map.put(key2, value2);
++        map.put(key3, value3);
++
++        Thread.sleep(SETTLE_MS); // ensure the cleaner thread is blocked inside remove()
++
++        cleaner.interrupt();     // <-- the documented attack
++        join(cleaner);
++
++        // Data-loss invariant: the live entries must still be present.
++        assertThat("live entry key1 dropped by clear() on interrupt", map.get(key1), is(value1));
++        assertThat("live entry key2 dropped by clear() on interrupt", map.get(key2), is(value2));
++        assertThat("live entry key3 dropped by clear() on interrupt", map.get(key3), is(value3));
++        assertThat(map.approximateSize(), is(3));
++
++        // Companion bound: the thread must still terminate.
++        assertThat(cleaner.isAlive(), is(false));
++    }
++
++    @Test
++    public void weakConcurrentSet_internalCleanerThread_interruptMustNotDropLiveEntries() throws Exception {
++        WeakConcurrentSet<Object> set = new WeakConcurrentSet<Object>(WeakConcurrentSet.Cleaner.THREAD);
++        Thread cleaner = set.getCleanerThread();
++        assertThat(cleaner, not(nullValue(Thread.class)));
++
++        Object value1 = new Object(), value2 = new Object(), value3 = new Object();
++        set.add(value1);
++        set.add(value2);
++        set.add(value3);
++
++        Thread.sleep(SETTLE_MS);
++
++        cleaner.interrupt();
++        join(cleaner);
++
++        assertThat("live element value1 dropped by clear() on interrupt", set.contains(value1), is(true));
++        assertThat("live element value2 dropped by clear() on interrupt", set.contains(value2), is(true));
++        assertThat("live element value3 dropped by clear() on interrupt", set.contains(value3), is(true));
++        assertThat(set.approximateSize(), is(3));
++
++        assertThat(cleaner.isAlive(), is(false));
++    }
++
++    @Test
++    public void detachedThreadLocal_internalCleanerThread_interruptMustNotDropLiveEntries() throws Exception {
++        DetachedThreadLocal<Object> local = new DetachedThreadLocal<Object>(DetachedThreadLocal.Cleaner.THREAD);
++        Thread cleaner = local.getBackingMap().getCleanerThread();
++        assertThat(cleaner, not(nullValue(Thread.class)));
++
++        // Per-thread values keyed by (strongly-held) Thread keys.
++        Thread key1 = new Thread(), value1owner = key1; Object value1 = new Object();
++        Thread key2 = new Thread(); Object value2 = new Object();
++        local.define(key1, value1);
++        local.define(key2, value2);
++
++        Thread.sleep(SETTLE_MS);
++
++        cleaner.interrupt();
++        join(cleaner);
++
++        assertThat("per-thread value1 dropped by clear() on interrupt", local.get(key1), is(value1));
++        assertThat("per-thread value2 dropped by clear() on interrupt", local.get(key2), is(value2));
++        assertThat(local.getBackingMap().approximateSize(), is(2));
++
++        assertThat(cleaner.isAlive(), is(false));
++        // Keep keys strongly reachable to the end so they cannot be GC'd.
++        assertThat(value1owner.isAlive(), is(false));
++        assertThat(key2.isAlive(), is(false));
++    }
++
++    // ==================================================================
++    // Route 2 — NON-ENUMERATED route (## Plan surface (b)): an externally-constructed
++    // "MANUAL" thread driving run() directly (new Thread(x)). This is the exact shape the
++    // existing testExternalThread uses, but here we interrupt while the map is STILL POPULATED
++    // (the existing test interrupts only after doTest() already called clear()).
++    // ==================================================================
++
++    @Test
++    public void weakConcurrentMap_externalManualThread_interruptMustNotDropLiveEntries() throws Exception {
++        WeakConcurrentMap<Object, Object> map = new WeakConcurrentMap<Object, Object>(false);
++        assertThat(map.getCleanerThread(), nullValue(Thread.class));
++
++        Thread external = new Thread(map); // caller drives run() directly (Cleaner.MANUAL shape)
++        external.start();
++
++        Object key1 = new Object(), value1 = new Object();
++        Object key2 = new Object(), value2 = new Object();
++        map.put(key1, value1);
++        map.put(key2, value2);
++
++        Thread.sleep(SETTLE_MS);
++
++        external.interrupt();
++        join(external);
++
++        assertThat("live entry key1 dropped by clear() on interrupt", map.get(key1), is(value1));
++        assertThat("live entry key2 dropped by clear() on interrupt", map.get(key2), is(value2));
++        assertThat(map.approximateSize(), is(2));
++
++        assertThat(external.isAlive(), is(false));
++    }
++
++    @Test
++    public void weakConcurrentSet_externalManualThread_interruptMustNotDropLiveEntries() throws Exception {
++        WeakConcurrentSet<Object> set = new WeakConcurrentSet<Object>(WeakConcurrentSet.Cleaner.MANUAL);
++        assertThat(set.getCleanerThread(), nullValue(Thread.class));
++
++        Thread external = new Thread(set);
++        external.start();
++
++        Object value1 = new Object(), value2 = new Object();
++        set.add(value1);
++        set.add(value2);
++
++        Thread.sleep(SETTLE_MS);
++
++        external.interrupt();
++        join(external);
++
++        assertThat("live element value1 dropped by clear() on interrupt", set.contains(value1), is(true));
++        assertThat("live element value2 dropped by clear() on interrupt", set.contains(value2), is(true));
++        assertThat(set.approximateSize(), is(2));
++
++        assertThat(external.isAlive(), is(false));
++    }
++
++    @Test
++    public void detachedThreadLocal_externalManualThread_interruptMustNotDropLiveEntries() throws Exception {
++        DetachedThreadLocal<Object> local = new DetachedThreadLocal<Object>(DetachedThreadLocal.Cleaner.MANUAL);
++        assertThat(local.getBackingMap().getCleanerThread(), nullValue(Thread.class));
++
++        Thread external = new Thread(local);
++        external.start();
++
++        Thread key1 = new Thread(); Object value1 = new Object();
++        Thread key2 = new Thread(); Object value2 = new Object();
++        local.define(key1, value1);
++        local.define(key2, value2);
++
++        Thread.sleep(SETTLE_MS);
++
++        external.interrupt();
++        join(external);
++
++        assertThat("per-thread value1 dropped by clear() on interrupt", local.get(key1), is(value1));
++        assertThat("per-thread value2 dropped by clear() on interrupt", local.get(key2), is(value2));
++        assertThat(local.getBackingMap().approximateSize(), is(2));
++
++        assertThat(external.isAlive(), is(false));
++        assertThat(key1.isAlive(), is(false));
++        assertThat(key2.isAlive(), is(false));
++    }
++
++    // ==================================================================
++    // Route 3 — payload-class (## Plan surface (c)): submit run() to an ExecutorService and
++    // interrupt it via shutdownNow(). Same sink, different interrupt-delivery mechanism.
++    // ==================================================================
++
++    @Test
++    public void weakConcurrentMap_executorShutdownNow_interruptMustNotDropLiveEntries() throws Exception {
++        WeakConcurrentMap<Object, Object> map = new WeakConcurrentMap<Object, Object>(false);
++        ExecutorService pool = Executors.newSingleThreadExecutor();
++        pool.submit(map); // the pool worker executes run()
++
++        Object key1 = new Object(), value1 = new Object();
++        Object key2 = new Object(), value2 = new Object();
++        map.put(key1, value1);
++        map.put(key2, value2);
++
++        Thread.sleep(SETTLE_MS);
++
++        pool.shutdownNow(); // interrupts the worker thread blocked in remove()
++        pool.awaitTermination(JOIN_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
++
++        assertThat("live entry key1 dropped by clear() on executor shutdownNow", map.get(key1), is(value1));
++        assertThat("live entry key2 dropped by clear() on executor shutdownNow", map.get(key2), is(value2));
++        assertThat(map.approximateSize(), is(2));
++
++        assertThat(pool.isTerminated(), is(true));
++    }
++
++    // ==================================================================
++    // Route 4 — smuggling-primitive: interrupt with NO settle delay, immediately after start(), so
++    // the InterruptedException fires on (or racing with) the very first remove() call. This probes
++    // that there is no window where the pre-existing clear()-on-interrupt bug still fires, even when
++    // the thread has barely entered run(). The map is populated the entire time.
++    // ==================================================================
++
++    @Test
++    public void weakConcurrentMap_interruptImmediatelyAfterStart_mustNotDropLiveEntries() throws Exception {
++        final WeakConcurrentMap<Object, Object> map = new WeakConcurrentMap<Object, Object>(false);
++
++        Object key1 = new Object(), value1 = new Object();
++        Object key2 = new Object(), value2 = new Object();
++        map.put(key1, value1);
++        map.put(key2, value2);
++
++        Thread external = new Thread(map);
++        external.start();
++        external.interrupt();   // delivered with no settle delay: raced against the first remove()
++        join(external);
++
++        assertThat("live entry key1 dropped by clear() on immediate interrupt", map.get(key1), is(value1));
++        assertThat("live entry key2 dropped by clear() on immediate interrupt", map.get(key2), is(value2));
++        assertThat(map.approximateSize(), is(2));
++
++        assertThat(external.isAlive(), is(false));
++    }
++
++    // ==================================================================
++    // Invariant coverage — caller-defined (non-JDK) key/value type surviving interrupt.
++    // The map is identity/weak-reference based; the fix must not implicitly depend on JDK-only types.
++    // ==================================================================
++
++    @Test
++    public void weakConcurrentMap_customKeyValueType_interruptMustNotDropLiveEntries() throws Exception {
++        WeakConcurrentMap<CustomKey, CustomValue> map = new WeakConcurrentMap<CustomKey, CustomValue>(true);
++        Thread cleaner = map.getCleanerThread();
++
++        CustomKey key1 = new CustomKey(1); CustomValue value1 = new CustomValue("auth-token-A");
++        CustomKey key2 = new CustomKey(2); CustomValue value2 = new CustomValue("auth-token-B");
++        map.put(key1, value1);
++        map.put(key2, value2);
++
++        Thread.sleep(SETTLE_MS);
++
++        cleaner.interrupt();
++        join(cleaner);
++
++        assertThat("custom-typed live entry key1 dropped on interrupt", map.get(key1), is(value1));
++        assertThat("custom-typed live entry key2 dropped on interrupt", map.get(key2), is(value2));
++        assertThat(map.approximateSize(), is(2));
++
++        assertThat(cleaner.isAlive(), is(false));
++    }
++
++    // ==================================================================
++    // Positive controls — must stay GREEN on BOTH the vulnerable and the fixed tree. These prove the
++    // fix does not overcorrect into "never remove anything": explicit clear() must still empty the
++    // map, and GC-driven stale-entry removal must still work.
++    // ==================================================================
++
++    @Test
++    public void positiveControl_explicitClearStillEmptiesTheMap() {
++        WeakConcurrentMap<Object, Object> map = new WeakConcurrentMap<Object, Object>(false);
++        Object key1 = new Object(), value1 = new Object();
++        Object key2 = new Object(), value2 = new Object();
++        map.put(key1, value1);
++        map.put(key2, value2);
++        assertThat(map.approximateSize(), is(2));
++
++        map.clear(); // explicit, caller-invoked API — must unconditionally empty the map
++
++        assertThat(map.get(key1), nullValue());
++        assertThat(map.get(key2), nullValue());
++        assertThat(map.approximateSize(), is(0));
++    }
++
++    @Test
++    public void positiveControl_gcDrivenStaleEntryRemovalStillWorks() throws Exception {
++        WeakConcurrentMap<Object, Object> map = new WeakConcurrentMap<Object, Object>(true);
++        Thread cleaner = map.getCleanerThread();
++
++        Object liveKey = new Object(), liveValue = new Object();
++        Object staleKey = new Object(), staleValue = new Object();
++        map.put(liveKey, liveValue);
++        map.put(staleKey, staleValue);
++        assertThat(map.approximateSize(), is(2));
++
++        staleKey = null; // make the stale entry eligible for GC
++        System.gc();
++        Thread.sleep(1000L); // let the cleaner thread expunge it via the reference queue
++
++        // The genuinely-dead key was removed, the live one survived — cleanup is not disabled.
++        assertThat(map.get(liveKey), is(liveValue));
++        assertThat(map.approximateSize(), is(1));
++
++        assertThat(cleaner.isAlive(), is(true)); // still running, still cleaning
++    }
++}
+-- 
+2.55.0
+

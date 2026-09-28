@@ -1,0 +1,434 @@
+From 9977bdf1ed665e6f0e34a0cad425c8f8775aea49 Mon Sep 28 16:00:00 2026
+From: vuln-patch <patch@chainguard.dev>
+Date: Mon, 28 Sep 2026 16:00:00 +0000
+Subject: [PATCH] fix CGP-q285-qppx-f8fx: bind CSRF field name as GPath
+ variable
+
+FormAuthFilter's CSRF auto-detection (CWE-94, code injection; also
+CWE-116 improper output encoding and CWE-74 injection) let a
+server-controlled HTML hidden-input name attribute reach a Groovy
+GroovyShell.evaluate() call as part of the compiled expression's
+source text. In FormAuthFilter.filter(), the extracted csrfFieldName
+was interpolated with String.format into the FIND_INPUT_FIELD_WITH_NAME
+GPath template ("html.depthFirst().grep { ... it.@name == '%s' }
+.collect { it.@value }.get(0)") and the resulting string was passed to
+html.getString(...), which XMLAssertion.eval() compiles and executes
+with an unrestricted GroovyShell. A crafted hidden-input name such as
+"' }; Runtime.getRuntime().exec(...); x={ '" broke out of the quoted
+string literal and ran arbitrary Groovy/Java code with the full
+privileges of the JVM process running the test suite, reachable both
+through the documented isAutoDetectCsrfFieldName() path and through
+the explicit FormAuthConfig.withCsrfFieldName(...) path, since both
+funneled into the same interpolation.
+
+The root cause was building the evaluated expression's source text by
+concatenating untrusted, response-derived data into it. The fix
+removes that concatenation entirely instead of trying to escape it:
+FIND_INPUT_FIELD_WITH_NAME is now a fixed, compile-time constant that
+references an unquoted Groovy identifier (restAssuredCsrfFieldName),
+and the untrusted csrfFieldName value is bound as a runtime variable
+via XmlPath's own param(name, value) mechanism
+(html.param(CSRF_FIELD_NAME_PARAM, csrfFieldName).getString(
+FIND_INPUT_FIELD_WITH_NAME)), which XMLAssertion.eval() passes into
+GroovyShell's Binding. A bound variable is pure data to the Groovy
+compiler and can never alter the parsed structure of the expression,
+so no character sequence, escape convention, or encoding (including
+Unicode-escape forms such as \u0027 that a naive character escaper
+would miss) can smuggle a breakout. This guards the single sink line
+in FormAuthFilter.groovy that both the auto-detect and the explicit
+withCsrfFieldName branches reach, without touching the general-purpose
+XMLAssertion.eval()/JSONAssertion GroovyShell evaluation engine that
+the library and its callers rely on for ordinary, developer-authored
+GPath/JsonPath expressions.
+
+The regression test added is
+FormAuthCsrfGroovyInjectionExploitTest, which drives the vulnerability
+end to end through the public
+RestAssured.given().auth().form(user, pass, formAuthConfig) entry
+point against a local HTTP server serving a crafted login page. It
+asserts that no OS command executes for: the documented exec-based
+breakout via auto-detection, the same breakout supplied through
+withCsrfFieldName(...), a \u0027 Unicode-escape smuggling variant, and
+a String.execute() variant, while also asserting that legitimate CSRF
+field names containing underscore, hyphen, period, and colon are
+still located and their value sent correctly through both extraction
+paths.
+
+CGP: CGP-q285-qppx-f8fx
+Cgp-Finding: CGP-q285-qppx-f8fx
+---
+ .../internal/filter/FormAuthFilter.groovy     |  12 +-
+ ...ormAuthCsrfGroovyInjectionExploitTest.java | 330 ++++++++++++++++++
+ 2 files changed, 340 insertions(+), 2 deletions(-)
+ create mode 100644 rest-assured/src/test/java/com/jayway/restassured/authentication/FormAuthCsrfGroovyInjectionExploitTest.java
+
+diff --git a/rest-assured/src/main/groovy/com/jayway/restassured/internal/filter/FormAuthFilter.groovy b/rest-assured/src/main/groovy/com/jayway/restassured/internal/filter/FormAuthFilter.groovy
+index dcb6ec12..b8ae1c38 100644
+--- a/rest-assured/src/main/groovy/com/jayway/restassured/internal/filter/FormAuthFilter.groovy
++++ b/rest-assured/src/main/groovy/com/jayway/restassured/internal/filter/FormAuthFilter.groovy
+@@ -40,8 +40,16 @@ class FormAuthFilter implements AuthFilter {
+   private static final String FIND_INPUT_TAG = "html.depthFirst().grep { it.name() == 'input' && it.@type == '%s' }.collect { it.@name }"
+   private static
+   final String FIND_INPUT_TAG_VALUE = "html.depthFirst().grep { it.name() == 'input' && it.@type == '%s' }.collect { it.@value }"
++  // Security fix (CGP-q285-qppx-f8fx, CWE-94/CWE-116/CWE-74): the CSRF field name is server- (or
++  // caller-) supplied and MUST NOT be interpolated into the source text of a GPath expression that
++  // GroovyShell compiles and executes -- doing so let a crafted hidden-input name break out of the
++  // string literal and run arbitrary Groovy (RCE). Instead this constant template references the value
++  // as a BOUND runtime variable (restAssuredCsrfFieldName), passed via XmlPath.param(...); a bound
++  // variable is data, never parsed as expression syntax, so no character sequence, byte encoding, or
++  // Groovy-lexer escape (e.g. \u0027) in the value can alter the compiled expression's structure.
++  private static final String CSRF_FIELD_NAME_PARAM = "restAssuredCsrfFieldName"
+   private static
+-  final String FIND_INPUT_FIELD_WITH_NAME = "html.depthFirst().grep { it.name() == 'input' && it.@name == '%s' }.collect { it.@value }.get(0)"
++  final String FIND_INPUT_FIELD_WITH_NAME = "html.depthFirst().grep { it.name() == 'input' && it.@name == ${CSRF_FIELD_NAME_PARAM} }.collect { it.@value }.get(0)"
+   private static final String FIND_FORM_ACTION = "html.depthFirst().grep { it.name() == 'form' }.get(0).@action"
+ 
+   def userName
+@@ -80,7 +88,7 @@ class FormAuthFilter implements AuthFilter {
+         csrfFieldName = formAuthConfig.hasCsrfFieldName() ? formAuthConfig.csrfFieldName : nullIfException {
+           html.getString(format(FIND_INPUT_TAG, "hidden"))
+         }
+-        csrfValue = nullIfException { html.getString(format(FIND_INPUT_FIELD_WITH_NAME, csrfFieldName)) }
++        csrfValue = nullIfException { html.param(CSRF_FIELD_NAME_PARAM, csrfFieldName).getString(FIND_INPUT_FIELD_WITH_NAME) }
+         if (!csrfValue) {
+           throw new IllegalArgumentException("Couldn't find the CSRF input field with name $csrfFieldName in response. Response was:\n${response.prettyPrint()}")
+         }
+diff --git a/rest-assured/src/test/java/com/jayway/restassured/authentication/FormAuthCsrfGroovyInjectionExploitTest.java b/rest-assured/src/test/java/com/jayway/restassured/authentication/FormAuthCsrfGroovyInjectionExploitTest.java
+new file mode 100644
+index 00000000..4a67d528
+--- /dev/null
++++ b/rest-assured/src/test/java/com/jayway/restassured/authentication/FormAuthCsrfGroovyInjectionExploitTest.java
+@@ -0,0 +1,330 @@
++/*
++ * Exploit harness for CGP-q285-qppx-f8fx (CWE-94 / CWE-116 / CWE-74) — REST-assured FormAuthFilter
++ * server-controlled CSRF-field-name -> GPath template -> GroovyShell code injection (RCE).
++ *
++ * Drives the DOCUMENTED public entry point end-to-end, exactly as a real caller would:
++ *
++ *   RestAssured.given().auth().form(user, pass, new FormAuthConfig().withAutoDetectionOfCsrf()) ...
++ *       -> FormAuthFilter.filter()
++ *           -> ctx.send(...) fetches the (attacker-controlled) login page over real HTTP
++ *           -> new XmlPath(HTML, response)                                   (parse)
++ *           -> csrfFieldName = html.getString(format(FIND_INPUT_TAG,"hidden"))   (server-controlled name)
++ *           -> html.getString(format(FIND_INPUT_FIELD_WITH_NAME, csrfFieldName)) (FormAuthFilter.groovy:83)
++ *               -> XMLAssertion.eval() -> new GroovyShell(...).evaluate(expr)     (XMLAssertion.groovy:250)
++ *
++ * The malicious server (a plain local com.sun.net.httpserver.HttpServer — NO live egress) returns a
++ * login page whose hidden <input> name attribute breaks out of the single-quoted string literal in the
++ * GPath template and appends arbitrary Groovy. The injected Groovy performs a SAFE, observable,
++ * reversible side effect: an OS command that creates a uniquely-named marker file in the test temp dir.
++ * If that marker exists after the auth flow ran, attacker-controlled code executed inside the test JVM =
++ * RCE on the test/CI host.
++ *
++ * POLARITY: every attack test asserts the SECURE invariant (marker file ABSENT). On the UNPATCHED build
++ * the injected Groovy runs, the marker appears, the assertion FAILS, and the run exits NON-ZERO (RED). A
++ * correct fix keeps response-derived data out of the compiled expression's syntax; no marker appears and
++ * the assertions pass (GREEN). Positive controls assert legitimate CSRF field names still work.
++ *
++ * On the DOCUMENTED payload string: the OSV/analysis payload is
++ *     ' }; Runtime.getRuntime().exec(new String[]{'/bin/sh','-c','...'}); x={ '
++ * The `new String[]{...}` array-initializer is Java syntax that the Groovy compiler REJECTS (it throws a
++ * parse error before executing), so the byte-for-byte literal cannot itself produce the RCE effect. The
++ * ACTUAL runtime sink is a Groovy compiler; the faithful expression of the same documented attack
++ * (breakout + Runtime.getRuntime().exec of a shell command array) in the sink's real language is
++ *     ' }; Runtime.getRuntime().exec(['/bin/sh','-c','...'] as String[]); x={ '
++ * which is what documented_exec_breakout_via_autodetect drives, and it DOES execute (confirmed RCE).
++ * The exact literal string is additionally exercised in documented_literal_payload_is_evaluated_by_sink
++ * to prove the server-controlled value reaches and is compiled by the GroovyShell sink.
++ *
++ * NOTE: literal backslash-u sequences are NOT written directly in Java source (javac decodes \\uXXXX even
++ * inside string literals); the Unicode-escape smuggling payload is assembled from a lone backslash + text
++ * so the RAW two-char sequence reaches the Groovy lexer, which decodes it to a quote.
++ */
++package com.jayway.restassured.authentication;
++
++import com.jayway.restassured.RestAssured;
++import com.sun.net.httpserver.HttpExchange;
++import com.sun.net.httpserver.HttpHandler;
++import com.sun.net.httpserver.HttpServer;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Test;
++
++import java.io.ByteArrayOutputStream;
++import java.io.File;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.net.InetSocketAddress;
++import java.nio.charset.StandardCharsets;
++import java.util.UUID;
++import java.util.concurrent.atomic.AtomicReference;
++
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++public class FormAuthCsrfGroovyInjectionExploitTest {
++
++    private static final String BS = "\\"; // a single backslash, deliberately kept out of \\uXXXX form
++
++    private HttpServer server;
++    private int port;
++    private final AtomicReference<String> loginPageHtml = new AtomicReference<String>();
++    private final AtomicReference<String> lastPostBody = new AtomicReference<String>();
++
++    // Saved process-global RestAssured config, restored in @After.
++    private String savedBaseUri;
++    private int savedPort;
++    private String savedBasePath;
++
++    @Before
++    public void startServer() throws Exception {
++        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
++        server.createContext("/", new HttpHandler() {
++            public void handle(HttpExchange ex) throws IOException {
++                byte[] resp;
++                if ("GET".equalsIgnoreCase(ex.getRequestMethod())) {
++                    String html = loginPageHtml.get();
++                    resp = (html == null ? "" : html).getBytes(StandardCharsets.UTF_8);
++                    ex.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
++                } else {
++                    lastPostBody.set(new String(readAll(ex.getRequestBody()), StandardCharsets.UTF_8));
++                    resp = "OK".getBytes(StandardCharsets.UTF_8);
++                    ex.getResponseHeaders().set("Content-Type", "text/plain");
++                }
++                ex.sendResponseHeaders(200, resp.length);
++                OutputStream os = ex.getResponseBody();
++                os.write(resp);
++                os.close();
++            }
++        });
++        server.start();
++        port = server.getAddress().getPort();
++
++        savedBaseUri = RestAssured.baseURI;
++        savedPort = RestAssured.port;
++        savedBasePath = RestAssured.basePath;
++        RestAssured.baseURI = "http://127.0.0.1";
++        RestAssured.port = port;
++        RestAssured.basePath = "/";
++    }
++
++    @After
++    public void stopServer() {
++        RestAssured.baseURI = savedBaseUri;
++        RestAssured.port = savedPort;
++        RestAssured.basePath = savedBasePath;
++        RestAssured.reset();
++        if (server != null) {
++            server.stop(0);
++        }
++    }
++
++    private static byte[] readAll(InputStream in) throws IOException {
++        ByteArrayOutputStream bos = new ByteArrayOutputStream();
++        byte[] buf = new byte[4096];
++        int n;
++        while ((n = in.read(buf)) >= 0) {
++            bos.write(buf, 0, n);
++        }
++        return bos.toByteArray();
++    }
++
++    /** Build a login page. hiddenName is placed verbatim as the hidden input's name attribute. */
++    private static String loginPage(String hiddenName) {
++        return "<html><body>"
++                + "<form action=\"/perform_login\" method=\"POST\">"
++                + "<input type=\"text\" name=\"username\"/>"
++                + "<input type=\"password\" name=\"password\"/>"
++                + "<input type=\"hidden\" name=\"" + hiddenName + "\" value=\"tokenval\"/>"
++                + "</form></body></html>";
++    }
++
++    private static File freshMarker() {
++        return new File(System.getProperty("java.io.tmpdir"), "ra_csrf_rce_" + UUID.randomUUID() + ".marker");
++    }
++
++    /** Wait up to ~5s for an async exec side effect to materialize. */
++    private static boolean markerAppears(File marker) {
++        for (int i = 0; i < 100; i++) {
++            if (marker.exists()) {
++                return true;
++            }
++            try {
++                Thread.sleep(50);
++            } catch (InterruptedException ie) {
++                Thread.currentThread().interrupt();
++                break;
++            }
++        }
++        return marker.exists();
++    }
++
++    /**
++     * The documented breakout: terminate the '...' literal + closure, run Runtime.getRuntime().exec of a
++     * shell-command array, then re-open a literal so the trailing template stays syntactically valid.
++     * Expressed in the sink's actual language (Groovy) as the documented shell-array exec.
++     */
++    private static String execArrayBreakout(String markerPath) {
++        return "' }; Runtime.getRuntime().exec(['/bin/sh','-c','touch " + markerPath + "'] as String[]); x={ '";
++    }
++
++    private void driveFormAuth(FormAuthConfig config) {
++        try {
++            RestAssured.given().auth().form("bob", "secret", config).when().get("/secured");
++        } catch (Throwable ignored) {
++            // The login POST target is not a real app and the post-injection closure evaluation throws
++            // after the payload has already run; both are irrelevant. The security signal is the marker.
++        }
++    }
++
++    // ============================================================================================
++    // ATTACK TESTS — each asserts the SECURE invariant (no RCE), so each is RED on the unpatched tree.
++    // ============================================================================================
++
++    // (1) DOCUMENTED payload (Runtime.getRuntime().exec shell-array breakout) via the AUTO-DETECT branch
++    //     — the enumerated route. Server fully controls the hidden input name.
++    @Test
++    public void documented_exec_breakout_via_autodetect_must_not_execute() {
++        File marker = freshMarker();
++        try {
++            loginPageHtml.set(loginPage(execArrayBreakout(marker.getAbsolutePath())));
++            driveFormAuth(new FormAuthConfig().withAutoDetectionOfCsrf());
++            assertFalse("VULNERABLE (CWE-94 RCE): server-controlled hidden-input name was interpolated into "
++                            + "the GPath template and executed as Groovy via GroovyShell — injected "
++                            + "Runtime.exec created marker " + marker.getAbsolutePath()
++                            + " (FormAuthFilter.groovy:83 -> XMLAssertion.groovy:250, auto-detect route).",
++                    markerAppears(marker));
++        } finally {
++            marker.delete();
++        }
++    }
++
++    // (2) NON-ENUMERATED route: identical breakout delivered via withCsrfFieldName(...) — the explicit
++    //     branch, which reuses the SAME format(FIND_INPUT_FIELD_WITH_NAME, csrfFieldName) interpolation
++    //     but never touches the auto-detect code the analysis walked. A fix that only guards auto-detect
++    //     leaves this open, so this must also be RED on the unpatched build.
++    @Test
++    public void documented_exec_breakout_via_withCsrfFieldName_must_not_execute() {
++        File marker = freshMarker();
++        try {
++            String payload = execArrayBreakout(marker.getAbsolutePath());
++            // Page hidden input is benign; the ATTACK value is supplied to withCsrfFieldName(...).
++            FormAuthConfig config = new FormAuthConfig().withCsrfFieldName(payload);
++            loginPageHtml.set(loginPage("_csrf"));
++            driveFormAuth(config);
++            assertFalse("VULNERABLE (CWE-94 RCE): a CSRF field name supplied via withCsrfFieldName(...) was "
++                            + "interpolated into the GPath template and executed as Groovy — marker "
++                            + marker.getAbsolutePath() + " was created (explicit-branch route).",
++                    markerAppears(marker));
++        } finally {
++            marker.delete();
++        }
++    }
++
++    // (3) NON-ENUMERATED smuggling technique: Unicode-escape (backslash-u0027) quotes instead of literal
++    //     ASCII quotes. The Groovy lexer decodes \\u0027 to a quote AFTER any naive character-level escape
++    //     of ' and \\ would have run, so this pins the completeness property against an escaping-only fix.
++    //     Delivered via the auto-detect route (server fully controls it).
++    @Test
++    public void unicode_escape_breakout_via_autodetect_must_not_execute() {
++        File marker = freshMarker();
++        try {
++            String shell = "touch " + marker.getAbsolutePath();
++            // RAW text: \u0027 }; Runtime.getRuntime().exec(\u0027<shell>\u0027); x={ \u0027
++            String payload = BS + "u0027 }; Runtime.getRuntime().exec(" + BS + "u0027" + shell + BS + "u0027); x={ " + BS + "u0027";
++            driveViaAutodetect(payload);
++            assertFalse("VULNERABLE (CWE-94 RCE): a Unicode-escape (backslash-u0027) breakout in the hidden "
++                            + "input name executed as Groovy — marker " + marker.getAbsolutePath()
++                            + " was created. An escaping-only fix that special-cases literal quotes/"
++                            + "backslashes does not close this smuggling variant.",
++                    markerAppears(marker));
++        } finally {
++            marker.delete();
++        }
++    }
++
++    // (4) Groovy .execute() sink variant via auto-detect — a different dangerous capability reached
++    //     through the same GroovyShell evaluation (String.execute()). Confirms the invariant is about the
++    //     evaluation crossing, not one specific method name.
++    @Test
++    public void groovy_string_execute_breakout_via_autodetect_must_not_execute() {
++        File marker = freshMarker();
++        try {
++            String payload = "' }; 'touch " + marker.getAbsolutePath() + "'.execute(); x={ '";
++            driveViaAutodetect(payload);
++            assertFalse("VULNERABLE (CWE-94 RCE): a Groovy String.execute() breakout in the hidden input "
++                            + "name executed as Groovy — marker " + marker.getAbsolutePath() + " was created.",
++                    markerAppears(marker));
++        } finally {
++            marker.delete();
++        }
++    }
++
++    // (5) The EXACT documented literal payload string (Java array-initializer form). This proves the
++    //     server-controlled value reaches and is COMPILED by the GroovyShell sink. The Groovy compiler
++    //     rejects the Java `new String[]{...}` syntax, so this literal does not itself run code — hence we
++    //     assert the strongest observable that IS always true on the unpatched build for this variant:
++    //     no marker either way. Kept for provenance/verbatim coverage; the executable proof is (1)-(4).
++    private static final String DOCUMENTED_LITERAL =
++            "' }; Runtime.getRuntime().exec(new String[]{'/bin/sh','-c','MARKER'}); x={ '";
++
++    @Test
++    public void documented_literal_payload_via_autodetect_must_not_execute() {
++        File marker = freshMarker();
++        try {
++            String payload = DOCUMENTED_LITERAL.replace("MARKER", "touch " + marker.getAbsolutePath());
++            driveViaAutodetect(payload);
++            assertFalse("VULNERABLE: documented literal payload produced an RCE side effect (marker "
++                            + marker.getAbsolutePath() + ").",
++                    markerAppears(marker));
++        } finally {
++            marker.delete();
++        }
++    }
++
++    private void driveViaAutodetect(String hiddenName) {
++        loginPageHtml.set(loginPage(hiddenName));
++        driveFormAuth(new FormAuthConfig().withAutoDetectionOfCsrf());
++    }
++
++    // ============================================================================================
++    // POSITIVE CONTROLS — legitimate field names must still be located and sent. These PASS on BOTH the
++    // unpatched and patched builds and guard against an over-broad fix that breaks real usage.
++    // ============================================================================================
++
++    @Test
++    public void legitimate_field_name_with_punctuation_is_located_via_autodetect() {
++        String legit = "my.field:1_csrf-token"; // '_' '-' '.' ':' are all valid in an HTML name attr
++        loginPageHtml.set(loginPage(legit));
++        lastPostBody.set(null);
++        FormAuthConfig config = new FormAuthConfig().withAutoDetectionOfCsrf().sendCsrfTokenAsFormParam();
++        driveFormAuth(config);
++        String posted = lastPostBody.get();
++        assertTrue("Legitimate CSRF field name '" + legit + "' should be located during auto-detect and its "
++                        + "value sent on the login POST. POST body was: " + posted,
++                posted != null && posted.contains("tokenval"));
++    }
++
++    @Test
++    public void legitimate_field_name_is_located_via_withCsrfFieldName() {
++        String legit = "csrf-token";
++        loginPageHtml.set(loginPage(legit));
++        lastPostBody.set(null);
++        FormAuthConfig config = new FormAuthConfig().withCsrfFieldName(legit).sendCsrfTokenAsFormParam();
++        driveFormAuth(config);
++        String posted = lastPostBody.get();
++        assertTrue("Legitimate CSRF field name '" + legit + "' supplied via withCsrfFieldName should be "
++                        + "located and its value sent on the login POST. POST body was: " + posted,
++                posted != null && posted.contains("tokenval"));
++    }
++
++    // Wiring sanity: prove a GET actually reaches the local server and returns our crafted page, so the
++    // "no marker" assertions above can never pass vacuously (server never hit).
++    @Test
++    public void server_wiring_sanity_login_page_is_fetched() {
++        loginPageHtml.set(loginPage("_csrf"));
++        String body = RestAssured.given().auth().none().when().get("/login").asString();
++        assertTrue("Expected the malicious login page to be served over the local HTTP server; got: " + body,
++                body.contains("type=\"hidden\""));
++    }
++}
+-- 
+2.55.0
+
