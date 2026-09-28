@@ -1,0 +1,522 @@
+From 65005d7877c60415a8d29ecccf39b5aee077af50 Mon Sep 28 16:00:00 2026
+From: Chainguard Bot <noreply@chainguard.dev>
+Date: Mon, 28 Sep 2026 16:00:00 +0000
+Subject: [PATCH] carry-forward:
+ 0002-fix-reject-non-provider-class-before-instantiation-i.patch
+
+Cgp-Finding: CGP-gm3f-w8vf-c6p8
+---
+ .../java/jakarta/validation/Validation.java   |  10 +
+ .../jakarta/validation/BypassHunterTest.java  | 181 +++++++++++
+ .../validation/ConfusedDeputyExploitTest.java | 290 ++++++++++++++++++
+ 3 files changed, 481 insertions(+)
+ create mode 100644 src/test/java/jakarta/validation/BypassHunterTest.java
+ create mode 100644 src/test/java/jakarta/validation/ConfusedDeputyExploitTest.java
+
+diff --git a/src/main/java/jakarta/validation/Validation.java b/src/main/java/jakarta/validation/Validation.java
+index cac9304..88c5e99 100755
+--- a/src/main/java/jakarta/validation/Validation.java
++++ b/src/main/java/jakarta/validation/Validation.java
+@@ -607,6 +607,16 @@ public class Validation {
+ 
+ 		@Override
+ 		public T run() {
++			// Deny-by-default guard for CGP-gm3f-w8vf-c6p8 (CWE-470/CWE-266/CWE-913):
++			// the caller-supplied Class reaches this sink through the erased generic bound
++			// <U extends ValidationProvider<T>>, which a raw type / unchecked cast can violate.
++			// Positively confirm — with an identity-based Class supertype comparison, never a
++			// name/string comparison — that the class is assignable to ValidationProvider BEFORE
++			// its constructor runs, so no arbitrary caller-supplied class is ever instantiated
++			// (whether this action is invoked via AccessController.doPrivileged or action.run()).
++			if ( clazz == null || !ValidationProvider.class.isAssignableFrom( clazz ) ) {
++				throw new ValidationException( "Unable to find provider: " + clazz );
++			}
+ 			try {
+ 				return clazz.newInstance();
+ 			}
+diff --git a/src/test/java/jakarta/validation/BypassHunterTest.java b/src/test/java/jakarta/validation/BypassHunterTest.java
+new file mode 100644
+index 0000000..09ce67f
+--- /dev/null
++++ b/src/test/java/jakarta/validation/BypassHunterTest.java
+@@ -0,0 +1,181 @@
++/*
++ * Jakarta Bean Validation API
++ *
++ * License: Apache License, Version 2.0
++ * See the license.txt file in the root directory or <http://www.apache.org/licenses/LICENSE-2.0>.
++ */
++package jakarta.validation;
++
++import static org.testng.Assert.assertFalse;
++import static org.testng.Assert.assertTrue;
++import static org.testng.Assert.fail;
++
++import org.testng.annotations.Test;
++
++import jakarta.validation.NonRegisteredValidationProvider.NonRegisteredConfiguration;
++import jakarta.validation.spi.ValidationProvider;
++
++/**
++ * Bypass-hunt probes against the guard added in commit 69a08ec ({@code NewProviderInstance.run()}
++ * in {@code Validation.java}). Each probe targets a gap class the patch's own checklist did not
++ * explicitly exercise: interface/abstract Class objects that trivially satisfy
++ * {@code isAssignableFrom} but cannot structurally be instantiated, an INDIRECT (transitive)
++ * ValidationProvider implementer, and a non-provider class that subclasses a class whose
++ * constructor performs a side effect (to confirm inheritance from a "privileged-looking"
++ * superclass does not let a non-provider class slip past the type check).
++ *
++ * <p>All probes are run with NO SecurityManager installed (the default, hardest-to-defend
++ * configuration per the Plan's completeness property) so any escape is immediately observable via
++ * the action.run() arm.
++ */
++public class BypassHunterTest {
++
++	// ---- Probe 1: an interface that extends ValidationProvider -------------------------------
++	// isAssignableFrom(SubProviderInterface.class) is trivially true (interface inheritance), but
++	// an interface Class object has no constructor at all -- newInstance() must fail structurally,
++	// not via the guard's own exception message. Confirms no side effect can occur regardless.
++	public interface SubProviderInterface extends ValidationProvider<NonRegisteredConfiguration> {
++	}
++
++	@Test(singleThreaded = true)
++	@SuppressWarnings({ "unchecked", "rawtypes" })
++	public void bypass_interfaceExtendingValidationProvider_noConstructorRuns() {
++		SecurityManager previous = System.getSecurityManager();
++		System.setSecurityManager( null );
++		try {
++			try {
++				Validation.byProvider( (Class) SubProviderInterface.class ).configure();
++				fail( "expected a ValidationException; an interface cannot be instantiated" );
++			}
++			catch ( ValidationException expected ) {
++				// either the pre-newInstance guard's own message, or the post-newInstance
++				// InstantiationException wrap -- both are safe (no constructor ran either way)
++			}
++		}
++		finally {
++			System.setSecurityManager( previous );
++		}
++	}
++
++	// ---- Probe 2: an abstract class implementing ValidationProvider --------------------------
++	// isAssignableFrom is true, but Class#newInstance() on an abstract class always throws
++	// InstantiationException before any constructor body (even the abstract class's own) executes.
++	public abstract static class AbstractProvider implements ValidationProvider<NonRegisteredConfiguration> {
++		static volatile boolean constructed = false;
++
++		public AbstractProvider() {
++			constructed = true;
++		}
++	}
++
++	@Test(singleThreaded = true)
++	@SuppressWarnings({ "unchecked", "rawtypes" })
++	public void bypass_abstractClassImplementingValidationProvider_noConstructorRuns() {
++		AbstractProvider.constructed = false;
++		SecurityManager previous = System.getSecurityManager();
++		System.setSecurityManager( null );
++		try {
++			try {
++				Validation.byProvider( (Class) AbstractProvider.class ).configure();
++				fail( "expected a ValidationException; an abstract class cannot be instantiated" );
++			}
++			catch ( ValidationException expected ) {
++				// safe: abstract classes cannot be instantiated regardless of the type check
++			}
++		}
++		finally {
++			System.setSecurityManager( previous );
++		}
++		assertFalse( AbstractProvider.constructed,
++				"an abstract ValidationProvider's constructor must never run (it cannot be instantiated)" );
++	}
++
++	// ---- Probe 3: a NON-provider class that subclasses a class whose constructor performs a
++	// side effect (stand-in for a "privileged-looking" superclass already on the classpath).
++	// Gadget itself does NOT implement ValidationProvider (only its superclass's constructor runs
++	// as part of Gadget's construction chain), so it must still be rejected by the type check
++	// before any construction -- proving that inheriting from an arbitrary class does not let a
++	// non-provider type slip past the identity-based isAssignableFrom guard.
++	public static class SideEffectSuper {
++		static volatile boolean superConstructed = false;
++
++		public SideEffectSuper() {
++			superConstructed = true;
++		}
++	}
++
++	public static class NonProviderSubclass extends SideEffectSuper {
++		// deliberately NOT implements ValidationProvider
++	}
++
++	@Test(singleThreaded = true)
++	@SuppressWarnings({ "unchecked", "rawtypes" })
++	public void bypass_nonProviderSubclassOfSideEffectSuperclass_rejectedBeforeConstruction() {
++		SideEffectSuper.superConstructed = false;
++		SecurityManager previous = System.getSecurityManager();
++		System.setSecurityManager( null );
++		try {
++			try {
++				Validation.byProvider( (Class) NonProviderSubclass.class ).configure();
++				fail( "expected ValidationException rejecting the non-provider subclass before construction" );
++			}
++			catch ( ValidationException expected ) {
++				// rejected before newInstance(); superclass constructor must never run
++			}
++		}
++		finally {
++			System.setSecurityManager( previous );
++		}
++		assertFalse( SideEffectSuper.superConstructed,
++				"BYPASS: a non-ValidationProvider class's superclass constructor ran via "
++						+ "Validation.byProvider(...).configure() despite the class itself failing "
++						+ "the ValidationProvider assignability check." );
++	}
++
++	// ---- Probe 4 (control, not a bypass): an INDIRECT (transitive) ValidationProvider
++	// implementer -- via a sub-interface -- must still be correctly ACCEPTED (isAssignableFrom is
++	// transitive). This confirms the guard is not accidentally over-narrow in a way that would
++	// tempt a future maintainer to loosen it (e.g. to a direct-supertype-only check).
++	public interface ExtendedProvider extends ValidationProvider<NonRegisteredConfiguration> {
++	}
++
++	public static class IndirectProviderImpl implements ExtendedProvider {
++		static volatile boolean constructed = false;
++
++		public IndirectProviderImpl() {
++			constructed = true;
++		}
++
++		@Override
++		public NonRegisteredConfiguration createSpecializedConfiguration(jakarta.validation.spi.BootstrapState state) {
++			return new NonRegisteredConfiguration();
++		}
++
++		@Override
++		public NonRegisteredConfiguration createGenericConfiguration(jakarta.validation.spi.BootstrapState state) {
++			return new NonRegisteredConfiguration();
++		}
++
++		@Override
++		public ValidatorFactory buildValidatorFactory(jakarta.validation.spi.ConfigurationState configurationState) {
++			return null;
++		}
++	}
++
++	@Test(singleThreaded = true)
++	@SuppressWarnings({ "unchecked", "rawtypes" })
++	public void control_indirectValidationProviderImplementer_stillAccepted() {
++		IndirectProviderImpl.constructed = false;
++		SecurityManager previous = System.getSecurityManager();
++		System.setSecurityManager( null );
++		try {
++			Object configuration = Validation.byProvider( (Class) IndirectProviderImpl.class ).configure();
++			assertTrue( configuration != null, "a legitimate transitive ValidationProvider must still construct" );
++		}
++		finally {
++			System.setSecurityManager( previous );
++		}
++		assertTrue( IndirectProviderImpl.constructed,
++				"sanity: the legitimate indirect provider's constructor should have run" );
++	}
++}
+diff --git a/src/test/java/jakarta/validation/ConfusedDeputyExploitTest.java b/src/test/java/jakarta/validation/ConfusedDeputyExploitTest.java
+new file mode 100644
+index 0000000..bc416c6
+--- /dev/null
++++ b/src/test/java/jakarta/validation/ConfusedDeputyExploitTest.java
+@@ -0,0 +1,290 @@
++/*
++ * Jakarta Bean Validation API
++ *
++ * License: Apache License, Version 2.0
++ * See the license.txt file in the root directory or <http://www.apache.org/licenses/LICENSE-2.0>.
++ */
++package jakarta.validation;
++
++import static org.testng.Assert.assertFalse;
++import static org.testng.Assert.assertNotNull;
++import static org.testng.Assert.assertTrue;
++import static org.testng.Assert.fail;
++
++import java.security.Permission;
++
++import org.testng.annotations.Test;
++
++import jakarta.validation.NonRegisteredValidationProvider.NonRegisteredConfiguration;
++
++/**
++ * Exploit harness for CGP-gm3f-w8vf-c6p8 (CWE-272 / CWE-470 / CWE-266 / CWE-913):
++ * confused-deputy / arbitrary-class-instantiation via the single-argument
++ * {@code AccessController.doPrivileged} call in
++ * {@code Validation.ProviderSpecificBootstrapImpl.run(PrivilegedAction)} (Validation.java:240),
++ * whose privileged action reaches {@code NewProviderInstance.run()} ->
++ * {@code clazz.newInstance()} (Validation.java:419).
++ *
++ * <p>The exploit drives the EXACT sink through the ONLY reachable public entry point,
++ * {@code Validation.byProvider((Class) Gadget.class).configure()}, using a raw/unchecked cast
++ * to smuggle a class that is NOT a {@code ValidationProvider}. {@code Gadget}'s public no-arg
++ * constructor flips a static side-effect flag. The security property proved is:
++ * <em>the constructor of a caller-supplied non-provider class MUST NEVER run</em>.
++ *
++ * <p>On the UNPATCHED tree the constructor runs (flag flips) before the eventual
++ * ClassCastException/ValidationException, so every {@code assertFalse(Gadget.instantiated)}
++ * FAILS and the suite exits NON-ZERO (RED). A correct fix rejects the class with an
++ * assignability check BEFORE {@code newInstance()}, so the flag never flips and the suite
++ * exits ZERO (GREEN).
++ *
++ * <p>Two independently-reachable routes to the same defect are each pinned separately:
++ * <ul>
++ *   <li>Exploit A — a {@code SecurityManager} is installed: the OSV's literal confused-deputy
++ *       scenario; {@code run()} takes the {@code AccessController.doPrivileged(action)} arm at
++ *       line 240.</li>
++ *   <li>Exploit B — NO {@code SecurityManager} installed (the default on modern JVMs): the
++ *       non-enumerated route Analyze's single inventory line collapsed; {@code run()} takes the
++ *       {@code action.run()} arm and still instantiates the unchecked class. A fix that only
++ *       special-cases the {@code doPrivileged} arm stays RED here.</li>
++ * </ul>
++ */
++public class ConfusedDeputyExploitTest {
++
++	/**
++	 * Attacker gadget: NOT a {@link jakarta.validation.spi.ValidationProvider}. Its public no-arg
++	 * constructor is the security-checked side effect the confused deputy fires under elevated
++	 * privilege. We observe it via a static flag rather than by catching an exception, because the
++	 * property is "the constructor never ran", not "some exception was eventually thrown".
++	 */
++	public static class Gadget {
++		static volatile boolean instantiated = false;
++
++		public Gadget() {
++			// This body stands in for any security-checked side effect a real gadget's constructor
++			// would perform under jakarta.validation-api's broader ProtectionDomain.
++			instantiated = true;
++		}
++	}
++
++	/**
++	 * A permissive SecurityManager: {@code System.getSecurityManager() != null} is true so the
++	 * vulnerable {@code AccessController.doPrivileged(action)} arm at Validation.java:240 is
++	 * exercised, while no permission denials interfere with the harness mechanics or with the
++	 * gadget constructor. The flag flip proves the constructor ran INSIDE that privileged arm.
++	 */
++	private static final class AllowAllSecurityManager extends SecurityManager {
++		@Override
++		public void checkPermission(Permission perm) {
++			/* allow everything */
++		}
++
++		@Override
++		public void checkPermission(Permission perm, Object context) {
++			/* allow everything */
++		}
++	}
++
++	/**
++	 * Exploit A — SecurityManager PRESENT (OSV literal scenario): drive the public API with a
++	 * raw/unchecked cast so the erased generic bound carries an arbitrary Class; assert the
++	 * gadget constructor NEVER fires.
++	 *
++	 * Runs single-threaded ({@code singleThreaded = true}) and restores the prior SecurityManager
++	 * in {@code finally} (secure-patch-requirements §5: process-global-state isolation).
++	 */
++	@Test(singleThreaded = true)
++	@SuppressWarnings({ "unchecked", "rawtypes" })
++	public void exploitA_securityManagerPresent_doPrivilegedArm() {
++		Gadget.instantiated = false;
++		SecurityManager previous = System.getSecurityManager();
++		System.setSecurityManager( new AllowAllSecurityManager() );
++		try {
++			// Sanity: we really are on the doPrivileged arm for this route.
++			assertNotNull( System.getSecurityManager(),
++					"precondition: a SecurityManager must be installed for exploit A" );
++			try {
++				// EXACT documented payload: Validation.byProvider((Class) GadgetClass.class).configure()
++				Validation.byProvider( (Class) Gadget.class ).configure();
++				// A correct fix rejects the non-provider class with a specific ValidationException
++				// BEFORE newInstance(); reaching here (no throw at all) means the gadget was
++				// accepted and is a security failure.
++				fail( "expected ValidationException rejecting the non-provider class before instantiation" );
++			}
++			catch ( ValidationException expected ) {
++				// SECURE post-fix behavior: the caller-supplied non-provider class is rejected with
++				// a specific ValidationException raised BEFORE any constructor runs. (The message
++				// names the rejected class, e.g. "Unable to find provider: ...".)
++			}
++			catch ( ClassCastException afterSideEffect ) {
++				// UNPATCHED-only path: on the vulnerable tree the constructor already ran and the
++				// cast at Validation.java:214 threw AFTER the side effect. Not the secure behavior —
++				// the flag assertion below is the authoritative verdict and will FAIL here.
++			}
++		}
++		finally {
++			System.setSecurityManager( previous );
++		}
++
++		// SECURITY PROPERTY (authoritative verdict): the caller-supplied non-provider class must
++		// never be constructed.
++		// UNPATCHED: flag == true  -> assertion FAILS -> RED (non-zero exit).
++		// PATCHED:   flag == false -> assertion PASSES -> GREEN (zero exit).
++		assertFalse( Gadget.instantiated,
++				"CONFUSED-DEPUTY (SecurityManager present): Gadget's constructor ran under "
++						+ "AccessController.doPrivileged before any type check — arbitrary caller-supplied "
++						+ "class was instantiated under elevated privilege." );
++	}
++
++	/**
++	 * Exploit B — SecurityManager ABSENT (default modern-JVM state; non-enumerated route): the
++	 * same public-API drive takes the {@code action.run()} arm of {@code run()} and still
++	 * instantiates the unchecked class. Assert the gadget constructor NEVER fires. Independently
++	 * RED on the unpatched tree; catches a fix that only guards the {@code doPrivileged} arm.
++	 */
++	@Test(singleThreaded = true)
++	@SuppressWarnings({ "unchecked", "rawtypes" })
++	public void exploitB_noSecurityManager_actionRunArm() {
++		Gadget.instantiated = false;
++		SecurityManager previous = System.getSecurityManager();
++		// Ensure the no-SecurityManager route is actually exercised.
++		System.setSecurityManager( null );
++		try {
++			assertTrue( System.getSecurityManager() == null,
++					"precondition: no SecurityManager must be installed for exploit B" );
++			try {
++				// EXACT documented payload, raw/unchecked cast into the erased generic bound.
++				Validation.byProvider( (Class) Gadget.class ).configure();
++				fail( "expected ValidationException rejecting the non-provider class before instantiation" );
++			}
++			catch ( ValidationException expected ) {
++				// SECURE post-fix behavior: rejected with a specific ValidationException BEFORE any
++				// constructor runs, even on the action.run() (no-SecurityManager) arm.
++			}
++			catch ( ClassCastException afterSideEffect ) {
++				// UNPATCHED-only: post-construction cast throw; the flag assertion below is verdict.
++			}
++		}
++		finally {
++			System.setSecurityManager( previous );
++		}
++
++		assertFalse( Gadget.instantiated,
++				"ARBITRARY-CONSTRUCTOR-EXECUTION (no SecurityManager): Gadget's constructor ran via "
++						+ "the action.run() arm before any type check — a fix that only guards the "
++						+ "doPrivileged branch leaves this route open." );
++	}
++
++	/**
++	 * Invariant-coverage / systemic route: even a class with a public no-arg constructor whose
++	 * body does observable work (here, incrementing a counter) must not be constructed via this
++	 * API when it is not a ValidationProvider. This uses a DIFFERENT, non-JDK gadget than the two
++	 * above and exercises the SecurityManager-absent arm, so a fix that special-cases only the
++	 * literal {@code Gadget} type or only one arm still fails. The property proven is the general
++	 * capability property from the Plan ("no caller-supplied non-provider class is instantiated"),
++	 * not merely the single chain Analyze enumerated.
++	 */
++	@Test(singleThreaded = true)
++	@SuppressWarnings({ "unchecked", "rawtypes" })
++	public void exploitC_alternateGadget_capabilityProperty() {
++		SideEffectGadget.constructions = 0;
++		SecurityManager previous = System.getSecurityManager();
++		System.setSecurityManager( null );
++		try {
++			try {
++				Validation.byProvider( (Class) SideEffectGadget.class ).configure();
++				fail( "expected ValidationException rejecting the non-provider class before instantiation" );
++			}
++			catch ( ValidationException expected ) {
++				// SECURE post-fix behavior: rejected before the alternate gadget's constructor runs.
++			}
++			catch ( ClassCastException afterSideEffect ) {
++				// UNPATCHED-only — the counter assertion below is the verdict.
++			}
++		}
++		finally {
++			System.setSecurityManager( previous );
++		}
++
++		assertFalse( SideEffectGadget.constructions > 0,
++				"CAPABILITY PROPERTY: a caller-supplied non-provider class was instantiated via "
++						+ "Validation.byProvider(...).configure(); count=" + SideEffectGadget.constructions );
++	}
++
++	/**
++	 * A second, distinct attacker gadget for exploitC — proves the defect is a class-wide
++	 * capability, not tied to the specific {@code Gadget} type name.
++	 */
++	public static class SideEffectGadget {
++		static volatile int constructions = 0;
++
++		public SideEffectGadget() {
++			constructions++;
++		}
++	}
++
++	/**
++	 * POSITIVE CONTROL (preservation): a legitimate, non-JDK ValidationProvider with no custom
++	 * resolver must still be constructed and return a non-null Configuration end-to-end through the
++	 * exact code path the fix touches. This must stay GREEN before AND after the fix; blocking it
++	 * would be a regression. (Mirrors ValidationTest#testByProviderDoesNotRequireRetrievalViaProviderResolver.)
++	 */
++	@Test(singleThreaded = true)
++	public void positiveControl_legitimateProviderStillConstructs() {
++		SecurityManager previous = System.getSecurityManager();
++		System.setSecurityManager( null );
++		try {
++			NonRegisteredConfiguration configuration =
++					Validation.byProvider( NonRegisteredValidationProvider.class ).configure();
++			assertNotNull( configuration,
++					"preservation: a legitimate ValidationProvider must still construct and return a "
++							+ "non-null Configuration" );
++		}
++		finally {
++			System.setSecurityManager( previous );
++		}
++	}
++
++	/**
++	 * Bypass coverage (patching-unsafe-reflection known-bypass checklist): the identity-based
++	 * {@code ValidationProvider.class.isAssignableFrom(clazz)} guard cannot be evaded by the JVM
++	 * array/descriptor form of a class name (an array {@code Class}'s name is {@code [L...Gadget;}),
++	 * and the deny-by-default allow-list is never widened to the universal base type
++	 * {@code Object.class}. Both must be rejected with a {@code ValidationException} and neither may
++	 * be instantiated. (An array {@code Class} has no no-arg constructor to run, but the guard must
++	 * still reject it BEFORE {@code newInstance()} rather than fail with a reflection error, so the
++	 * check is proven to be a positive supertype test, not a name/string test.)
++	 */
++	@Test(singleThreaded = true)
++	@SuppressWarnings({ "unchecked", "rawtypes" })
++	public void bypassCoverage_arrayDescriptorAndUniversalBaseTypeRejected() {
++		Gadget.instantiated = false;
++		SecurityManager previous = System.getSecurityManager();
++		System.setSecurityManager( null );
++		try {
++			// (1) Array/descriptor form: Gadget[].class -> name "[Ljakarta.validation....Gadget;".
++			try {
++				Validation.byProvider( (Class) Gadget[].class ).configure();
++				fail( "expected ValidationException rejecting the array/descriptor-form class" );
++			}
++			catch ( ValidationException expected ) {
++				// rejected by identity-based supertype comparison, not a name check
++			}
++
++			// (2) Universal base type: Object.class must NOT be admitted by the allow-list.
++			try {
++				Validation.byProvider( (Class) Object.class ).configure();
++				fail( "expected ValidationException rejecting the universal base type Object.class" );
++			}
++			catch ( ValidationException expected ) {
++				// the allow-list is exactly "assignable to ValidationProvider", never Object
++			}
++		}
++		finally {
++			System.setSecurityManager( previous );
++		}
++
++		assertFalse( Gadget.instantiated,
++				"BYPASS: an evasion-spelled or universal-base-type class was instantiated via "
++						+ "Validation.byProvider(...).configure()." );
++	}
++}
+-- 
+2.55.0
+

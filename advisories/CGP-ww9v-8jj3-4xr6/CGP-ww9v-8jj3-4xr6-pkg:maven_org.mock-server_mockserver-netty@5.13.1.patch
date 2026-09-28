@@ -1,0 +1,412 @@
+From 67639333ac88a5bcdbe70d83bcbd67f387c832f3 Mon Sep 28 16:00:00 2026
+From: patch-forge <patch@chainguard.dev>
+Date: Mon, 28 Sep 2026 16:00:00 +0000
+Subject: [PATCH] fix: contain dashboard static-resource path traversal
+
+Vuln-ID: CGP-ww9v-8jj3-4xr6
+Cgp-Finding: CGP-ww9v-8jj3-4xr6
+---
+ .../dashboard/DashboardHandler.java           |  64 +++-
+ .../DashboardHandlerPathTraversalTest.java    | 301 ++++++++++++++++++
+ .../org/mockserver/dashboard-marker.txt       |   1 +
+ 3 files changed, 365 insertions(+), 1 deletion(-)
+ create mode 100644 mockserver-netty/src/test/java/org/mockserver/dashboard/DashboardHandlerPathTraversalTest.java
+ create mode 100644 mockserver-netty/src/test/resources/org/mockserver/dashboard-marker.txt
+
+diff --git a/mockserver-netty/src/main/java/org/mockserver/dashboard/DashboardHandler.java b/mockserver-netty/src/main/java/org/mockserver/dashboard/DashboardHandler.java
+index a3f7ba888..4e5decd74 100644
+--- a/mockserver-netty/src/main/java/org/mockserver/dashboard/DashboardHandler.java
++++ b/mockserver-netty/src/main/java/org/mockserver/dashboard/DashboardHandler.java
+@@ -54,7 +54,17 @@ public class DashboardHandler {
+             if (path.isEmpty() || path.equals("/")) {
+                 path = "/index.html";
+             }
+-            try (InputStream contentStream = DashboardHandler.class.getResourceAsStream("/org/mockserver/dashboard" + path)) {
++            // CWE-22 / CGP-ww9v-8jj3-4xr6: the attacker-controlled URL suffix is concatenated onto the
++            // fixed classpath prefix and handed to getResourceAsStream(). Without containment, ".."
++            // segments (and lexical-prefix / sibling names) let an attacker read arbitrary classpath
++            // resources outside /org/mockserver/dashboard on an exploded classpath. Resolve the
++            // concatenated resource name to its canonical form (collapsing "."/".." segments) and
++            // require the result to remain inside the dashboard subtree with a separator-aware
++            // boundary. Fail closed: a name that escapes the subtree yields the ordinary not-found
++            // response (no bytes, no leaked diagnostic detail — CWE-200), indistinguishable from a
++            // genuinely missing in-tree resource.
++            final String resourceName = resolveContainedResourceName(path);
++            try (InputStream contentStream = resourceName == null ? null : DashboardHandler.class.getResourceAsStream(resourceName)) {
+                 if (contentStream != null) {
+                     final String extension = substringAfterLast(path, ".");
+                     if (IS_STRING_CONTENT.contains(extension)) {
+@@ -84,4 +94,56 @@ public class DashboardHandler {
+             ctx.writeAndFlush(response);
+         }
+     }
++
++    /**
++     * The single classpath resource base the dashboard is allowed to serve from.
++     */
++    private static final String DASHBOARD_BASE = "/org/mockserver/dashboard";
++
++    /**
++     * Canonicalize the concatenated classpath resource name ({@code DASHBOARD_BASE + suffix}) and
++     * enforce that the resolved name stays INSIDE {@link #DASHBOARD_BASE}. Returns the safe, canonical
++     * resource name to open, or {@code null} when the requested name would escape the dashboard
++     * subtree (traversal, sibling/lexical-prefix collision, absolute-path injection, etc.) — the caller
++     * treats {@code null} as "resource not found" and fails closed.
++     *
++     * <p>This is an allow-by-containment check (CWE-184: positive containment, not a deny-list of bad
++     * substrings) evaluated on the fully normalized form (CWE-22: canonicalize-then-check ordering, no
++     * strip-and-continue), with a separator-aware boundary so a sibling such as
++     * {@code /org/mockserver/dashboard-marker.txt} is rejected even though it textually shares the base
++     * prefix.
++     */
++    private static String resolveContainedResourceName(final String suffix) {
++        // The suffix is a "/"-separated classpath sub-path. Normalize it segment-by-segment relative
++        // to the dashboard base, resolving "." and ".." and collapsing empty (duplicate-slash)
++        // segments. Any ".." that would rise above the base escapes the subtree -> reject.
++        final java.util.Deque<String> segments = new java.util.ArrayDeque<>();
++        for (final String segment : suffix.split("/", -1)) {
++            if (segment.isEmpty() || segment.equals(".")) {
++                // empty (leading/duplicate/trailing slash) or current-dir segment: skip.
++                continue;
++            }
++            if (segment.equals("..")) {
++                if (segments.isEmpty()) {
++                    // would escape above the dashboard base.
++                    return null;
++                }
++                segments.removeLast();
++                continue;
++            }
++            segments.add(segment);
++        }
++        final StringBuilder resolved = new StringBuilder(DASHBOARD_BASE);
++        for (final String segment : segments) {
++            resolved.append('/').append(segment);
++        }
++        final String resolvedName = resolved.toString();
++        // Separator-aware containment: the resolved name must be the base itself or live strictly
++        // beneath it. "startsWith(DASHBOARD_BASE)" alone would wrongly accept the sibling
++        // "/org/mockserver/dashboard-marker.txt"; requiring the next char be "/" closes that gap.
++        if (resolvedName.equals(DASHBOARD_BASE) || resolvedName.startsWith(DASHBOARD_BASE + "/")) {
++            return resolvedName;
++        }
++        return null;
++    }
+ }
+diff --git a/mockserver-netty/src/test/java/org/mockserver/dashboard/DashboardHandlerPathTraversalTest.java b/mockserver-netty/src/test/java/org/mockserver/dashboard/DashboardHandlerPathTraversalTest.java
+new file mode 100644
+index 000000000..2580cf883
+--- /dev/null
++++ b/mockserver-netty/src/test/java/org/mockserver/dashboard/DashboardHandlerPathTraversalTest.java
+@@ -0,0 +1,301 @@
++package org.mockserver.dashboard;
++
++import com.google.common.io.ByteStreams;
++import io.netty.channel.ChannelFuture;
++import io.netty.channel.ChannelHandlerContext;
++import org.junit.Before;
++import org.junit.Test;
++import org.mockito.ArgumentCaptor;
++import org.mockserver.model.HttpRequest;
++import org.mockserver.model.HttpResponse;
++
++import java.io.InputStream;
++
++import static org.hamcrest.MatcherAssert.assertThat;
++import static org.hamcrest.Matchers.containsString;
++import static org.hamcrest.Matchers.equalTo;
++import static org.hamcrest.Matchers.is;
++import static org.hamcrest.Matchers.not;
++import static org.hamcrest.Matchers.nullValue;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.times;
++import static org.mockito.Mockito.verify;
++import static org.mockito.Mockito.when;
++
++/**
++ * Exploit / regression harness for CGP-ww9v-8jj3-4xr6 (CWE-22 path traversal in
++ * {@link DashboardHandler}, related CWE-200 information exposure, CWE-184 incomplete list).
++ *
++ * <p>Drives the REAL runtime sink
++ * {@code DashboardHandler.renderDashboard(ChannelHandlerContext, HttpRequest)} which concatenates the
++ * attacker-controlled URL suffix (everything after {@code /mockserver/dashboard}) onto the fixed
++ * classpath prefix {@code /org/mockserver/dashboard} and hands the result to
++ * {@code DashboardHandler.class.getResourceAsStream(...)} at DashboardHandler.java:57, then streams
++ * the bytes back to the client via {@code ctx.writeAndFlush(response)}.
++ *
++ * <p>Response-shape facts (verified against the model):
++ * <ul>
++ *   <li>Resource-served (200) branch builds its response via {@code response()} — a bare
++ *       {@code new HttpResponse()} whose {@code getStatusCode()} is {@code null} (Netty applies the
++ *       default 200 only at serialization) but whose <em>body is populated</em> with the resource
++ *       bytes.</li>
++ *   <li>Not-found / rejection branch builds its response via {@code notFoundResponse()} —
++ *       {@code getStatusCode() == 404} with a {@code null} body.</li>
++ * </ul>
++ * The concrete HARMFUL EFFECT of the vulnerability is therefore: a traversal payload produces a
++ * response whose body contains the bytes of a resource resolved OUTSIDE
++ * {@code /org/mockserver/dashboard}. Each exploit test asserts that no out-of-tree bytes are returned
++ * and that the response is instead the not-found shape (404, empty body). On the unpatched build the
++ * body <em>does</em> contain the out-of-tree bytes, so these tests FAIL (RED); a correct containment
++ * fix makes them PASS (GREEN). The preservation tests pass on both builds.
++ */
++public class DashboardHandlerPathTraversalTest {
++
++    private static final String PREFIX = "/mockserver/dashboard";
++
++    private DashboardHandler handler;
++
++    @Before
++    public void setUp() {
++        handler = new DashboardHandler();
++    }
++
++    /**
++     * Invoke the real sink with a GET request whose path is {@code /mockserver/dashboard + suffix}
++     * and return the exact HttpResponse the handler wrote to the channel.
++     */
++    private HttpResponse renderAndCapture(String suffix) throws Exception {
++        HttpRequest request = new HttpRequest()
++            .withMethod("GET")
++            .withPath(PREFIX + suffix)
++            .withKeepAlive(false);
++
++        // Mock the Netty context; writeAndFlush(...).addListener(...) must not NPE.
++        ChannelHandlerContext ctx = mock(ChannelHandlerContext.class);
++        ChannelFuture future = mock(ChannelFuture.class);
++        when(ctx.writeAndFlush(org.mockito.ArgumentMatchers.any())).thenReturn(future);
++        when(future.addListener(org.mockito.ArgumentMatchers.any())).thenReturn(future);
++
++        handler.renderDashboard(ctx, request);
++
++        ArgumentCaptor<Object> captor = ArgumentCaptor.forClass(Object.class);
++        verify(ctx, times(1)).writeAndFlush(captor.capture());
++        return (HttpResponse) captor.getValue();
++    }
++
++    /** Read an in-tree resource's raw bytes directly, to compare against what the handler returns. */
++    private byte[] rawResourceBytes(String classpathName) throws Exception {
++        try (InputStream is = DashboardHandler.class.getResourceAsStream(classpathName)) {
++            assertThat("test setup: expected resource to exist: " + classpathName, is, is(not(nullValue())));
++            return ByteStreams.toByteArray(is);
++        }
++    }
++
++    private String rawResourceString(String classpathName) throws Exception {
++        return new String(rawResourceBytes(classpathName), "UTF-8");
++    }
++
++    /**
++     * Assert a response is the not-found / rejection shape: HTTP 404, no body, and (CWE-200) no leaked
++     * diagnostic detail (stack trace, exception message, resolved classpath path) in body or headers.
++     * This is the shape a traversal payload MUST produce — indistinguishable from the ordinary
++     * "resource not found inside the tree" response.
++     */
++    private void assertNotFoundShaped(HttpResponse response, String suffix) {
++        String body = response.getBodyAsString();
++        assertThat("rejection response must have no body, suffix=" + suffix,
++            (body == null || body.isEmpty()), is(true));
++        assertThat("traversal payload must yield the 404 not-found response, not the resource, suffix=" + suffix,
++            response.getStatusCode(), is(equalTo(404)));
++        // CWE-200: no leaked path / exception detail anywhere.
++        String headers = response.getHeaders() == null ? "" : response.getHeaders().toString();
++        String haystack = (body == null ? "" : body) + " " + headers;
++        assertThat("must not leak classpath path", haystack, not(containsString("/org/mockserver/dashboard")));
++        assertThat("must not leak exception detail", haystack.toLowerCase(), not(containsString("exception")));
++    }
++
++    // ---------------------------------------------------------------------------------------------
++    // RED: enumerated route — raw ".." traversal to a REAL out-of-tree classpath-root resource.
++    // On the unpatched build the response body contains the file's contents (harmful effect).
++    // ---------------------------------------------------------------------------------------------
++    @Test
++    public void rawDotDotTraversalMustNotDiscloseOutOfTreeProperties() throws Exception {
++        String secret = rawResourceString("/example_logging_configuration.properties");
++        // sanity: the leak target genuinely exists at the classpath root, 3 levels above the base.
++        assertThat(secret, containsString("java.util.logging.FileHandler.pattern"));
++
++        HttpResponse response = renderAndCapture("/../../../example_logging_configuration.properties");
++
++        // HARMFUL EFFECT on unpatched build: the out-of-tree file's bytes are returned to the client.
++        String body = response.getBodyAsString();
++        assertThat("VULNERABLE: out-of-tree resource contents disclosed via '..' traversal",
++            body == null ? "" : body, not(containsString("java.util.logging.FileHandler.pattern")));
++        assertNotFoundShaped(response, "/../../../example_logging_configuration.properties");
++    }
++
++    // ---------------------------------------------------------------------------------------------
++    // RED: NON-ENUMERATED route — lexical-prefix / missing-separator collision. The suffix lands one
++    // level above the base then names a sibling whose classpath name textually starts with
++    // "/org/mockserver/dashboard" but is NOT inside it (/org/mockserver/dashboard-marker.txt).
++    // A naive startsWith(base) containment check passes this; a separator-aware check rejects it.
++    // ---------------------------------------------------------------------------------------------
++    @Test
++    public void lexicalPrefixCollisionMustNotDiscloseSiblingResource() throws Exception {
++        String marker = rawResourceString("/org/mockserver/dashboard-marker.txt");
++        assertThat(marker, containsString("LEXICAL_PREFIX_COLLISION_SECRET_MARKER"));
++
++        HttpResponse response = renderAndCapture("/../dashboard-marker.txt");
++
++        // HARMFUL EFFECT on unpatched build: sibling-of-base resource contents disclosed.
++        String body = response.getBodyAsString();
++        assertThat("VULNERABLE: lexical-prefix sibling resource disclosed",
++            body == null ? "" : body, not(containsString("LEXICAL_PREFIX_COLLISION_SECRET_MARKER")));
++        assertNotFoundShaped(response, "/../dashboard-marker.txt");
++    }
++
++    // ---------------------------------------------------------------------------------------------
++    // RED: NON-ENUMERATED route — .class bytecode disclosure (the binary IS_STRING_CONTENT=false
++    // branch in the handler). Reads /org/mockserver/cli/Main.class via '..' traversal. Proves the fix
++    // must also close the binary branch, not only the string branch.
++    // ---------------------------------------------------------------------------------------------
++    @Test
++    public void dotDotTraversalMustNotDiscloseClassBytecode() throws Exception {
++        byte[] classBytes = rawResourceBytes("/org/mockserver/cli/Main.class");
++        assertThat(classBytes.length > 0, is(true));
++
++        HttpResponse response = renderAndCapture("/../../../org/mockserver/cli/Main.class");
++
++        // HARMFUL EFFECT on unpatched build: .class file bytes returned (starts with 0xCAFEBABE).
++        byte[] returned = response.getBodyAsRawBytes();
++        boolean leakedClass = returned != null && returned.length >= 4
++            && (returned[0] & 0xFF) == 0xCA && (returned[1] & 0xFF) == 0xFE
++            && (returned[2] & 0xFF) == 0xBA && (returned[3] & 0xFF) == 0xBE;
++        assertThat("VULNERABLE: classpath .class bytecode disclosed via '..' traversal",
++            leakedClass, is(false));
++        assertNotFoundShaped(response, "/../../../org/mockserver/cli/Main.class");
++    }
++
++    // ---------------------------------------------------------------------------------------------
++    // OSV literal enumerated payloads — must be not-found-shaped (no throw, no leak). These target a
++    // file absent from THIS tree, so they 404 either way today; pinned so a future decode/refactor
++    // cannot silently reopen them, and to prove no exception escapes to the client (CWE-200).
++    // ---------------------------------------------------------------------------------------------
++    @Test
++    public void osvLiteralApplicationPropertiesPayloadIsRejectedCleanly() throws Exception {
++        HttpResponse response = renderAndCapture("/../../../../application.properties");
++        assertNotFoundShaped(response, "/../../../../application.properties");
++    }
++
++    @Test
++    public void osvLiteralEncodedTraversalPayloadIsRejectedCleanly() throws Exception {
++        // KNOWN-BYPASS style payload, tested verbatim from ## Analyze.
++        HttpResponse response = renderAndCapture("/%2e%2e/%2e%2e/%2e%2e/%2e%2e/application.properties");
++        assertNotFoundShaped(response, "/%2e%2e/%2e%2e/%2e%2e/%2e%2e/application.properties");
++    }
++
++    // ---------------------------------------------------------------------------------------------
++    // Additional bypass-class coverage: absolute-path/trailing-separator suffix and duplicate-separator
++    // variant. Must be not-found-shaped (never disclose out-of-tree content, never throw/leak).
++    // ---------------------------------------------------------------------------------------------
++    @Test
++    public void trailingSeparatorTraversalVariantIsRejectedCleanly() throws Exception {
++        HttpResponse response = renderAndCapture("/../../../example_logging_configuration.properties/");
++        String body = response.getBodyAsString();
++        assertThat("trailing-separator variant must not disclose out-of-tree content",
++            body == null ? "" : body, not(containsString("java.util.logging.FileHandler.pattern")));
++        assertNotFoundShaped(response, "/../../../example_logging_configuration.properties/");
++    }
++
++    @Test
++    public void duplicateSlashTraversalVariantIsRejectedCleanly() throws Exception {
++        HttpResponse response = renderAndCapture("//../dashboard-marker.txt");
++        String body = response.getBodyAsString();
++        assertThat("duplicate-slash variant must not disclose sibling marker",
++            body == null ? "" : body, not(containsString("LEXICAL_PREFIX_COLLISION_SECRET_MARKER")));
++        assertNotFoundShaped(response, "//../dashboard-marker.txt");
++    }
++
++    // ---------------------------------------------------------------------------------------------
++    // Genuine not-found baseline — a real, non-existent resource INSIDE the tree. Establishes the
++    // exact response shape the traversal rejections must be indistinguishable from.
++    // ---------------------------------------------------------------------------------------------
++    @Test
++    public void genuineNotFoundInsideTreeIs404WithNoBody() throws Exception {
++        HttpResponse response = renderAndCapture("/does-not-exist.html");
++        assertThat(response.getStatusCode(), is(equalTo(404)));
++        String body = response.getBodyAsString();
++        assertThat(body == null || body.isEmpty(), is(true));
++    }
++
++    // ---------------------------------------------------------------------------------------------
++    // Preservation (must-not-break) — legitimate resources still served with correct body + headers.
++    // These pass on BOTH the unpatched and patched builds; they guard against an over-broad fix.
++    // NOTE: the served (200) branch uses response() which leaves getStatusCode()==null, so we assert
++    // on body bytes and the Content-Type/Content-Length headers, not on the status code.
++    // ---------------------------------------------------------------------------------------------
++    private void assertServedOk(String suffix, String classpathName, String expectedContentType,
++                                boolean stringContent) throws Exception {
++        HttpResponse response = renderAndCapture(suffix);
++        byte[] expected = rawResourceBytes(classpathName);
++        // served branch: statusCode is null (default 200 applied at serialization), body populated.
++        assertThat("legitimate resource must be served (non-404), suffix=" + suffix,
++            response.getStatusCode(), is(nullValue()));
++        assertThat("Content-Type header, suffix=" + suffix,
++            response.getFirstHeader("Content-Type"), is(equalTo(expectedContentType)));
++        if (stringContent) {
++            String expectedStr = new String(expected, "UTF-8");
++            assertThat("body content, suffix=" + suffix,
++                response.getBodyAsString(), is(equalTo(expectedStr)));
++            assertThat("Content-Length header, suffix=" + suffix,
++                response.getFirstHeader("Content-Length"),
++                is(equalTo(String.valueOf(expectedStr.getBytes().length))));
++        } else {
++            byte[] actual = response.getBodyAsRawBytes();
++            assertThat("body bytes length, suffix=" + suffix, actual.length, is(equalTo(expected.length)));
++            assertThat("Content-Length header, suffix=" + suffix,
++                response.getFirstHeader("Content-Length"), is(equalTo(String.valueOf(expected.length))));
++        }
++    }
++
++    @Test
++    public void defaultIndexIsServed() throws Exception {
++        // "" and "/" both map to /index.html
++        String index = rawResourceString("/org/mockserver/dashboard/index.html");
++
++        HttpResponse rootEmpty = renderAndCapture("");
++        assertThat(rootEmpty.getBodyAsString(), is(equalTo(index)));
++
++        HttpResponse rootSlash = renderAndCapture("/");
++        assertThat(rootSlash.getBodyAsString(), is(equalTo(index)));
++
++        assertServedOk("/index.html", "/org/mockserver/dashboard/index.html", "text/html; charset=utf-8", true);
++    }
++
++    @Test
++    public void topLevelStaticFilesAreServed() throws Exception {
++        assertServedOk("/favicon.ico", "/org/mockserver/dashboard/favicon.ico", "image/x-icon", false);
++        assertServedOk("/apple-touch-icon.png", "/org/mockserver/dashboard/apple-touch-icon.png", "image/png", false);
++        assertServedOk("/asset-manifest.json", "/org/mockserver/dashboard/asset-manifest.json", "application/json; charset=UTF-8", true);
++        assertServedOk("/service-worker.js", "/org/mockserver/dashboard/service-worker.js", "application/javascript; charset=UTF-8", true);
++        assertServedOk("/AveriaSansLibre-Regular.ttf", "/org/mockserver/dashboard/AveriaSansLibre-Regular.ttf", "application/octet-stream", false);
++        assertServedOk("/AveriaSansLibre-Regular.woff2", "/org/mockserver/dashboard/AveriaSansLibre-Regular.woff2", "application/font-woff2", false);
++        assertServedOk("/precache-manifest.7e5b6099c96247cc327e95964d344a55.js",
++            "/org/mockserver/dashboard/precache-manifest.7e5b6099c96247cc327e95964d344a55.js",
++            "application/javascript; charset=UTF-8", true);
++    }
++
++    @Test
++    public void nestedStaticFilesWithMultiDotAndTildeNamesAreServed() throws Exception {
++        assertServedOk("/static/css/main.66fded09.chunk.css",
++            "/org/mockserver/dashboard/static/css/main.66fded09.chunk.css", "text/css; charset=utf-8", true);
++        assertServedOk("/static/css/main.66fded09.chunk.css.map",
++            "/org/mockserver/dashboard/static/css/main.66fded09.chunk.css.map", "application/json; charset=UTF-8", true);
++        assertServedOk("/static/js/main.defc53a6.chunk.js",
++            "/org/mockserver/dashboard/static/js/main.defc53a6.chunk.js", "application/javascript; charset=UTF-8", true);
++        assertServedOk("/static/js/2.d40871cb.chunk.js",
++            "/org/mockserver/dashboard/static/js/2.d40871cb.chunk.js", "application/javascript; charset=UTF-8", true);
++        // multi-dot AND tilde in the filename — must not be mistaken for a traversal signal
++        assertServedOk("/static/js/runtime~main.26e8d0d9.js",
++            "/org/mockserver/dashboard/static/js/runtime~main.26e8d0d9.js", "application/javascript; charset=UTF-8", true);
++    }
++}
+diff --git a/mockserver-netty/src/test/resources/org/mockserver/dashboard-marker.txt b/mockserver-netty/src/test/resources/org/mockserver/dashboard-marker.txt
+new file mode 100644
+index 000000000..8e3d17b17
+--- /dev/null
++++ b/mockserver-netty/src/test/resources/org/mockserver/dashboard-marker.txt
+@@ -0,0 +1 @@
++LEXICAL_PREFIX_COLLISION_SECRET_MARKER: this resource is a sibling of the dashboard directory, NOT inside it; a naive startsWith("/org/mockserver/dashboard") containment check without a separator boundary would wrongly serve it.
+-- 
+2.55.0
+

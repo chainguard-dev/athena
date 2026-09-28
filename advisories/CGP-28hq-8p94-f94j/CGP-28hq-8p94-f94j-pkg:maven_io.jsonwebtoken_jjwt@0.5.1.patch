@@ -1,0 +1,373 @@
+From 4ce01ee4a80bd2ffaadd66a464ca2c8c1bbdc272 Mon Sep 28 16:00:00 2026
+From: patch-forge <patch@chainguard.dev>
+Date: Mon, 28 Sep 2026 16:00:00 +0000
+Subject: [PATCH] fix: use constant-time signature/MAC compare
+
+Vuln-ID: CGP-28hq-8p94-f94j
+Cgp-Finding: CGP-28hq-8p94-f94j
+---
+ .../impl/crypto/MacValidator.java             |   8 +-
+ .../impl/crypto/RsaSignatureValidator.java    |  10 +-
+ .../TimingOracleSignatureForgeryTest.groovy   | 293 ++++++++++++++++++
+ 3 files changed, 307 insertions(+), 4 deletions(-)
+ create mode 100644 src/test/groovy/io/jsonwebtoken/impl/crypto/TimingOracleSignatureForgeryTest.groovy
+
+diff --git a/src/main/java/io/jsonwebtoken/impl/crypto/MacValidator.java b/src/main/java/io/jsonwebtoken/impl/crypto/MacValidator.java
+index 95227ae..ee82ae8 100644
+--- a/src/main/java/io/jsonwebtoken/impl/crypto/MacValidator.java
++++ b/src/main/java/io/jsonwebtoken/impl/crypto/MacValidator.java
+@@ -18,7 +18,7 @@ package io.jsonwebtoken.impl.crypto;
+ import io.jsonwebtoken.SignatureAlgorithm;
+ 
+ import java.security.Key;
+-import java.util.Arrays;
++import java.security.MessageDigest;
+ 
+ public class MacValidator implements SignatureValidator {
+ 
+@@ -31,6 +31,10 @@ public class MacValidator implements SignatureValidator {
+     @Override
+     public boolean isValid(byte[] data, byte[] signature) {
+         byte[] computed = this.signer.sign(data);
+-        return Arrays.equals(computed, signature);
++        // Constant-time comparison (CWE-208/CWE-697): java.util.Arrays.equals short-circuits on the
++        // first differing byte, leaking the matching-prefix length through timing and enabling
++        // byte-by-byte MAC forgery. MessageDigest.isEqual scans the full length with no
++        // data-dependent early exit (and returns false on length mismatch, matching prior behavior).
++        return MessageDigest.isEqual(computed, signature);
+     }
+ }
+diff --git a/src/main/java/io/jsonwebtoken/impl/crypto/RsaSignatureValidator.java b/src/main/java/io/jsonwebtoken/impl/crypto/RsaSignatureValidator.java
+index a306d74..3c2622c 100644
+--- a/src/main/java/io/jsonwebtoken/impl/crypto/RsaSignatureValidator.java
++++ b/src/main/java/io/jsonwebtoken/impl/crypto/RsaSignatureValidator.java
+@@ -21,11 +21,11 @@ import io.jsonwebtoken.lang.Assert;
+ 
+ import java.security.InvalidKeyException;
+ import java.security.Key;
++import java.security.MessageDigest;
+ import java.security.PublicKey;
+ import java.security.Signature;
+ import java.security.interfaces.RSAPrivateKey;
+ import java.security.interfaces.RSAPublicKey;
+-import java.util.Arrays;
+ 
+ public class RsaSignatureValidator extends RsaProvider implements SignatureValidator {
+ 
+@@ -52,7 +52,13 @@ public class RsaSignatureValidator extends RsaProvider implements SignatureValid
+         } else {
+             Assert.notNull(this.SIGNER, "RSA Signer instance cannot be null.  This is a bug.  Please report it.");
+             byte[] computed = this.SIGNER.sign(data);
+-            return Arrays.equals(computed, signature);
++            // Constant-time comparison (CWE-208/CWE-697): java.util.Arrays.equals short-circuits on
++            // the first differing byte, leaking the matching-prefix length through timing and
++            // enabling byte-by-byte signature forgery on this local sign-and-compare path.
++            // MessageDigest.isEqual scans the full length with no data-dependent early exit (and
++            // returns false on length mismatch, matching prior behavior). The PublicKey branch above
++            // stays on Signature.verify(), the correct primitive for asymmetric verification.
++            return MessageDigest.isEqual(computed, signature);
+         }
+     }
+ 
+diff --git a/src/test/groovy/io/jsonwebtoken/impl/crypto/TimingOracleSignatureForgeryTest.groovy b/src/test/groovy/io/jsonwebtoken/impl/crypto/TimingOracleSignatureForgeryTest.groovy
+new file mode 100644
+index 0000000..81f9899
+--- /dev/null
++++ b/src/test/groovy/io/jsonwebtoken/impl/crypto/TimingOracleSignatureForgeryTest.groovy
+@@ -0,0 +1,293 @@
++/*
++ * Exploit / RED harness for CGP-28hq-8p94-f94j
++ * (CWE-208 timing discrepancy; related CWE-697 incorrect comparison, CWE-347 signature verification):
++ *
++ *   Non-constant-time java.util.Arrays.equals() in MacValidator and RsaSignatureValidator enables a
++ *   timing-oracle HMAC/RSA signature forgery.
++ *
++ * Named sinks driven by this suite:
++ *   - io.jsonwebtoken.impl.crypto.MacValidator.isValid(byte[],byte[])            (MacValidator.java:34)
++ *   - io.jsonwebtoken.impl.crypto.RsaSignatureValidator.isValid(byte[],byte[])  (RsaSignatureValidator.java:55,
++ *                                                                                 RSAPrivateKey sign-and-compare branch)
++ *
++ * RED->GREEN convention: the "flip gate" tests below assert the SECURE (constant-time) property, so on
++ * the UNPATCHED build they FAIL -- the failure IS the demonstration of the timing-oracle harmful
++ * effect (the sink short-circuits and rejection time leaks the matching-prefix length). Once the sink
++ * is patched to a constant-time comparison (MessageDigest.isEqual) they PASS.
++ *
++ * Reachability routes exercised (deliberately NOT just the OSV trace's internal parse(String) call):
++ *   - Jwts.parser().setSigningKey(key).parseClaimsJws(forged)   -> MacValidator.isValid   (convenience method)
++ *   - Jwts.parser().setSigningKey(RSAPrivateKey).parse(forged)  -> RsaSignatureValidator.isValid (private-key branch)
++ */
++package io.jsonwebtoken.impl.crypto
++
++import io.jsonwebtoken.Jwts
++import io.jsonwebtoken.SignatureAlgorithm
++import io.jsonwebtoken.SignatureException
++import io.jsonwebtoken.impl.TextCodec
++import org.junit.Test
++
++import java.security.Key
++import java.security.KeyPair
++import java.security.MessageDigest
++import java.security.PrivateKey
++import java.security.interfaces.RSAPrivateKey
++
++import static org.junit.Assert.*
++
++class TimingOracleSignatureForgeryTest {
++
++    // ---------------------------------------------------------------------------------------------
++    // Helpers
++    // ---------------------------------------------------------------------------------------------
++
++    /** Read the compiled bytecode of a loaded class straight from the runtime classloader. */
++    private static byte[] classBytes(Class<?> c) {
++        String res = '/' + c.getName().replace('.', '/') + '.class'
++        InputStream is = c.getResourceAsStream(res)
++        assertNotNull("cannot locate compiled ${c.name} on the classpath", is)
++        ByteArrayOutputStream bos = new ByteArrayOutputStream()
++        byte[] buf = new byte[8192]
++        int n
++        while ((n = is.read(buf)) != -1) { bos.write(buf, 0, n) }
++        is.close()
++        return bos.toByteArray()
++    }
++
++    /** True if the class's constant pool references the given "owner"/"member" symbol pair. */
++    private static boolean references(byte[] cls, String owner, String member) {
++        String blob = new String(cls, "ISO-8859-1")
++        return blob.contains(owner) && blob.contains(member)
++    }
++
++    private static boolean sinkUsesShortCircuitingCompare(Class<?> sink) {
++        byte[] cls = classBytes(sink)
++        return references(cls, 'java/util/Arrays', 'equals') &&
++               !references(cls, 'java/security/MessageDigest', 'isEqual')
++    }
++
++    /** Take a signed compact JWS and replace only its signature segment with a forged one. */
++    private static String withSignature(String compact, byte[] forgedSig) {
++        int i = compact.lastIndexOf('.')
++        return compact.substring(0, i + 1) + TextCodec.BASE64URL.encode(forgedSig)
++    }
++
++    // =============================================================================================
++    // FLIP GATES  --  assert the SECURE property; FAIL (RED) on the unpatched build, PASS on patched.
++    // =============================================================================================
++
++    /**
++     * HMAC family (HS256/HS384/HS512). The named sink MacValidator.isValid must NOT compare the
++     * attacker-supplied MAC with the short-circuiting java.util.Arrays.equals: it must use a
++     * constant-time comparison. On the unpatched build this fails, proving the timing-oracle sink.
++     */
++    @Test
++    void testMacValidatorSinkIsConstantTime() {
++        byte[] cls = classBytes(MacValidator)
++        boolean usesArraysEquals = references(cls, 'java/util/Arrays', 'equals')
++        boolean constantTime      = references(cls, 'java/security/MessageDigest', 'isEqual')
++
++        assertFalse("VULNERABLE: MacValidator.isValid (MacValidator.java:34) compares the attacker-supplied " +
++                    "MAC with the short-circuiting java.util.Arrays.equals -> timing oracle enabling " +
++                    "byte-by-byte HS256/HS384/HS512 MAC forgery. It must use a constant-time comparison.",
++                    usesArraysEquals)
++        assertTrue("MacValidator.isValid must use a constant-time comparison (java.security.MessageDigest.isEqual).",
++                   constantTime)
++    }
++
++    /**
++     * RSA private-key sign-and-compare branch (RS256/RS384/RS512 with an RSAPrivateKey validation key).
++     * RsaSignatureValidator.isValid must NOT use Arrays.equals on that branch; the PublicKey branch must
++     * keep using the correct asymmetric primitive Signature.verify().
++     */
++    @Test
++    void testRsaValidatorPrivateKeyBranchIsConstantTime() {
++        byte[] cls = classBytes(RsaSignatureValidator)
++        boolean usesArraysEquals = references(cls, 'java/util/Arrays', 'equals')
++        boolean constantTime      = references(cls, 'java/security/MessageDigest', 'isEqual')
++        boolean keepsVerify       = references(cls, 'java/security/Signature', 'verify')
++
++        assertFalse("VULNERABLE: RsaSignatureValidator.isValid (RsaSignatureValidator.java:55, RSAPrivateKey " +
++                    "branch) compares the attacker-supplied signature with the short-circuiting " +
++                    "java.util.Arrays.equals -> timing oracle enabling RS256/RS384/RS512 forgery. It must " +
++                    "use a constant-time comparison.",
++                    usesArraysEquals)
++        assertTrue("RsaSignatureValidator.isValid private-key branch must use a constant-time comparison " +
++                   "(java.security.MessageDigest.isEqual).", constantTime)
++        assertTrue("Preservation: RsaSignatureValidator must keep the PublicKey branch on Signature.verify().",
++                   keepsVerify)
++    }
++
++    /**
++     * HARMFUL EFFECT (timing oracle). Times the exact comparison primitive that MacValidator.isValid
++     * actually invokes (determined structurally from the loaded class) against the real MAC produced by
++     * the real MacSigner, comparing a forgery that matches the whole prefix except the last byte vs a
++     * forgery that mismatches at the first byte. A short-circuiting compare rejects the near-miss
++     * markedly slower -> the attacker's oracle. Asserts the SECURE property (no data-dependent leak),
++     * so it FAILS on the unpatched build (where the sink uses Arrays.equals, ~5-6x on this VM) and
++     * PASSES once the sink is constant-time (~1.0x).
++     */
++    @Test
++    void testHmacSinkComparisonDoesNotLeakMatchingPrefixLength() {
++        SignatureAlgorithm alg = SignatureAlgorithm.HS512
++        Key key = MacProvider.generateKey(alg)
++        byte[] data = "eyJhbGciOiJIUzUxMiJ9.eyJzdWIiOiJKb2UifQ".getBytes("US-ASCII")
++
++        // The real expected MAC the sink recomputes via MacSigner:
++        byte[] correct = new MacSigner(alg, key).sign(data)
++        assertEquals("HS512 MAC length", 64, correct.length)
++
++        byte[] almost = correct.clone(); almost[correct.length - 1] = (byte) (almost[correct.length - 1] ^ 0xFF) // matches all-but-last
++        byte[] first  = correct.clone(); first[0] = (byte) (first[0] ^ 0xFF)                                     // mismatch at first
++
++        // Sanity: the real sink rejects both (identical functional result on vuln & patched builds).
++        MacValidator v = new MacValidator(alg, key)
++        assertFalse(v.isValid(data, almost))
++        assertFalse(v.isValid(data, first))
++
++        // Measure the SAME primitive the sink invokes, chosen by structurally inspecting the sink class.
++        boolean shortCircuit = sinkUsesShortCircuitingCompare(MacValidator)
++
++        // warmup
++        long sink = 0
++        for (int i = 0; i < 5_000_000; i++) {
++            sink += (cmp(shortCircuit, correct, almost) ? 1 : 0) + (cmp(shortCircuit, correct, first) ? 1 : 0)
++        }
++        assertEquals("both forgeries are invalid", 0L, sink)
++
++        int rounds = 9, iters = 5_000_000
++        long[] almostT = new long[rounds], firstT = new long[rounds]
++        for (int r = 0; r < rounds; r++) {
++            almostT[r] = timeCmp(shortCircuit, correct, almost, iters)
++            firstT[r]  = timeCmp(shortCircuit, correct, first,  iters)
++        }
++        Arrays.sort(almostT); Arrays.sort(firstT)
++        double ratio = (almostT[0] as double) / (firstT[0] as double)   // min = least-noise estimator
++        println "[timing-oracle] MacValidator sink comparison full-prefix/no-prefix ratio = ${ratio} " +
++                "(shortCircuitPrimitive=${shortCircuit})"
++
++        assertTrue("VULNERABLE: the MAC-comparison primitive used by MacValidator.isValid leaks the " +
++                   "matching-prefix length (a near-miss forgery is rejected ${ratio}x slower than a " +
++                   "first-byte mismatch). This is the timing oracle that recovers the MAC byte-by-byte. " +
++                   "A constant-time comparison keeps this ratio ~1.0.",
++                   ratio < 1.5d)
++    }
++
++    private static boolean cmp(boolean shortCircuit, byte[] a, byte[] b) {
++        return shortCircuit ? Arrays.equals(a, b) : MessageDigest.isEqual(a, b)
++    }
++
++    private static long timeCmp(boolean shortCircuit, byte[] a, byte[] b, int iters) {
++        long acc = 0; long t0 = System.nanoTime()
++        for (int i = 0; i < iters; i++) { if (cmp(shortCircuit, a, b)) acc++ }
++        if (acc == Long.MIN_VALUE) println acc
++        return System.nanoTime() - t0
++    }
++
++    // =============================================================================================
++    // REACHABILITY  --  a forged token flows into each named sink through public JwtParser routes and
++    // is rejected. Passes on both builds (functional result is identical); establishes the sinks are on
++    // the real runtime path via routes the OSV trace did not enumerate.
++    // =============================================================================================
++
++    @Test
++    void testHmacForgedTokenReachesMacValidatorSinkViaParseClaimsJws() {
++        byte[] key = MacProvider.generateKey(SignatureAlgorithm.HS256).getEncoded()
++        String valid = Jwts.builder().setSubject("Joe").signWith(SignatureAlgorithm.HS256, key).compact()
++
++        int i = valid.lastIndexOf('.')
++        byte[] realSig = TextCodec.BASE64URL.decode(valid.substring(i + 1))
++        byte[] forgedSig = realSig.clone(); forgedSig[forgedSig.length - 1] = (byte) (forgedSig[forgedSig.length - 1] ^ 0xFF)
++        String forged = withSignature(valid, forgedSig)
++
++        try {
++            Jwts.parser().setSigningKey(key).parseClaimsJws(forged)   // convenience route (NOT the OSV trace)
++            fail("forged HS256 token must be rejected by MacValidator.isValid")
++        } catch (SignatureException expected) {
++            assertTrue(expected.message.contains("JWT signature does not match"))
++        }
++    }
++
++    @Test
++    void testRsaForgedTokenReachesPrivateKeySinkViaParse() {
++        KeyPair kp = RsaProvider.generateKeyPair(1024)
++        PrivateKey privateKey = kp.getPrivate()
++        assertTrue(privateKey instanceof RSAPrivateKey)
++
++        String valid = Jwts.builder().setSubject("Joe").signWith(SignatureAlgorithm.RS256, privateKey).compact()
++        int i = valid.lastIndexOf('.')
++        byte[] realSig = TextCodec.BASE64URL.decode(valid.substring(i + 1))
++        byte[] forgedSig = realSig.clone(); forgedSig[forgedSig.length - 1] = (byte) (forgedSig[forgedSig.length - 1] ^ 0xFF)
++        String forged = withSignature(valid, forgedSig)
++
++        try {
++            // RSAPrivateKey validation key -> RsaSignatureValidator sign-and-compare branch (Arrays.equals sink).
++            Jwts.parser().setSigningKey(privateKey).parse(forged)
++            fail("forged RS256 token must be rejected by RsaSignatureValidator.isValid (private-key branch)")
++        } catch (SignatureException expected) {
++            assertTrue(expected.message.contains("JWT signature does not match"))
++        }
++    }
++
++    // =============================================================================================
++    // POSITIVE CONTROLS  --  a genuinely correct signature is still accepted for every algorithm
++    // family exercised by the two sinks. Pins the must-not-break preservation property.
++    // =============================================================================================
++
++    @Test
++    void testPositiveControlHmacAccepted() {
++        byte[] key = MacProvider.generateKey(SignatureAlgorithm.HS256).getEncoded()
++        String jwt = Jwts.builder().setSubject("Joe").signWith(SignatureAlgorithm.HS256, key).compact()
++        def jws = Jwts.parser().setSigningKey(key).parseClaimsJws(jwt)
++        assertEquals("Joe", jws.getBody().getSubject())
++    }
++
++    @Test
++    void testPositiveControlRsaPublicKeyPathAccepted() {
++        KeyPair kp = RsaProvider.generateKeyPair(1024)
++        String jwt = Jwts.builder().setSubject("Joe").signWith(SignatureAlgorithm.RS256, kp.getPrivate()).compact()
++        def token = Jwts.parser().setSigningKey(kp.getPublic()).parse(jwt)  // Signature.verify() branch
++        assertEquals("Joe", token.getBody().getSubject())
++    }
++
++    @Test
++    void testPositiveControlRsaPrivateKeySignAndCompareAccepted() {
++        KeyPair kp = RsaProvider.generateKeyPair(1024)
++        String jwt = Jwts.builder().setSubject("Joe").signWith(SignatureAlgorithm.RS256, kp.getPrivate()).compact()
++        def token = Jwts.parser().setSigningKey(kp.getPrivate()).parse(jwt)  // constant-time-compare-must-still-accept branch
++        assertEquals("Joe", token.getBody().getSubject())
++    }
++
++    @Test
++    void testPositiveControlEcAccepted() {
++        KeyPair kp = EllipticCurveProvider.generateKeyPair(SignatureAlgorithm.ES256)
++        String jwt = Jwts.builder().setSubject("Joe").signWith(SignatureAlgorithm.ES256, kp.getPrivate()).compact()
++        def token = Jwts.parser().setSigningKey(kp.getPublic()).parse(jwt)
++        assertEquals("Joe", token.getBody().getSubject())
++    }
++
++    // =============================================================================================
++    // LENGTH-MISMATCH  --  a wrong-length signature must be rejected gracefully (false / SignatureException),
++    // never an uncaught NPE/AIOOBE. A constant-time replacement must preserve this behavior.
++    // =============================================================================================
++
++    @Test
++    void testMacValidatorRejectsWrongLengthSignature() {
++        SignatureAlgorithm alg = SignatureAlgorithm.HS256
++        Key key = MacProvider.generateKey(alg)
++        MacValidator v = new MacValidator(alg, key)
++        byte[] data = "a.b".getBytes("US-ASCII")
++        assertFalse("short signature must be rejected, not throw",  v.isValid(data, new byte[10]))
++        assertFalse("long signature must be rejected, not throw",   v.isValid(data, new byte[200]))
++        assertFalse("empty signature must be rejected, not throw",  v.isValid(data, new byte[0]))
++    }
++
++    @Test
++    void testRsaPrivateKeyBranchRejectsWrongLengthSignature() {
++        KeyPair kp = RsaProvider.generateKeyPair(1024)
++        RsaSignatureValidator v = new RsaSignatureValidator(SignatureAlgorithm.RS256, kp.getPrivate())
++        byte[] data = "a.b".getBytes("US-ASCII")
++        assertFalse("short signature must be rejected, not throw", v.isValid(data, new byte[10]))
++        assertFalse("long signature must be rejected, not throw",  v.isValid(data, new byte[999]))
++    }
++}
+-- 
+2.55.0
+

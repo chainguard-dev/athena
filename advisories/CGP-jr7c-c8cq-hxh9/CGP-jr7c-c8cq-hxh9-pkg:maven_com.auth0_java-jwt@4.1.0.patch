@@ -1,0 +1,312 @@
+From c23377d19f6d0de8c2b0e6e57e1b39708f0185a8 Mon Sep 28 16:00:00 2026
+From: Chainguard Bot <noreply@chainguard.dev>
+Date: Mon, 28 Sep 2026 16:00:00 +0000
+Subject: [PATCH] carry-forward:
+ 0001-fix-bound-TokenUtils.splitToken-to-O-1-allocation-cl.patch
+
+Cgp-Finding: CGP-jr7c-c8cq-hxh9
+---
+ .../main/java/com/auth0/jwt/TokenUtils.java   |  65 +++++-
+ .../TokenUtilsHeapAmplificationRedTest.java   | 213 ++++++++++++++++++
+ 2 files changed, 270 insertions(+), 8 deletions(-)
+ create mode 100644 lib/src/test/java/com/auth0/jwt/TokenUtilsHeapAmplificationRedTest.java
+
+diff --git a/lib/src/main/java/com/auth0/jwt/TokenUtils.java b/lib/src/main/java/com/auth0/jwt/TokenUtils.java
+index 6fa731c..68869e1 100644
+--- a/lib/src/main/java/com/auth0/jwt/TokenUtils.java
++++ b/lib/src/main/java/com/auth0/jwt/TokenUtils.java
+@@ -15,15 +15,64 @@ abstract class TokenUtils {
+         if (token == null) {
+             throw new JWTDecodeException("The token is null.");
+         }
+-        String[] parts = token.split("\\.");
+-        if (parts.length == 2 && token.endsWith(".")) {
+-            //Tokens with alg='none' have empty String as Signature.
+-            parts = new String[]{parts[0], parts[1], ""};
++        // Bounded tokenizer (CWE-770): reproduces String.split("\\.") exactly -- the same segment
++        // count (with trailing empty segments removed) and the alg='none' empty-signature
++        // special-case -- but WITHOUT ever allocating a String[] with one slot per delimiter.
++        // token.split("\\.") allocated ~N+1 references for a string of N '.' characters BEFORE the
++        // "3 parts" guard could reject it, giving a pre-auth heap-amplification DoS proportional to
++        // the attacker-supplied length. Here a single O(1)-allocation scan computes the part count,
++        // and substrings are materialised only on the accept path (at most 3 bounded substrings),
++        // so allocation is O(1) in the number of delimiter characters regardless of their count or
++        // position. The bound is a protocol-structural constant (a JWT is exactly 3 '.'-separated
++        // fields), not a tunable capacity, so no override knob is exposed.
++        final int len = token.length();
++        int firstDot = -1;
++        int secondDot = -1;
++        int lastNonDot = -1;
++        int totalDots = 0;
++        for (int i = 0; i < len; i++) {
++            if (token.charAt(i) == '.') {
++                totalDots++;
++                if (firstDot == -1) {
++                    firstDot = i;
++                } else if (secondDot == -1) {
++                    secondDot = i;
++                }
++            } else {
++                lastNonDot = i;
++            }
++        }
++
++        // Segment count that String.split("\\.") (limit 0) would return, i.e. after removing
++        // trailing empty segments.
++        int partCount;
++        if (lastNonDot == -1) {
++            // The string is empty or consists solely of '.' characters.
++            partCount = (len == 0) ? 1 : 0;
++        } else {
++            // All characters after lastNonDot are '.' (by definition of lastNonDot); those produce
++            // trailing empty segments that split() discards.
++            int trailingDots = (len - 1) - lastNonDot;
++            int keptDots = totalDots - trailingDots;
++            partCount = keptDots + 1;
+         }
+-        if (parts.length != 3) {
+-            throw new JWTDecodeException(
+-                    String.format("The token was expected to have 3 parts, but got %s.", parts.length));
++
++        if (partCount == 3) {
++            return new String[]{
++                token.substring(0, firstDot),
++                token.substring(firstDot + 1, secondDot),
++                token.substring(secondDot + 1, lastNonDot + 1)
++            };
++        }
++        if (partCount == 2 && token.endsWith(".")) {
++            //Tokens with alg='none' have empty String as Signature.
++            return new String[]{
++                token.substring(0, firstDot),
++                token.substring(firstDot + 1, lastNonDot + 1),
++                ""
++            };
+         }
+-        return parts;
++        throw new JWTDecodeException(
++                String.format("The token was expected to have 3 parts, but got %s.", partCount));
+     }
+ }
+diff --git a/lib/src/test/java/com/auth0/jwt/TokenUtilsHeapAmplificationRedTest.java b/lib/src/test/java/com/auth0/jwt/TokenUtilsHeapAmplificationRedTest.java
+new file mode 100644
+index 0000000..7e4ff79
+--- /dev/null
++++ b/lib/src/test/java/com/auth0/jwt/TokenUtilsHeapAmplificationRedTest.java
+@@ -0,0 +1,213 @@
++package com.auth0.jwt;
++
++import com.auth0.jwt.algorithms.Algorithm;
++import com.sun.management.ThreadMXBean;
++import org.junit.Test;
++
++import java.lang.management.ManagementFactory;
++
++import static org.junit.Assert.assertTrue;
++
++/**
++ * RED exploit for CGP-jr7c-c8cq-hxh9 (CWE-770 / CWE-400 / CWE-789):
++ * pre-authentication linear heap amplification in TokenUtils.splitToken.
++ *
++ * <p>The sink is {@code token.split("\\.")} at TokenUtils.java:18 (the single-argument form,
++ * with no limit). For a string of N delimiter ('.') characters this allocates a {@code String[]}
++ * of ~N+1 references (plus one empty {@code String} object per leading/interior dot) BEFORE the
++ * {@code parts.length != 3} guard at line 22 can reject the token, i.e. before any format or
++ * signature validation. The allocation is O(N) in the number of dots regardless of their position.
++ *
++ * <p>Each test asserts the SAFE (remediated) property: that tokenizing an attacker string allocates
++ * less than {@link #AMPLIFICATION_THRESHOLD_BYTES}. On the UNPATCHED build these assertions FAIL --
++ * every adversarial payload drives 200+ MiB of allocation through the sink, which IS the observable
++ * harm (RED). A bound on the split operation itself (e.g. {@code split("\\.", 4)}) makes the
++ * allocation O(1), so the same assertions PASS (GREEN) once patched.
++ *
++ * <p>The harm is measured via {@link ThreadMXBean#getThreadAllocatedBytes(long)}, which reports the
++ * cumulative bytes the calling thread has allocated. Unlike net heap usage this signal is monotonic
++ * and is NOT reclaimed by GC, so it deterministically measures the transient {@code String[]}
++ * allocation the sink performs even though the array is discarded when {@code splitToken} throws.
++ *
++ * <p>A fix that merely truncates an already fully-split array still performs the full O(N)
++ * allocation and therefore stays RED here -- {@link #splitTokenAllocationMustNotScaleWithDotCount()}
++ * pins exactly that by requiring allocation to stay flat across N.
++ *
++ * <p>Payload sizes are single-digit millions of dots: large enough to make the amplification
++ * unmistakable (hundreds of MiB) yet small enough not to literally exhaust the 512 MiB forked test
++ * JVM (a real OOM would corrupt the fork). The literal documented payload is
++ * {@code '.'*10_000_000 + 'x'}; its O(N) behaviour is what the scaling test proves, so a fix that
++ * bounds the split defends the documented payload at any N.
++ */
++public class TokenUtilsHeapAmplificationRedTest {
++
++    private static final ThreadMXBean TMX =
++            (ThreadMXBean) ManagementFactory.getThreadMXBean();
++
++    /** A remediated tokenizer allocates O(1); anything above this is unbounded amplification (harm). */
++    private static final long AMPLIFICATION_THRESHOLD_BYTES = 50L * 1024 * 1024; // 50 MiB
++
++    /** Single-digit millions: ~200 MiB alloc, well under the 512 MiB forked-JVM ceiling. */
++    private static final int BIG = 4_000_000;
++
++    /** A legitimate, well-formed 3-part token used only to warm up JWTParser/ObjectMapper
++     * construction before measuring an entry point that builds its own JWTParser internally,
++     * and as the positive control. */
++    private static final String LEGIT_TOKEN = "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0"
++            + ".eyJpc3MiOiJhdXRoMCJ9"
++            + ".W1mx_Y0hbAMbPmfW9whT605AAcxB7REFuJiDAHk2Sdc";
++
++    /** '.'*n + 'x' -- the documented leading-dot shape. */
++    private static String leadingDots(int n) {
++        StringBuilder sb = new StringBuilder(n + 1);
++        for (int i = 0; i < n; i++) {
++            sb.append('.');
++        }
++        sb.append('x');
++        return sb.toString();
++    }
++
++    /** 'x' + '.'*n -- trailing dots (non-enumerated route). */
++    private static String trailingDots(int n) {
++        StringBuilder sb = new StringBuilder(n + 1);
++        sb.append('x');
++        for (int i = 0; i < n; i++) {
++            sb.append('.');
++        }
++        return sb.toString();
++    }
++
++    /** ('a'+'.') repeated -- dots dispersed through the whole string (non-enumerated route). */
++    private static String dispersedDots(int pairs) {
++        StringBuilder sb = new StringBuilder(pairs * 2);
++        for (int i = 0; i < pairs; i++) {
++            sb.append('a').append('.');
++        }
++        return sb.toString();
++    }
++
++    /**
++     * Bytes the current thread allocates while running {@code r}. The RuntimeException that
++     * splitToken/decode/verify throw is swallowed on purpose: it is thrown AFTER the amplified
++     * array is already allocated, and we assert on the allocation, not on the throw.
++     */
++    private static long allocatedBytes(Runnable r) {
++        long tid = Thread.currentThread().getId();
++        long before = TMX.getThreadAllocatedBytes(tid);
++        try {
++            r.run();
++        } catch (RuntimeException expectedRejection) {
++            // JWTDecodeException / JWTVerificationException -- the token is still rejected, just too late.
++        }
++        return TMX.getThreadAllocatedBytes(tid) - before;
++    }
++
++    private static long mib(long bytes) {
++        return bytes / (1024 * 1024);
++    }
++
++    // ---------------------------------------------------------------------------------------------
++    // 1. Documented leading-dot payload through the EXACT named sink (TokenUtils.splitToken:18).
++    // ---------------------------------------------------------------------------------------------
++    @Test
++    public void splitTokenMustNotAmplifyOnLeadingDots() {
++        long alloc = allocatedBytes(() -> TokenUtils.splitToken(leadingDots(BIG)));
++        System.out.println("RED splitToken leading-dots(" + BIG + ") alloc=" + mib(alloc) + "MiB");
++        assertTrue("VULNERABLE: splitToken allocated " + mib(alloc)
++                        + " MiB tokenizing " + BIG + " leading dots (unbounded String.split)",
++                alloc < AMPLIFICATION_THRESHOLD_BYTES);
++    }
++
++    // ---------------------------------------------------------------------------------------------
++    // 2. Non-enumerated shape (trailing dots) through JWT.decode(String) -- unauthenticated static path.
++    // ---------------------------------------------------------------------------------------------
++    @Test
++    public void jwtDecodeMustNotAmplifyOnTrailingDots() {
++        // Warm up JWTParser/ObjectMapper construction (JWT.decode(String) builds a brand new
++        // JWTParser -- and therefore a brand new Jackson ObjectMapper plus bean introspection --
++        // internally). On a cold JVM this one-time class-loading/introspection cost is well over
++        // 100 MiB and has nothing to do with the split() amplification under test; without this
++        // warm-up the assertion below would still fail after a correct fix, on this cost alone.
++        JWT.decode(LEGIT_TOKEN);
++        long alloc = allocatedBytes(() -> JWT.decode(trailingDots(BIG)));
++        System.out.println("RED JWT.decode trailing-dots(" + BIG + ") alloc=" + mib(alloc) + "MiB");
++        assertTrue("VULNERABLE: JWT.decode allocated " + mib(alloc)
++                        + " MiB tokenizing " + BIG + " trailing dots (unbounded String.split)",
++                alloc < AMPLIFICATION_THRESHOLD_BYTES);
++    }
++
++    // ---------------------------------------------------------------------------------------------
++    // 3. Non-enumerated shape (dispersed dots) through new JWT().decodeJwt(String) -- instance path.
++    // ---------------------------------------------------------------------------------------------
++    @Test
++    public void jwtDecodeJwtMustNotAmplifyOnDispersedDots() {
++        // Warm up JWTParser/ObjectMapper construction for the same reason as the trailing-dots
++        // test above: `new JWT()` builds its own JWTParser/ObjectMapper internally.
++        new JWT().decodeJwt(LEGIT_TOKEN);
++        long alloc = allocatedBytes(() -> new JWT().decodeJwt(dispersedDots(BIG)));
++        System.out.println("RED JWT().decodeJwt dispersed-dots(" + BIG + ") alloc=" + mib(alloc) + "MiB");
++        assertTrue("VULNERABLE: JWT().decodeJwt allocated " + mib(alloc)
++                        + " MiB tokenizing " + BIG + " dispersed dots (unbounded String.split)",
++                alloc < AMPLIFICATION_THRESHOLD_BYTES);
++    }
++
++    // ---------------------------------------------------------------------------------------------
++    // 4. PRE-AUTH amplification through JWTVerifier.verify(String) -- the primary authenticated path.
++    //    Allocation happens before any signature check, so this is genuinely pre-authentication.
++    // ---------------------------------------------------------------------------------------------
++    @Test
++    public void jwtVerifierVerifyMustNotAmplifyPreAuth() {
++        JWTVerifier verifier = (JWTVerifier) JWT.require(Algorithm.HMAC256("secret")).build();
++        long alloc = allocatedBytes(() -> verifier.verify(leadingDots(BIG)));
++        System.out.println("RED JWTVerifier.verify leading-dots(" + BIG + ") alloc=" + mib(alloc) + "MiB");
++        assertTrue("VULNERABLE: JWTVerifier.verify allocated " + mib(alloc)
++                        + " MiB tokenizing " + BIG + " leading dots BEFORE signature check (pre-auth DoS)",
++                alloc < AMPLIFICATION_THRESHOLD_BYTES);
++    }
++
++    // ---------------------------------------------------------------------------------------------
++    // 5. INVARIANT: allocation must NOT scale with the dot count. This is the O(N) property the
++    //    literal documented payload ('.'*10_000_000 + 'x') weaponizes. It also defeats a fix that
++    //    truncates the array AFTER an unbounded split (that still allocates O(N)); only a fix that
++    //    bounds the split operation itself keeps allocation flat across N and passes this test.
++    // ---------------------------------------------------------------------------------------------
++    @Test
++    public void splitTokenAllocationMustNotScaleWithDotCount() {
++        // warm up the bean/JIT so the first measurement is not inflated
++        allocatedBytes(() -> TokenUtils.splitToken("a.b.c"));
++
++        // Build the adversarial inputs OUTSIDE the measured window: constructing an N-char String is
++        // inherently O(N) and is a cost of the test fixture, not of the sink under test. Measuring it
++        // would conflate "the test built a big string" with "splitToken allocated an array per dot".
++        // The payloads are still driven verbatim through the real sink below; only the measurement
++        // boundary is tightened so the assertion isolates the split's own allocation.
++        final String small = leadingDots(1_000_000);
++        final String big = leadingDots(4_000_000);
++
++        long allocSmall = allocatedBytes(() -> TokenUtils.splitToken(small));
++        long allocBig = allocatedBytes(() -> TokenUtils.splitToken(big));
++        System.out.println("RED scaling: 1M dots=" + mib(allocSmall) + "MiB  4M dots=" + mib(allocBig) + "MiB");
++
++        // Bounded split -> allocBig ~= allocSmall (both O(1)). Unbounded -> allocBig ~= 4x allocSmall
++        // AND both huge. Requiring allocBig <= 2.5x allocSmall fails hard on the unbounded impl.
++        assertTrue("VULNERABLE: allocation grew from " + mib(allocSmall) + " MiB (1M dots) to "
++                        + mib(allocBig) + " MiB (4M dots) -- split allocation scales with dot count",
++                allocBig <= allocSmall * 5 / 2);
++    }
++
++    // ---------------------------------------------------------------------------------------------
++    // 6. POSITIVE CONTROL: a legitimate 3-part token allocates negligibly on BOTH the unpatched and
++    //    patched builds. This proves the RED assertions above fire on the AMPLIFICATION, not on any
++    //    call to splitToken, and that a correct bounded fix keeps this token working.
++    // ---------------------------------------------------------------------------------------------
++    @Test
++    public void legitimateTokenAllocatesNegligibly() {
++        // warm up
++        allocatedBytes(() -> TokenUtils.splitToken(LEGIT_TOKEN));
++        long alloc = allocatedBytes(() -> TokenUtils.splitToken(LEGIT_TOKEN));
++        System.out.println("RED control legit-3-part alloc=" + mib(alloc) + "MiB");
++        assertTrue("harness sanity: legitimate token allocated " + mib(alloc)
++                        + " MiB -- assertion is not measuring amplification",
++                alloc < AMPLIFICATION_THRESHOLD_BYTES);
++    }
++}
+-- 
+2.55.0
+

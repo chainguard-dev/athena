@@ -1,0 +1,48 @@
+{
+  "id": "CGP-72c7-jxrr-483r",
+  "schema_version": "1.6.0",
+  "summary": "UrlValidator.isValidAuthority() crashes with ArrayIndexOutOfBoundsException on URLs with hostnames containing more than 10 labels.",
+  "details": "### Root Cause\n\n`UrlValidator.isValidAuthority(String authority)` (lines 355–395 of `src/share/org/apache/commons/validator/UrlValidator.java`) allocates a fixed-size `String[10]` array:\n\n```java\nString[] domainSegment = new String[10];\nboolean match = true;\nint segmentCount = 0;\nint segmentLength = 0;\nPerl5Util atomMatcher = new Perl5Util();\n\nwhile (match) {\n    match = atomMatcher.match(ATOM_PATTERN, hostIP);\n    if (match) {\n        domainSegment[segmentCount] = atomMatcher.group(1);  // segmentCount not bounded to array length 10\n        segmentLength = domainSegment[segmentCount].length() + 1;\n        ...\n        segmentCount++;\n    }\n}\n```\n\nThe loop variable `segmentCount` is incremented once per dot-separated label with no guard against `segmentCount >= 10`. When a URL hostname has 11 or more labels, the write at `domainSegment[10]` throws `ArrayIndexOutOfBoundsException`.\n\n### Affected Locations\n\n- `org.apache.commons.validator.UrlValidator.isValidAuthority(String)` — lines 355–395 of `src/share/org/apache/commons/validator/UrlValidator.java`. This is the direct sink. The exception propagates upward through `isValid(String)` without being caught.\n\n### Attack Vectors\n\n- **Crafted URL with 11+ hostname labels**: An attacker supplies a URL such as `http://a.a.a.a.a.a.a.a.a.a.com/` (11 dot-separated labels in the hostname). The public API `UrlValidator.isValid(String)` or `GenericValidator.isUrl(String)` is called with this input. The `isValidAuthority` method iterates to `segmentCount == 10`, writes past the end of the 10-element array, and throws `ArrayIndexOutOfBoundsException`, crashing the request thread.\n  - **Complexity**: single short crafted input, no authentication or special access required\n  - **Prerequisites**: the application must pass user-supplied input to `UrlValidator.isValid(String)` or `GenericValidator.isUrl(String)` without a surrounding try/catch for `ArrayIndexOutOfBoundsException`\n  - **Targets**: availability of the request-handling thread; applications that do not catch unchecked exceptions will expose this as a denial-of-service\n\n### Impact\n\nAny application that feeds user-supplied input into `GenericValidator.isUrl()` or `UrlValidator.isValid()` without catching `ArrayIndexOutOfBoundsException` will have the request thread terminated by the unchecked exception. This enables a trivial denial-of-service with a single short URL string. Confidentiality and integrity are not affected.\n\n### Trace\n\n1. Caller invokes `UrlValidator.isValid(value)` or `GenericValidator.isUrl(value)` with a URL whose hostname has 11+ labels.\n2. `isValid` calls `isValidAuthority(matchUrlPat.group(PARSE_URL_AUTHORITY))`.\n3. `isValidAuthority` enters the hostname-label `while` loop; on the 11th iteration `segmentCount == 10`, and `domainSegment[10] = atomMatcher.group(1)` throws `ArrayIndexOutOfBoundsException`.\n4. The exception propagates uncaught through `isValidAuthority` and `isValid` to the caller.",
+  "severity": [
+    {
+      "type": "CVSS_V3",
+      "score": "CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L/E:X/RL:X/RC:R"
+    }
+  ],
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Maven",
+        "name": "commons-validator:commons-validator",
+        "purl": "pkg:maven/commons-validator/commons-validator"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "1.1.0"
+            },
+            {
+              "fixed": "1.3.1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "cwe_ids": [
+          "CWE-400"
+        ],
+        "sink_locator": [
+          {
+            "class": "org.apache.commons.validator.UrlValidator",
+            "method": "isValidAuthority(String)",
+            "file_line": "src/share/org/apache/commons/validator/UrlValidator.java:355-395"
+          }
+        ]
+      }
+    }
+  ],
+  "published": "2026-09-28T16:00:00Z",
+  "modified": "2026-09-28T16:00:00Z"
+}

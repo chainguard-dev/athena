@@ -1,0 +1,48 @@
+{
+  "id": "CGP-4qc2-x2g2-q32h",
+  "schema_version": "1.6.0",
+  "summary": "RandomStringUtils and RandomUtils use ThreadLocalRandom (non-cryptographic PRNG), making generated tokens predictable if misused for security-sensitive values.",
+  "details": "### Root Cause\n\nAll random-generation methods in `RandomStringUtils` and `RandomUtils` are backed by `java.util.concurrent.ThreadLocalRandom`, a 64-bit-state SplittableRandom-style PRNG that is not cryptographically secure and whose output is predictable after observing a small number of samples.\n\nIn `src/main/java/org/apache/commons/lang3/RandomStringUtils.java` (lines 52–54):\n\n```java\nprivate static ThreadLocalRandom random() {\n    return ThreadLocalRandom.current();\n}\n```\n\nEvery public method in `RandomStringUtils` — `randomAlphanumeric()`, `randomAlpha()`, `randomNumeric()`, `randomAscii()`, `random(int)`, and all their overloads — delegates to this private method for all character selection.\n\nIn `src/main/java/org/apache/commons/lang3/RandomUtils.java` (lines 225–226):\n\n```java\nprivate static ThreadLocalRandom random() {\n    return ThreadLocalRandom.current();\n}\n```\n\nAll public methods in `RandomUtils` — `nextBoolean()`, `nextBytes()`, `nextInt()`, `nextLong()`, `nextFloat()`, `nextDouble()` — delegate to this same method.\n\n`ThreadLocalRandom` is a 64-bit-state PRNG designed for high-throughput non-security use cases. Its internal state can be reconstructed from a small number of observed output values, making any value it produces predictable to an attacker who can observe prior outputs.\n\nThe class-level Javadoc of `RandomStringUtils` explicitly states: *\"Instances of Random, upon which the implementation of this class relies, are not cryptographically secure.\"* `RandomUtils` is marked `@Deprecated`. Later releases of commons-lang3 (3.16+) switched the default backing PRNG to `SecureRandom`.\n\n### Affected Locations\n\n- `org.apache.commons.lang3.RandomStringUtils.random()` — lines 52–54: returns `ThreadLocalRandom.current()`; all public string-generation methods delegate here.\n- `org.apache.commons.lang3.RandomUtils.random()` — lines 225–226: returns `ThreadLocalRandom.current()`; all public numeric/byte-generation methods delegate here.\n\nThe cross-codebase hunt also found `ThreadLocalRandom.current()` in `ArrayUtils.java` (lines 4677–4678), used internally for array shuffling operations. Array shuffling is not a security token generation context and is not a security-relevant sink for this CWE.\n\n### Attack Vectors\n\n**Predictable security token generation**\nDownstream projects frequently misuse `RandomStringUtils.randomAlphanumeric(n)` to generate session IDs, password-reset tokens, CSRF tokens, or API keys. Because `ThreadLocalRandom`'s 64-bit internal state can be reconstructed from a small number of observed output values, an attacker who can observe any output from the PRNG (e.g. by requesting multiple tokens, or by observing tokens in HTTP responses, logs, or error messages) can predict future and past output values, forging tokens for other users or sessions.\n\n**State reconstruction from observed samples**\nAn attacker who can observe a sufficient number of `ThreadLocalRandom` outputs (the exact number depends on the output character set and length) can reconstruct the 64-bit internal seed and predict all past and future outputs from the same PRNG instance. This is a well-documented property of linear congruential and SplittableRandom-family PRNGs.\n\n**Scope note**\nThis finding is classified as a documented sharp edge rather than a hidden flaw: the `RandomStringUtils` class-level Javadoc explicitly warns that the implementation is not cryptographically secure. The risk is downstream misuse of the API for security-sensitive purposes. Later releases of commons-lang3 (3.16+) switched the default to `SecureRandom`.\n\n### Impact\n\nIf a downstream application uses `RandomStringUtils` or `RandomUtils` to generate security-sensitive values (session IDs, password-reset tokens, CSRF tokens, API keys, nonces), those values are predictable to an attacker who can observe prior PRNG output. This enables:\n- **Session hijacking** — predicting valid session identifiers.\n- **Password reset token forgery** — predicting reset tokens for arbitrary accounts.\n- **CSRF token bypass** — predicting CSRF tokens for other users' sessions.\n- **API key prediction** — predicting API keys generated for other users.\n\n### Trace\n\n1. Downstream application calls `RandomStringUtils.randomAlphanumeric(n)` to generate a security token.\n2. `randomAlphanumeric(n)` delegates to `random(n, true, true)`.\n3. `random(int, boolean, boolean)` calls the private `random()` method, which returns `ThreadLocalRandom.current()`.\n4. `ThreadLocalRandom.nextInt()` drives character selection — output is a function of the 64-bit internal state.\n5. Attacker observes multiple token outputs and reconstructs the 64-bit PRNG state.\n6. Attacker predicts past or future token values, forging tokens for other users.",
+  "severity": [
+    {
+      "type": "CVSS_V3",
+      "score": "CVSS:3.1/AV:L/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:N"
+    }
+  ],
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Maven",
+        "name": "org.apache.commons:commons-lang3",
+        "purl": "pkg:maven/org.apache.commons/commons-lang3"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.0"
+            },
+            {
+              "fixed": "3.15.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "cwe_ids": [
+          "CWE-338"
+        ],
+        "sink_locator": [
+          {
+            "class": "org.apache.commons.lang3.RandomStringUtils",
+            "method": "random()",
+            "file_line": "src/main/java/org/apache/commons/lang3/RandomStringUtils.java:52-54"
+          }
+        ]
+      }
+    }
+  ],
+  "published": "2026-09-28T16:00:00Z",
+  "modified": "2026-09-28T16:00:00Z"
+}

@@ -1,0 +1,653 @@
+From 22e562ebc02bc2f5f84f50ff33269ad95d2194b8 Mon Sep 28 16:00:00 2026
+From: patch-forge <patch@chainguard.dev>
+Date: Mon, 28 Sep 2026 16:00:00 +0000
+Subject: [PATCH] fix: bound ValidatorUtils.replace to O(1) stack, no unbounded
+ recursion
+
+Vuln-ID: CGP-3p49-8jjq-wc72
+Cgp-Finding: CGP-3p49-8jjq-wc72
+---
+ .../validator/util/ValidatorUtils.java        |  42 ++-
+ .../util/ValidatorUtilsReplaceBypassTest.java | 299 ++++++++++++++++++
+ .../util/ValidatorUtilsReplaceTest.java       | 262 +++++++++++++++
+ 3 files changed, 587 insertions(+), 16 deletions(-)
+ create mode 100644 src/test/java/org/apache/commons/validator/util/ValidatorUtilsReplaceBypassTest.java
+ create mode 100644 src/test/java/org/apache/commons/validator/util/ValidatorUtilsReplaceTest.java
+
+diff --git a/src/main/java/org/apache/commons/validator/util/ValidatorUtils.java b/src/main/java/org/apache/commons/validator/util/ValidatorUtils.java
+index b0539bc6..747b3fb8 100644
+--- a/src/main/java/org/apache/commons/validator/util/ValidatorUtils.java
++++ b/src/main/java/org/apache/commons/validator/util/ValidatorUtils.java
+@@ -59,30 +59,40 @@ public class ValidatorUtils {
+             return value;
+         }
+ 
++        // A zero-length key would make no forward progress per scan step, so
++        // the historical recursive implementation looped/recursed without
++        // bound (StackOverflowError) even for a tiny value. There is nothing
++        // meaningful to substitute for an empty key, so treat it as a no-op
++        // and return the value unchanged. This guarantees termination in
++        // O(1) stack for the degenerate case (CWE-674).
++        if (key.length() == 0) {
++            return value;
++        }
++
+         int pos = value.indexOf(key);
+ 
+         if (pos < 0) {
+             return value;
+         }
+ 
+-        int length = value.length();
+-        int start = pos;
+-        int end = pos + key.length();
+-
+-        if (length == key.length()) {
+-            value = replaceValue;
+-
+-        } else if (end == length) {
+-            value = value.substring(0, start) + replaceValue;
+-
+-        } else {
+-            value =
+-                    value.substring(0, start)
+-                    + replaceValue
+-                    + replace(value.substring(end), key, replaceValue);
++        // Iterative left-to-right, non-overlapping replacement. Each occurrence
++        // of key in the ORIGINAL value is replaced with replaceValue; text just
++        // appended from replaceValue is never rescanned for further key
++        // occurrences, because the scan cursor (start) advances through the
++        // original value only. Stack usage is O(1) regardless of the number of
++        // occurrences, so no value can drive the JVM stack to exhaustion
++        // (CWE-674 / CWE-400 / CWE-770).
++        final int keyLength = key.length();
++        final StringBuilder sb = new StringBuilder(value.length());
++        int start = 0;
++        while (pos >= 0) {
++            sb.append(value, start, pos).append(replaceValue);
++            start = pos + keyLength;
++            pos = value.indexOf(key, start);
+         }
++        sb.append(value, start, value.length());
+ 
+-        return value;
++        return sb.toString();
+     }
+ 
+     /**
+diff --git a/src/test/java/org/apache/commons/validator/util/ValidatorUtilsReplaceBypassTest.java b/src/test/java/org/apache/commons/validator/util/ValidatorUtilsReplaceBypassTest.java
+new file mode 100644
+index 00000000..f20a20c8
+--- /dev/null
++++ b/src/test/java/org/apache/commons/validator/util/ValidatorUtilsReplaceBypassTest.java
+@@ -0,0 +1,299 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.commons.validator.util;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
++
++import java.lang.reflect.Method;
++import java.util.HashMap;
++import java.util.Map;
++import java.util.concurrent.Callable;
++import java.util.concurrent.atomic.AtomicReference;
++
++import org.apache.commons.validator.Arg;
++import org.apache.commons.validator.Field;
++import org.apache.commons.validator.Msg;
++import org.apache.commons.validator.Var;
++import org.junit.Test;
++
++/**
++ * Bypass-hunt probes for CGP-3p49-8jjq-wc72 (CWE-674) against the PATCHED
++ * {@link ValidatorUtils#replace(String, String, String)}. Exercises: (a) an
++ * order-of-magnitude larger occurrence count than RED's N=15000, (b) the
++ * zero-length-key degenerate case on a much larger value, (c) the three
++ * enumerated caller sites RED did not individually exercise
++ * (Field.processVars / Field.processMessageComponents / Field.processArg),
++ * and (d) the exact TOKEN_INDEXED ("[]") key shape used by
++ * ValidatorAction.handleIndexedField. All are expected to PASS (no
++ * StackOverflowError / hang) on the patched build if the fix is complete.
++ */
++public class ValidatorUtilsReplaceBypassTest {
++
++    private static final long JOIN_TIMEOUT_MS = 30000L;
++
++    private static final class Outcome {
++        final String result;
++        final Throwable thrown;
++        final boolean finished;
++        Outcome(final String result, final Throwable thrown, final boolean finished) {
++            this.result = result;
++            this.thrown = thrown;
++            this.finished = finished;
++        }
++    }
++
++    private static Outcome runBounded(final Callable<String> body) throws InterruptedException {
++        final AtomicReference<String> out = new AtomicReference<String>();
++        final AtomicReference<Throwable> err = new AtomicReference<Throwable>();
++        final Thread t = new Thread(new Runnable() {
++            @Override
++            public void run() {
++                try {
++                    out.set(body.call());
++                } catch (final Throwable th) {
++                    err.set(th);
++                }
++            }
++        }, "replace-bypass-worker");
++        t.setUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
++            @Override
++            public void uncaughtException(final Thread th, final Throwable ex) {
++                err.compareAndSet(null, ex);
++            }
++        });
++        t.start();
++        t.join(JOIN_TIMEOUT_MS);
++        final boolean finished = !t.isAlive();
++        if (!finished) {
++            t.interrupt();
++        }
++        return new Outcome(out.get(), err.get(), finished);
++    }
++
++    private static void assertNoStackExhaustion(final Outcome o, final String route) {
++        if (!o.finished) {
++            fail(route + ": did not terminate within " + JOIN_TIMEOUT_MS + "ms");
++        }
++        if (o.thrown instanceof StackOverflowError) {
++            fail(route + ": threw StackOverflowError — unbounded recursion still reachable");
++        }
++        if (o.thrown != null) {
++            fail(route + ": threw unexpected " + o.thrown);
++        }
++    }
++
++    // ------------------------------------------------------------------
++    // (1) An order of magnitude beyond RED's documented N=15,000.
++    // ------------------------------------------------------------------
++    @Test
++    public void directReplaceWithVeryLargeOccurrenceCount() throws Exception {
++        final int n = 200000;
++        final String key = "${var}";
++        final StringBuilder sb = new StringBuilder(key.length() * n);
++        for (int i = 0; i < n; i++) {
++            sb.append(key);
++        }
++        final String value = sb.toString();
++
++        final Outcome o = runBounded(new Callable<String>() {
++            @Override
++            public String call() {
++                return ValidatorUtils.replace(value, key, "X");
++            }
++        });
++        assertNoStackExhaustion(o, "direct-200k-occurrences");
++        assertEquals(n, o.result.length());
++        boolean allX = true;
++        for (int i = 0; i < o.result.length(); i++) {
++            if (o.result.charAt(i) != 'X') {
++                allX = false;
++                break;
++            }
++        }
++        assertTrue(allX);
++    }
++
++    // ------------------------------------------------------------------
++    // (2) Zero-length key on a much larger value than RED's "abc".
++    // ------------------------------------------------------------------
++    @Test
++    public void directReplaceWithZeroLengthKeyOnLargeValue() throws Exception {
++        final StringBuilder sb = new StringBuilder(100000);
++        for (int i = 0; i < 100000; i++) {
++            sb.append('a');
++        }
++        final String value = sb.toString();
++        final Outcome o = runBounded(new Callable<String>() {
++            @Override
++            public String call() {
++                return ValidatorUtils.replace(value, "", "X");
++            }
++        });
++        assertNoStackExhaustion(o, "zero-length-key-large-value");
++    }
++
++    // ------------------------------------------------------------------
++    // (3) Enumerated caller site Field.processVars (Field.java:619) — not
++    // individually exercised by RED (RED only drove Field.process's own
++    // property substitution at line 576).
++    // ------------------------------------------------------------------
++    @Test
++    public void fieldProcessVarsWithManyOccurrencesDoesNotBlowStack() throws Exception {
++        final int n = 15000;
++        final String tokenName = "myConst";
++        final String token = "${" + tokenName + "}";
++        final StringBuilder sb = new StringBuilder(token.length() * n);
++        for (int i = 0; i < n; i++) {
++            sb.append(token);
++        }
++
++        final Field field = new Field();
++        field.setProperty("unrelated"); // keep property substitution out of this probe
++        field.addVar("someVar", sb.toString(), "int"); // Var.value carries the N-occurrence payload
++
++        final Map<String, String> constants = new HashMap<String, String>();
++        constants.put(tokenName, "X");
++        final Map<String, String> globalConstants = new HashMap<String, String>();
++
++        final Outcome o = runBounded(new Callable<String>() {
++            @Override
++            public String call() {
++                invokeProcess(field, globalConstants, constants);
++                return field.getVarValue("someVar");
++            }
++        });
++        assertNoStackExhaustion(o, "field-processVars-many-occurrences");
++        assertEquals(n, o.result.length());
++    }
++
++    // ------------------------------------------------------------------
++    // (4) Enumerated caller site Field.processMessageComponents (Field.java:633).
++    // ------------------------------------------------------------------
++    @Test
++    public void fieldProcessMessageComponentsWithManyOccurrencesDoesNotBlowStack() throws Exception {
++        final int n = 15000;
++        final String tokenName = "myConst";
++        final String token = "${" + tokenName + "}";
++        final StringBuilder sb = new StringBuilder(token.length() * n);
++        for (int i = 0; i < n; i++) {
++            sb.append(token);
++        }
++
++        final Field field = new Field();
++        field.setProperty("unrelated");
++        final Msg msg = new Msg();
++        msg.setName("msg1");
++        msg.setKey(sb.toString());
++        field.addMsg(msg);
++
++        final Map<String, String> constants = new HashMap<String, String>();
++        constants.put(tokenName, "X");
++        final Map<String, String> globalConstants = new HashMap<String, String>();
++
++        final Outcome o = runBounded(new Callable<String>() {
++            @Override
++            public String call() {
++                invokeProcess(field, globalConstants, constants);
++                return field.getMsg("msg1");
++            }
++        });
++        assertNoStackExhaustion(o, "field-processMessageComponents-many-occurrences");
++        assertEquals(n, o.result.length());
++    }
++
++    // ------------------------------------------------------------------
++    // (5) Enumerated caller site Field.processArg (Field.java:658).
++    // ------------------------------------------------------------------
++    @Test
++    public void fieldProcessArgWithManyOccurrencesDoesNotBlowStack() throws Exception {
++        final int n = 15000;
++        final String tokenName = "myConst";
++        final String token = "${" + tokenName + "}";
++        final StringBuilder sb = new StringBuilder(token.length() * n);
++        for (int i = 0; i < n; i++) {
++            sb.append(token);
++        }
++
++        final Field field = new Field();
++        field.setProperty("unrelated");
++        final Arg arg = new Arg();
++        arg.setKey(sb.toString());
++        arg.setPosition(0);
++        field.addArg(arg);
++
++        final Map<String, String> constants = new HashMap<String, String>();
++        constants.put(tokenName, "X");
++        final Map<String, String> globalConstants = new HashMap<String, String>();
++
++        final Outcome o = runBounded(new Callable<String>() {
++            @Override
++            public String call() {
++                invokeProcess(field, globalConstants, constants);
++                return field.getArg(0).getKey();
++            }
++        });
++        assertNoStackExhaustion(o, "field-processArg-many-occurrences");
++        assertEquals(n, o.result.length());
++    }
++
++    // ------------------------------------------------------------------
++    // (6) The exact key shape used by ValidatorAction.handleIndexedField
++    // (ValidatorAction.java:741) — key = Field.TOKEN_INDEXED ("[]"), many
++    // occurrences in the field key.
++    // ------------------------------------------------------------------
++    @Test
++    public void tokenIndexedKeyShapeWithManyOccurrencesDoesNotBlowStack() throws Exception {
++        final int n = 15000;
++        final String key = Field.TOKEN_INDEXED; // "[]"
++        final StringBuilder sb = new StringBuilder(key.length() * n);
++        for (int i = 0; i < n; i++) {
++            sb.append(key);
++        }
++        final String fieldKey = sb.toString();
++
++        final Outcome o = runBounded(new Callable<String>() {
++            @Override
++            public String call() {
++                return ValidatorUtils.replace(fieldKey, key, "[3]");
++            }
++        });
++        assertNoStackExhaustion(o, "token-indexed-key-shape");
++        assertEquals(n * "[3]".length(), o.result.length());
++    }
++
++    /** Invoke the package-private Field.process(Map,Map) reflectively (same pattern as RED). */
++    private static void invokeProcess(Field field, Map<String, String> globalConstants, Map<String, String> constants) {
++        try {
++            Method m = Field.class.getDeclaredMethod("process", Map.class, Map.class);
++            m.setAccessible(true);
++            m.invoke(field, globalConstants, constants);
++        } catch (java.lang.reflect.InvocationTargetException ite) {
++            Throwable cause = ite.getCause();
++            if (cause instanceof Error) {
++                throw (Error) cause;
++            }
++            if (cause instanceof RuntimeException) {
++                throw (RuntimeException) cause;
++            }
++            throw new RuntimeException(cause);
++        } catch (ReflectiveOperationException roe) {
++            throw new RuntimeException(roe);
++        }
++    }
++}
+diff --git a/src/test/java/org/apache/commons/validator/util/ValidatorUtilsReplaceTest.java b/src/test/java/org/apache/commons/validator/util/ValidatorUtilsReplaceTest.java
+new file mode 100644
+index 00000000..104b1286
+--- /dev/null
++++ b/src/test/java/org/apache/commons/validator/util/ValidatorUtilsReplaceTest.java
+@@ -0,0 +1,262 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.commons.validator.util;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.fail;
++
++import java.util.HashMap;
++import java.util.Map;
++import java.util.concurrent.atomic.AtomicReference;
++
++import org.apache.commons.validator.Field;
++import org.junit.Test;
++
++/**
++ * Exploit harness for CGP-3p49-8jjq-wc72 (CWE-674 — Uncontrolled Recursion in
++ * {@link ValidatorUtils#replace(String, String, String)}).
++ *
++ * <p>{@code ValidatorUtils.replace} performs string substitution with unbounded
++ * self-recursion: one stack frame per occurrence of {@code key} in {@code value}.
++ * A {@code value} carrying tens of thousands of occurrences of {@code key} drives
++ * recursion depth == occurrence count, exhausting the JVM thread stack and throwing
++ * {@link StackOverflowError}. The zero-length-key case makes zero forward progress
++ * per call and recurses without bound even for a tiny input.</p>
++ *
++ * <p>Each dangerous call is executed on a dedicated worker thread with the default
++ * stack size, and any {@link Throwable} that escapes is captured via an
++ * uncaught-exception handler so the assertion targets the SPECIFIC harmful effect
++ * ({@code StackOverflowError} escaping) rather than using a catch-all. A bounded
++ * join also catches an iterative-but-hanging (infinite-loop / quadratic) mis-fix.
++ * On the UNPATCHED build the StackOverflowError-detecting tests FAIL (RED); once
++ * {@code replace} no longer consumes stack proportional to occurrence count they
++ * PASS (GREEN).</p>
++ */
++public class ValidatorUtilsReplaceTest {
++
++    /** Documented payload: 10,000+ repeated occurrences of the placeholder token. */
++    private static final int OCCURRENCES = 15000;
++
++    /** Wall-clock bound so an iterative-but-hanging (infinite/quadratic) mis-fix is also caught. */
++    private static final long JOIN_TIMEOUT_MS = 30000L;
++
++    /** Result of running a payload on a worker thread. */
++    private static final class Outcome {
++        final String result;
++        final Throwable thrown;
++        final boolean finished;
++        Outcome(final String result, final Throwable thrown, final boolean finished) {
++            this.result = result;
++            this.thrown = thrown;
++            this.finished = finished;
++        }
++    }
++
++    /**
++     * Run {@code body} on a fresh thread with the default stack size, capturing any
++     * escaping {@link Throwable}. Returns whether it finished within the wall-clock bound.
++     */
++    private static Outcome runBounded(final java.util.concurrent.Callable<String> body) throws InterruptedException {
++        final AtomicReference<String> out = new AtomicReference<String>();
++        final AtomicReference<Throwable> err = new AtomicReference<Throwable>();
++        final Thread t = new Thread(new Runnable() {
++            @Override
++            public void run() {
++                try {
++                    out.set(body.call());
++                } catch (final Throwable th) {
++                    err.set(th);
++                }
++            }
++        }, "replace-exploit-worker");
++        // Also catch anything the try/catch above cannot (defensive).
++        t.setUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
++            @Override
++            public void uncaughtException(final Thread th, final Throwable ex) {
++                err.compareAndSet(null, ex);
++            }
++        });
++        t.start();
++        t.join(JOIN_TIMEOUT_MS);
++        final boolean finished = !t.isAlive();
++        if (!finished) {
++            t.interrupt();
++        }
++        return new Outcome(out.get(), err.get(), finished);
++    }
++
++    private static void assertNoStackExhaustion(final Outcome o, final String route) {
++        if (!o.finished) {
++            fail(route + ": ValidatorUtils.replace did not terminate within " + JOIN_TIMEOUT_MS
++                    + "ms (unbounded loop/quadratic mis-fix) — CWE-674");
++        }
++        if (o.thrown instanceof StackOverflowError) {
++            fail(route + ": ValidatorUtils.replace threw StackOverflowError — unbounded recursion, "
++                    + "one stack frame per key occurrence (CWE-674)");
++        }
++        if (o.thrown != null) {
++            fail(route + ": ValidatorUtils.replace threw unexpected " + o.thrown);
++        }
++    }
++
++    // ---------------------------------------------------------------------------
++    // Primary exploit — DIRECT public-API route (proves the fix lives in the utility,
++    // not only at the Field/ValidatorAction call sites).
++    // ---------------------------------------------------------------------------
++
++    @Test
++    public void directReplaceWithManyOccurrencesDoesNotBlowStack() throws Exception {
++        final String key = "${var}";
++        final StringBuilder sb = new StringBuilder(key.length() * OCCURRENCES);
++        for (int i = 0; i < OCCURRENCES; i++) {
++            sb.append(key);
++        }
++        final String value = sb.toString(); // '${var}' repeated 15,000 times
++
++        final Outcome o = runBounded(new java.util.concurrent.Callable<String>() {
++            @Override
++            public String call() {
++                return ValidatorUtils.replace(value, key, "X");
++            }
++        });
++
++        assertNoStackExhaustion(o, "direct-many-occurrences");
++        // Content check: a fix that returns wrong/truncated output for huge N must also fail.
++        final StringBuilder expected = new StringBuilder(OCCURRENCES);
++        for (int i = 0; i < OCCURRENCES; i++) {
++            expected.append('X');
++        }
++        assertEquals("direct-many-occurrences: replacement result incorrect",
++                expected.toString(), o.result);
++    }
++
++    // ---------------------------------------------------------------------------
++    // Enumerated pipeline route — through Field.process() (sink caller, Field.java:576).
++    // Proves the pipeline-level route is fixed too, not only the direct call.
++    // ---------------------------------------------------------------------------
++
++    @Test
++    public void fieldProcessWithManyOccurrencesDoesNotBlowStack() throws Exception {
++        final String tokenName = "myConst";
++        final String token = "${" + tokenName + "}"; // key2 built by Field.process
++        final StringBuilder sb = new StringBuilder(token.length() * OCCURRENCES);
++        for (int i = 0; i < OCCURRENCES; i++) {
++            sb.append(token);
++        }
++
++        final Field field = new Field();
++        field.setProperty(sb.toString()); // property = '${myConst}' x 15,000
++
++        final Map<String, String> constants = new HashMap<String, String>();
++        constants.put(tokenName, "X");           // -> key2 = ${myConst}, replaceValue = X
++        final Map<String, String> globalConstants = new HashMap<String, String>();
++
++        final Outcome o = runBounded(new java.util.concurrent.Callable<String>() {
++            @Override
++            public String call() {
++                // Field.process is package-private; this test lives in a subpackage,
++                // so invoke it reflectively to drive the real pipeline sink (line 576).
++                try {
++                    java.lang.reflect.Method m = Field.class.getDeclaredMethod(
++                            "process", Map.class, Map.class);
++                    m.setAccessible(true);
++                    m.invoke(field, globalConstants, constants);
++                } catch (java.lang.reflect.InvocationTargetException ite) {
++                    Throwable cause = ite.getCause();
++                    if (cause instanceof Error) {
++                        throw (Error) cause;
++                    }
++                    if (cause instanceof RuntimeException) {
++                        throw (RuntimeException) cause;
++                    }
++                    throw new RuntimeException(cause);
++                } catch (ReflectiveOperationException roe) {
++                    throw new RuntimeException(roe);
++                }
++                return field.getProperty();
++            }
++        });
++
++        assertNoStackExhaustion(o, "field-process-many-occurrences");
++        final StringBuilder expected = new StringBuilder(OCCURRENCES);
++        for (int i = 0; i < OCCURRENCES; i++) {
++            expected.append('X');
++        }
++        assertEquals("field-process-many-occurrences: property not fully substituted",
++                expected.toString(), o.result);
++    }
++
++    // ---------------------------------------------------------------------------
++    // Non-enumerated degenerate route — zero-length key. No forward progress per call:
++    // recurses/loops without bound even for a tiny value (distinct from "many
++    // occurrences"). ## Analyze's payload list only covers repeated non-empty keys.
++    // ---------------------------------------------------------------------------
++
++    @Test
++    public void directReplaceWithZeroLengthKeyTerminates() throws Exception {
++        final Outcome o = runBounded(new java.util.concurrent.Callable<String>() {
++            @Override
++            public String call() {
++                return ValidatorUtils.replace("abc", "", "X");
++            }
++        });
++        assertNoStackExhaustion(o, "zero-length-key");
++        // The exact output of empty-key replacement is a fix-design choice; the invariant
++        // is termination in bounded resources. We only require the call returns non-null.
++        if (o.result == null) {
++            fail("zero-length-key: replace returned null for a non-null value");
++        }
++    }
++
++    // ---------------------------------------------------------------------------
++    // Positive-control tests — pin existing semantics so a fix that breaks normal
++    // use also fails this suite. These pass on the unpatched build.
++    // ---------------------------------------------------------------------------
++
++    @Test
++    public void nullArgumentsReturnValueUnchanged() {
++        assertNull(ValidatorUtils.replace(null, "a", "b"));
++        assertEquals("abc", ValidatorUtils.replace("abc", null, "b"));
++        assertEquals("abc", ValidatorUtils.replace("abc", "a", null));
++    }
++
++    @Test
++    public void smallLegitimateSubstitutionIsCorrect() {
++        // 3 occurrences fully and correctly substituted.
++        assertEquals("XbXbX", ValidatorUtils.replace("aba" + "ba", "a", "X"));
++        assertEquals("Q Q Q", ValidatorUtils.replace("k k k", "k", "Q"));
++    }
++
++    @Test
++    public void exactMatchAndTailOccurrenceSemantics() {
++        // value exactly equals key
++        assertEquals("REP", ValidatorUtils.replace("KEY", "KEY", "REP"));
++        // key at the tail of value
++        assertEquals("headREP", ValidatorUtils.replace("headKEY", "KEY", "REP"));
++        // key at the head of value
++        assertEquals("REPtail", ValidatorUtils.replace("KEYtail", "KEY", "REP"));
++    }
++
++    @Test
++    public void replaceValueContainingKeyIsNotRescanned() {
++        // Inserted replaceValue contains key; only occurrences in the ORIGINAL value are
++        // replaced (no re-scan of inserted text). Documents the must-preserve semantic.
++        assertEquals("aXa", ValidatorUtils.replace("a_a", "_", "X"));
++        assertEquals("_-_-", ValidatorUtils.replace("--", "-", "_-"));
++    }
++}
+-- 
+2.55.0
+

@@ -1,0 +1,1366 @@
+From c8b2cf831ce32e283bfddd163ad5cbaa7b0fb596 Mon Sep 28 16:00:00 2026
+From: Verify Agent <verify@chainguard.dev>
+Date: Mon, 28 Sep 2026 16:00:00 +0000
+Subject: [PATCH] fix CGP-qjm4-c96g-8hhw: reject unsigned SAML assertions by
+ default
+
+This addresses CWE-345 (insufficient verification of data
+authenticity) in two classes of the affected artifact,
+cxf-rt-rs-security-oauth2-saml:
+org.apache.cxf.rs.security.oauth2.grants.saml.Saml2BearerGrantHandler.
+validateToken and org.apache.cxf.rs.security.saml.AbstractSamlInHandler.
+validateToken. Both methods handled an unsigned SAML assertion in an
+else branch that performed exactly one check: whether the transport
+session presented any TLS client certificate at all
+(getTLSCertificates(message) == null). If some certificate accepted by
+the container truststore was present, the unsigned assertion was
+accepted and used to issue an OAuth2 access token, or to install a
+SecurityContext, for whatever subject the assertion's own Issuer and
+Subject named.
+
+The root cause is that presence of a TLS client certificate is a
+channel property, not proof of the peer's claimed identity, and the
+code never compared the TLS client identity to the assertion's Issuer
+or Subject. Because an unsigned assertion is authored in its entirety
+by the sender, every identity-bearing field in it (Issuer, Subject
+NameID, and any SubjectConfirmation or SubjectKeyInfo) is
+attacker-controlled; an attacker holding any accepted client
+certificate could name an arbitrary, including privileged, subject and
+be authenticated as that subject. This held for every
+SubjectConfirmation method the assertion declared -- Bearer,
+Sender-Vouches, Holder-of-Key, an unrecognized or custom method, or
+none at all -- since the unbound accept path did not depend on which
+method was used.
+
+The fix introduces a single shared chokepoint,
+org.apache.cxf.rs.security.saml.SamlTlsIdentityBinding, and wires it
+into the unsigned-assertion branch of both validateToken methods. Its
+isUnsignedAssertionTlsBound check unconditionally returns false: no
+comparison between the assertion's own key material and the TLS peer
+certificate is trusted to prove identity, because an attacker
+controls both sides of any such comparison. An unsigned assertion is
+therefore rejected by default in both sinks regardless of
+confirmation method, and identity can only be established by a
+signature that chains to the configured sigVerCrypto trust anchor (the
+pre-existing signed-assertion path, left unchanged). A
+deployment-scoped opt-out, SamlTlsIdentityBinding.
+isUnboundAcceptanceAllowed (system property
+org.apache.cxf.saml.allow-unbound-unsigned-assertion), lets an
+operator explicitly re-enable the legacy presence-only behavior; it
+defaults off, is read through a single strict true/false parser where
+only "1"/"true"/"yes"/"on" engage it, and logs a WARN naming the
+CVE/CWE on every use.
+
+The regression test class
+Saml2UnsignedAssertionTlsBindingExploitTest (with its
+UnsignedSamlCallbackHandler helper) asserts that an unsigned assertion
+presenting an accepted-but-unrelated TLS client certificate is
+rejected by Saml2BearerGrantHandler.createAccessToken and by a real
+AbstractSamlInHandler subclass, across Bearer, Sender-Vouches,
+Holder-of-Key, an unrecognized confirmation method, no
+SubjectConfirmation element at all, and a dual Bearer plus
+Holder-of-Key SubjectConfirmation on one assertion. It also asserts
+the escape hatch fails closed for every non-affirmative value and
+engages only on an explicit affirmative, and positively confirms the
+preserved, legitimate behavior: a genuinely signed assertion is still
+accepted through AbstractSamlInHandler.
+
+CGP: CGP-qjm4-c96g-8hhw
+Cgp-Finding: CGP-qjm4-c96g-8hhw
+---
+ .../grants/saml/Saml2BearerGrantHandler.java  |  22 +-
+ ...nsignedAssertionTlsBindingExploitTest.java | 900 ++++++++++++++++++
+ .../saml/UnsignedSamlCallbackHandler.java     | 142 +++
+ .../security/saml/AbstractSamlInHandler.java  |  22 +-
+ .../security/saml/SamlTlsIdentityBinding.java | 150 +++
+ 5 files changed, 1232 insertions(+), 4 deletions(-)
+ create mode 100644 rt/rs/security/oauth-parent/oauth2-saml/src/test/java/org/apache/cxf/rs/security/oauth2/grants/saml/Saml2UnsignedAssertionTlsBindingExploitTest.java
+ create mode 100644 rt/rs/security/oauth-parent/oauth2-saml/src/test/java/org/apache/cxf/rs/security/oauth2/grants/saml/UnsignedSamlCallbackHandler.java
+ create mode 100644 rt/rs/security/xml/src/main/java/org/apache/cxf/rs/security/saml/SamlTlsIdentityBinding.java
+
+diff --git a/rt/rs/security/oauth-parent/oauth2-saml/src/main/java/org/apache/cxf/rs/security/oauth2/grants/saml/Saml2BearerGrantHandler.java b/rt/rs/security/oauth-parent/oauth2-saml/src/main/java/org/apache/cxf/rs/security/oauth2/grants/saml/Saml2BearerGrantHandler.java
+index f0d7b03d49d..f6e47998d03 100644
+--- a/rt/rs/security/oauth-parent/oauth2-saml/src/main/java/org/apache/cxf/rs/security/oauth2/grants/saml/Saml2BearerGrantHandler.java
++++ b/rt/rs/security/oauth-parent/oauth2-saml/src/main/java/org/apache/cxf/rs/security/oauth2/grants/saml/Saml2BearerGrantHandler.java
+@@ -50,6 +50,7 @@ import org.apache.cxf.rs.security.oauth2.saml.Constants;
+ import org.apache.cxf.rs.security.oauth2.saml.SamlOAuthValidator;
+ import org.apache.cxf.rs.security.oauth2.utils.OAuthConstants;
+ import org.apache.cxf.rs.security.oauth2.utils.OAuthUtils;
++import org.apache.cxf.rs.security.saml.SamlTlsIdentityBinding;
+ import org.apache.cxf.rs.security.saml.authorization.SecurityContextProvider;
+ import org.apache.cxf.rs.security.saml.authorization.SecurityContextProviderImpl;
+ import org.apache.cxf.rt.security.SecurityConstants;
+@@ -226,8 +227,25 @@ public class Saml2BearerGrantHandler extends AbstractGrantHandler {
+                 trustCredential.setPublicKey(samlKeyInfo.getPublicKey());
+                 trustCredential.setCertificates(samlKeyInfo.getCerts());
+                 signatureTrustValidator.validate(trustCredential, data);
+-            } else if (getTLSCertificates(message) == null) {
+-                throw new OAuthServiceException(OAuthConstants.INVALID_GRANT);
++            } else {
++                // Unsigned assertion. Presence of *some* accepted TLS client certificate is a channel
++                // property, not proof of who the peer claims to be: accepting an unsigned assertion on
++                // that basis alone lets any lower-trust party holding an accepted client certificate
++                // obtain an access token for any subject (CGP-qjm4-c96g-8hhw / CWE-345). An unsigned
++                // assertion is authored in its entirety by the sender and nothing in it is
++                // authenticated by a trust anchor, so no field of it (Issuer, Subject NameID, or
++                // SubjectConfirmation/SubjectKeyInfo) can bind the presenter to the subject it names.
++                // Reject unsigned assertions here (fail closed) regardless of confirmation method;
++                // identity must be established by a signature that chains to the configured
++                // sigVerCrypto trust anchor. An operator that genuinely relies on the legacy weaker
++                // behavior may opt back in via SamlTlsIdentityBinding.ALLOW_UNBOUND_PROPERTY
++                // (default off, WARN-logged).
++                Certificate[] tlsCerts = getTLSCertificates(message);
++                if (tlsCerts == null
++                    || (!SamlTlsIdentityBinding.isUnsignedAssertionTlsBound(assertion, tlsCerts, data)
++                        && !SamlTlsIdentityBinding.isUnboundAcceptanceAllowed())) {
++                    throw new OAuthServiceException(OAuthConstants.INVALID_GRANT);
++                }
+             }
+ 
+             if (samlValidator != null) {
+diff --git a/rt/rs/security/oauth-parent/oauth2-saml/src/test/java/org/apache/cxf/rs/security/oauth2/grants/saml/Saml2UnsignedAssertionTlsBindingExploitTest.java b/rt/rs/security/oauth-parent/oauth2-saml/src/test/java/org/apache/cxf/rs/security/oauth2/grants/saml/Saml2UnsignedAssertionTlsBindingExploitTest.java
+new file mode 100644
+index 00000000000..dfe6623d189
+--- /dev/null
++++ b/rt/rs/security/oauth-parent/oauth2-saml/src/test/java/org/apache/cxf/rs/security/oauth2/grants/saml/Saml2UnsignedAssertionTlsBindingExploitTest.java
+@@ -0,0 +1,900 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements. See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership. The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License. You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied. See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.cxf.rs.security.oauth2.grants.saml;
++
++import java.io.InputStream;
++import java.lang.reflect.Field;
++import java.security.KeyStore;
++import java.security.cert.Certificate;
++import java.security.cert.X509Certificate;
++import java.util.Collections;
++import java.util.List;
++
++import org.w3c.dom.Document;
++import org.w3c.dom.Element;
++
++import jakarta.ws.rs.container.ContainerRequestContext;
++import jakarta.ws.rs.core.MultivaluedHashMap;
++import jakarta.ws.rs.core.MultivaluedMap;
++import org.apache.cxf.Bus;
++import org.apache.cxf.BusFactory;
++import org.apache.cxf.helpers.DOMUtils;
++import org.apache.cxf.message.Exchange;
++import org.apache.cxf.message.ExchangeImpl;
++import org.apache.cxf.message.Message;
++import org.apache.cxf.message.MessageImpl;
++import org.apache.cxf.phase.PhaseInterceptorChain;
++import org.apache.cxf.rs.security.oauth2.common.AccessTokenRegistration;
++import org.apache.cxf.rs.security.oauth2.common.Client;
++import org.apache.cxf.rs.security.oauth2.common.OAuthPermission;
++import org.apache.cxf.rs.security.oauth2.common.ServerAccessToken;
++import org.apache.cxf.rs.security.oauth2.common.UserSubject;
++import org.apache.cxf.rs.security.oauth2.provider.OAuthDataProvider;
++import org.apache.cxf.rs.security.oauth2.provider.OAuthServiceException;
++import org.apache.cxf.rs.security.oauth2.saml.Constants;
++import org.apache.cxf.rs.security.oauth2.saml.SamlOAuthValidator;
++import org.apache.cxf.rs.security.oauth2.tokens.bearer.BearerAccessToken;
++import org.apache.cxf.rs.security.oauth2.tokens.refresh.RefreshToken;
++import org.apache.cxf.rs.security.oauth2.utils.OAuthConstants;
++import org.apache.cxf.rs.security.saml.AbstractSamlInHandler;
++import org.apache.cxf.rt.security.SecurityConstants;
++import org.apache.cxf.security.SecurityContext;
++import org.apache.cxf.security.transport.TLSSessionInfo;
++import org.apache.wss4j.common.crypto.Crypto;
++import org.apache.wss4j.common.crypto.Merlin;
++import org.apache.wss4j.common.saml.OpenSAMLUtil;
++import org.apache.wss4j.common.saml.SAMLCallback;
++import org.apache.wss4j.common.saml.SAMLUtil;
++import org.apache.wss4j.common.saml.SamlAssertionWrapper;
++import org.apache.wss4j.common.saml.builder.SAML2Constants;
++import org.apache.wss4j.dom.engine.WSSConfig;
++import org.apache.wss4j.dom.handler.RequestData;
++import org.apache.wss4j.dom.validate.Credential;
++import org.apache.wss4j.dom.validate.Validator;
++
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.fail;
++
++/**
++ * Exploit harness for CGP-qjm4-c96g-8hhw (CWE-345 -- insufficient verification of data authenticity;
++ * related CWE-287/346/347/940).
++ *
++ * <p><b>Root cause.</b> Both
++ * {@link org.apache.cxf.rs.security.oauth2.grants.saml.Saml2BearerGrantHandler#validateToken}
++ * (OSV-named sink, line 229) and the shared {@code AbstractSamlInHandler.validateToken}
++ * (line 196) handle an UNSIGNED assertion by performing exactly one check:
++ * {@code getTLSCertificates(message) == null}. If the transport session presents <em>any</em> client
++ * TLS certificate -- any certificate the container truststore accepted, e.g. the attacker's own
++ * tenant certificate -- the unsigned assertion is accepted and an OAuth2 access token is issued /
++ * a {@code SecurityContext} is set for whatever subject the assertion names. There is NO comparison
++ * between the TLS client identity and the assertion's Issuer or Subject. The mere presence of a
++ * completed 2-way TLS handshake is treated as proof of who the peer claims to be.
++ *
++ * <p><b>Security invariant this suite pins (from the ## Plan section).</b> No unsigned SAML assertion
++ * may be treated as proof of identity unless the TLS client certificate that terminated <em>this</em>
++ * connection is cryptographically bound to the identity-bearing content of <em>that specific</em>
++ * assertion. "Some accepted TLS cert is present" must never, by itself, satisfy this -- for ANY
++ * SubjectConfirmation method (Bearer, Sender-Vouches, an unrecognized/custom method, or none).
++ *
++ * <p><b>How each test asserts the invariant (RED polarity).</b> Each attack test submits an unsigned
++ * assertion naming an attacker-chosen subject while presenting a genuine, accepted-but-unrelated TLS
++ * client certificate (the {@code attacker.jks} cert). It then asserts that the assertion was REJECTED.
++ * On the unpatched build the assertion is ACCEPTED (a token is issued / a SecurityContext is set for
++ * the attacker-chosen subject -- the concrete harmful effect), so {@code fail(...)} runs and the test
++ * FAILS. Once CXF binds the TLS identity to the assertion (or rejects unsigned assertions by default),
++ * the specific authentication rejection is thrown and the test PASSES. The suite therefore exits
++ * NON-ZERO on the unpatched build and ZERO once fixed.
++ *
++ * <p>Fixtures reused from the sibling exploit harness (src/test/resources):
++ * <ul>
++ *   <li>{@code attacker.jks} -- self-signed key {@code attacker}; the attacker's accepted-but-unrelated
++ *       client certificate. NOT related to any asserted subject.</li>
++ *   <li>{@code truststore.jks} -- the deployment's {@code sigVerCrypto}.</li>
++ * </ul>
++ */
++public class Saml2UnsignedAssertionTlsBindingExploitTest {
++
++    private static final String ENDPOINT = "https://sp.example.com/oauth/token";
++    private static final String KS_PASSWORD = "password";
++
++    /** An attacker-chosen, privileged subject that is NOT bound to the attacker's TLS certificate. */
++    private static final String IMPERSONATED_SUBJECT = "administrator";
++
++    private static final String ALLOW_UNBOUND_PROP =
++        "org.apache.cxf.saml.allow-unbound-unsigned-assertion";
++
++    @BeforeClass
++    public static void init() {
++        WSSConfig.init();
++        OpenSAMLUtil.initSamlEngine();
++    }
++
++    // ==============================================================================================
++    // Sink #1 -- Saml2BearerGrantHandler.validateToken (OSV-named sink, line 229) via createAccessToken.
++    // OSV literal trace + non-enumerated route (a): the attacker holds their OWN genuine, accepted
++    // client cert but the assertion's Subject/Issuer names a different, privileged identity.
++    // ==============================================================================================
++    @Test
++    public void testUnsignedAssertionWithAnyTlsCertGrantsAccessTokenBearerGrant() throws Exception {
++        Crypto trustStore = loadCrypto("truststore.jks");
++        Certificate[] attackerTlsCerts = loadCertChain("attacker.jks", "attacker");
++
++        // Unsigned Bearer assertion naming a privileged subject the attacker does not own.
++        String assertion = buildUnsignedAssertionBase64Url(
++            IMPERSONATED_SUBJECT, "https://evil-idp.example.com", ENDPOINT, SAML2Constants.CONF_BEARER);
++
++        Saml2BearerGrantHandler handler = newBearerGrantHandler();
++
++        // The attacker completes 2-way TLS with THEIR OWN accepted certificate.
++        Message message = newMessageWithTlsCerts(trustStore, attackerTlsCerts);
++        Object previous = setCurrentMessage(message);
++        try {
++            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
++            params.putSingle(Constants.CLIENT_GRANT_ASSERTION_PARAM, assertion);
++            params.putSingle(OAuthConstants.GRANT_TYPE, Constants.SAML2_BEARER_GRANT);
++
++            ServerAccessToken token;
++            try {
++                token = handler.createAccessToken(new Client("clientId", "clientSecret", true), params);
++            } catch (OAuthServiceException ex) {
++                return; // FIXED: unsigned assertion rejected because TLS identity is not bound to it
++            }
++
++            assertNotNull("VULNERABLE: access token issued for an UNSIGNED SAML assertion", token);
++            assertNotNull("VULNERABLE: access token subject set from an UNSIGNED SAML assertion",
++                          token.getSubject());
++            assertEquals("VULNERABLE (CWE-345): Saml2BearerGrantHandler issued an access token for the "
++                         + "attacker-chosen subject from an UNSIGNED SAML assertion, solely because the "
++                         + "attacker presented some accepted TLS client certificate -- the TLS identity "
++                         + "was never bound to the assertion's Issuer/Subject",
++                         IMPERSONATED_SUBJECT, token.getSubject().getLogin());
++            fail("VULNERABLE (CWE-345): Saml2BearerGrantHandler issued an access token for subject '"
++                 + token.getSubject().getLogin() + "' from an UNSIGNED SAML assertion, solely because "
++                 + "the attacker presented some accepted TLS client certificate -- the TLS identity was "
++                 + "never bound to the assertion's Issuer/Subject");
++        } finally {
++            restoreCurrentMessage(previous);
++        }
++    }
++
++    // ==============================================================================================
++    // Sink #2 -- AbstractSamlInHandler.validateToken (line 196), driven through a concrete subclass.
++    // Route (b) Sender-Vouches: checkSenderVouches returns true whenever ANY TLS cert is present.
++    // ==============================================================================================
++    @Test
++    public void testUnsignedSenderVouchesAssertionAcceptedByInHandler() throws Exception {
++        assertInHandlerRejectsUnsigned(SAML2Constants.CONF_SENDER_VOUCHES, "Sender-Vouches");
++    }
++
++    // Route (b) Bearer: checkBearer only returns false when NO cert is present; a cert present => accept.
++    @Test
++    public void testUnsignedBearerAssertionAcceptedByInHandler() throws Exception {
++        assertInHandlerRejectsUnsigned(SAML2Constants.CONF_BEARER, "Bearer");
++    }
++
++    // Route (c) unrecognized/custom confirmation method: all three recogniser loops fall through and
++    // implicitly return true (the fail-closed-dispatch property from ## Plan invariant 3).
++    @Test
++    public void testUnsignedCustomConfirmationMethodAssertionAcceptedByInHandler() throws Exception {
++        assertInHandlerRejectsUnsigned("urn:example:custom:cm:made-up-method", "custom/unrecognized method");
++    }
++
++    // Route (c) NO SubjectConfirmation element at all: every recogniser loop iterates an empty list
++    // and returns true -- implicit accept.
++    @Test
++    public void testUnsignedNoConfirmationAssertionAcceptedByInHandler() throws Exception {
++        assertInHandlerRejectsUnsigned(null, "no SubjectConfirmation");
++    }
++
++    /**
++     * Drives the shared {@code AbstractSamlInHandler.validateToken} sink (line 196) with an unsigned
++     * assertion whose identity is NOT bound to the attacker's TLS certificate, and asserts it is
++     * rejected. Pre-patch: the assertion is accepted and a SecurityContext is set for the
++     * attacker-chosen subject (harmful effect) -> the test FAILS.
++     */
++    private void assertInHandlerRejectsUnsigned(String confirmationMethod, String label) throws Exception {
++        Crypto trustStore = loadCrypto("truststore.jks");
++        Certificate[] attackerTlsCerts = loadCertChain("attacker.jks", "attacker");
++
++        Element assertionElement = buildUnsignedAssertionElement(
++            IMPERSONATED_SUBJECT, "https://evil-idp.example.com", ENDPOINT, confirmationMethod);
++
++        Message message = newMessageWithTlsCerts(trustStore, attackerTlsCerts);
++        message.put(Message.HTTP_REQUEST_METHOD, "POST");
++
++        Object previous = setCurrentMessage(message);
++        try {
++            TestSamlInHandler inHandler = new TestSamlInHandler();
++            inHandler.setValidator(new ClaimsOnlyValidator()); // supported extension point
++            try {
++                inHandler.drive(message, assertionElement);
++            } catch (RuntimeException ex) {
++                if (isAuthRejection(ex)) {
++                    return; // FIXED: the unsigned, unbound assertion was rejected
++                }
++                throw ex;
++            }
++
++            SecurityContext sc = message.get(SecurityContext.class);
++            assertNotNull("VULNERABLE: SecurityContext set from an UNSIGNED SAML assertion (" + label + ")", sc);
++            assertNotNull("VULNERABLE: SecurityContext principal set from an UNSIGNED SAML assertion ("
++                          + label + ")", sc.getUserPrincipal());
++            assertEquals("VULNERABLE (CWE-345): AbstractSamlInHandler authenticated the attacker-chosen "
++                         + "subject from an UNSIGNED SAML assertion using " + label + " confirmation, "
++                         + "solely because some accepted TLS client certificate was present -- the TLS "
++                         + "identity was never bound to the assertion's Subject",
++                         IMPERSONATED_SUBJECT, sc.getUserPrincipal().getName());
++            fail("VULNERABLE (CWE-345): AbstractSamlInHandler authenticated subject '"
++                 + sc.getUserPrincipal().getName() + "' from an UNSIGNED SAML assertion using "
++                 + label + " confirmation, solely because some accepted TLS client certificate was "
++                 + "present -- the TLS identity was never bound to the assertion's Subject");
++        } finally {
++            restoreCurrentMessage(previous);
++        }
++    }
++
++    // ==============================================================================================
++    // Positive control -- an unsigned assertion presented over a connection with NO TLS client cert
++    // must be rejected both before and after the fix (this is the one presence-check branch that
++    // already works). Stays GREEN on both trees; guards against a "change nothing" no-op.
++    // ==============================================================================================
++    @Test
++    public void testUnsignedAssertionWithoutTlsCertIsRejected() throws Exception {
++        Crypto trustStore = loadCrypto("truststore.jks");
++
++        String assertion = buildUnsignedAssertionBase64Url(
++            IMPERSONATED_SUBJECT, "https://evil-idp.example.com", ENDPOINT, SAML2Constants.CONF_BEARER);
++
++        Saml2BearerGrantHandler handler = newBearerGrantHandler();
++
++        // No TLS certificate on this connection at all.
++        Message message = newMessageWithTlsCerts(trustStore, null);
++        Object previous = setCurrentMessage(message);
++        try {
++            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
++            params.putSingle(Constants.CLIENT_GRANT_ASSERTION_PARAM, assertion);
++            params.putSingle(OAuthConstants.GRANT_TYPE, Constants.SAML2_BEARER_GRANT);
++
++            try {
++                handler.createAccessToken(new Client("clientId", "clientSecret", true), params);
++            } catch (OAuthServiceException ex) {
++                return; // EXPECTED both pre- and post-patch
++            }
++            fail("An unsigned assertion with NO TLS client certificate must always be rejected");
++        } finally {
++            restoreCurrentMessage(previous);
++        }
++    }
++
++    // ==============================================================================================
++    // Regression assertion of the corrected secure behavior for the Holder-of-Key confirmation method
++    // (was, in an earlier round, a "preservation control" asserting ACCEPTANCE -- that was WRONG).
++    //
++    // The ## Patch-Judge (QUALITY) proved that a Holder-of-Key "binding" of an UNSIGNED assertion is a
++    // tautology: the whole assertion is attacker-authored, so the attacker chooses BOTH the cert they
++    // present for the TLS handshake AND the SubjectKeyInfo bytes in their own assertion, and can always
++    // make the two match while writing ANY <Subject> NameID. Making the SubjectKeyInfo match the peer
++    // cert therefore proves nothing about the named subject -- it is exactly the self-asserted
++    // impersonation vector testUnsignedHolderOfKeySelfAssertedPrivilegedSubjectAcceptedByInHandler
++    // exploits. Because there is no way to tell a "legitimate" unsigned HoK assertion apart from the
++    // attack (the ONLY difference is the attacker-chosen NameID string), the correct behavior is to
++    // reject every unsigned assertion regardless of confirmation method. This test pins that: an
++    // unsigned HoK assertion whose SubjectKeyInfo DOES match the presented TLS peer cert -- even with a
++    // benign-looking Subject -- is REJECTED. The genuinely-preserved path is the SIGNED path, exercised
++    // positively by testSignedAssertionStillAcceptedByInHandler below (and by the pre-existing
++    // Saml2BearerGrantHandlerTrustExploitTest#testTrustedAssertionStillGrantsAccessTokenBearerGrant).
++    // ==============================================================================================
++    @Test
++    public void testUnsignedHolderOfKeyAssertionBoundToTlsCertIsRejected() throws Exception {
++        Crypto trustStore = loadCrypto("truststore.jks");
++        // The peer's genuine certificate is used BOTH as the TLS peer cert AND as the assertion's
++        // Holder-of-Key SubjectKeyInfo cert -- a "binding" the attacker controls both sides of.
++        X509Certificate peerCert = loadX509Certificate("attacker.jks", "attacker");
++        Certificate[] peerTlsCerts = new Certificate[] {peerCert};
++
++        Element assertionElement = buildUnsignedHolderOfKeyAssertionElement(
++            "hok-subject", "https://idp.example.com", ENDPOINT, peerCert);
++
++        Message message = newMessageWithTlsCerts(trustStore, peerTlsCerts);
++        message.put(Message.HTTP_REQUEST_METHOD, "POST");
++
++        Object previous = setCurrentMessage(message);
++        try {
++            TestSamlInHandler inHandler = new TestSamlInHandler();
++            inHandler.setValidator(new ClaimsOnlyValidator());
++            try {
++                inHandler.drive(message, assertionElement);
++            } catch (RuntimeException ex) {
++                if (isAuthRejection(ex)) {
++                    return; // FIXED: unsigned assertions are rejected regardless of confirmation method
++                }
++                throw ex;
++            }
++
++            SecurityContext sc = message.get(SecurityContext.class);
++            assertNotNull("VULNERABLE: SecurityContext set from an UNSIGNED Holder-of-Key assertion "
++                          + "whose SubjectKeyInfo is merely the attacker-controlled peer cert", sc);
++            fail("VULNERABLE (CWE-345): AbstractSamlInHandler accepted an UNSIGNED Holder-of-Key "
++                 + "assertion solely because its self-authored SubjectKeyInfo matches the presented "
++                 + "TLS peer certificate -- an attacker controls both sides of that comparison, so it "
++                 + "is not proof of the named subject");
++        } finally {
++            restoreCurrentMessage(previous);
++        }
++    }
++
++    // ==============================================================================================
++    // Preservation positive control (## Plan Must-not-break): the genuinely-legitimate path that must
++    // keep working is the SIGNED assertion path, NOT the (unsound) unsigned-HoK path. A SAML assertion
++    // signed by a certificate that chains to the configured sigVerCrypto trust anchor is still accepted
++    // by AbstractSamlInHandler.validateToken -- the fix only touches the else/unsigned branch. This
++    // proves the fix is not "reject everything": trusted signed identity still authenticates. (The
++    // signed path through Saml2BearerGrantHandler is additionally covered by the pre-existing
++    // Saml2BearerGrantHandlerTrustExploitTest#testTrustedAssertionStillGrantsAccessTokenBearerGrant.)
++    // ==============================================================================================
++    @Test
++    public void testSignedAssertionStillAcceptedByInHandler() throws Exception {
++        Crypto trustedSigner = loadCrypto("trusted.jks");
++        Crypto trustStore = loadCrypto("truststore.jks");
++
++        Element assertionElement = buildSignedAssertionElement(
++            "alice", "https://legit-idp.example.com", ENDPOINT, trustedSigner, "trusted");
++
++        // A signed assertion is trust-anchored; no TLS client cert is needed for the signed path.
++        Message message = newMessageWithTlsCerts(trustStore, null);
++        message.put(Message.HTTP_REQUEST_METHOD, "POST");
++
++        Object previous = setCurrentMessage(message);
++        try {
++            TestSamlInHandler inHandler = new TestSamlInHandler();
++            inHandler.setValidator(new ClaimsOnlyValidator());
++
++            inHandler.drive(message, assertionElement); // must NOT throw
++
++            SecurityContext sc = message.get(SecurityContext.class);
++            assertNotNull("A trust-anchored SIGNED assertion must still be accepted (preservation)", sc);
++            assertNotNull("SecurityContext principal must be set for a trusted signed assertion",
++                          sc.getUserPrincipal());
++            assertEquals("alice", sc.getUserPrincipal().getName());
++        } finally {
++            restoreCurrentMessage(previous);
++        }
++    }
++
++    // ==============================================================================================
++    // Non-enumerated route (HoK self-asserted) -- the Holder-of-Key TAUTOLOGY bypass the
++    // ## Patch-Judge (QUALITY) proved against the patched tree. This drives the named sink
++    // AbstractSamlInHandler.validateToken (line 196) via the SAME Holder-of-Key confirmation-method
++    // framing the ## Plan Must-not-break section asks to PRESERVE, but with the assertion's
++    // \u003cSubject\u003e NameID naming the privileged identity 'administrator' that the attacker does NOT own
++    // -- while the assertion's SubjectKeyInfo carries the attacker's OWN certificate (the same cert
++    // the attacker presents as the TLS peer cert).
++    //
++    // Why this is the invariant, not just a path: the accept decision's PRINCIPAL is the \u003cSubject\u003e
++    // NameID (getUserPrincipal().getName()). The patched binding check
++    // (SamlTlsIdentityBinding.isUnsignedAssertionTlsBound -> matchesTlsCertificate, and
++    // AbstractSamlInHandler.checkHolderOfKey -> compareCredentials) only compares the assertion's
++    // own SubjectKeyInfo (attacker-message-supplied content, since the assertion is unsigned and
++    // entirely attacker-authored) to the TLS peer cert (channel value). The attacker controls BOTH
++    // sides of that comparison, so it is a tautology: the NAMED SUBJECT is never bound to the
++    // presented key. ## Plan invariant 1 / Required-defenses require every identity field the accept
++    // decision depends on (here the Subject NameID) to be bound to the verified TLS identity before
++    // the assertion is trusted -- which the current fix does not do.
++    //
++    // A fix that only tightens the enumerated Bearer/Sender-Vouches/custom/absent routes but keeps
++    // treating "SubjectKeyInfo matches the presenter's own cert" as proof of a self-asserted Subject
++    // NameID leaves this RED. Only a fix that binds the Subject/Issuer identity itself to the TLS
++    // peer (or rejects unsigned assertions outright) turns it GREEN. It stays RED on the current
++    // (patched) tree; the positive control testUnsignedHolderOfKeyAssertionBoundToTlsCertIsAccepted
++    // above (whose \u003cSubject\u003e = 'hok-subject' is not a claim to another identity) documents the one
++    // legitimately-preserved shape and must remain GREEN.
++    //
++    // NOTE on the OTHER named sink (Saml2BearerGrantHandler.validateToken, OSV sink #1): this exact
++    // HoK-tautology is NOT reachable there. That handler's delegate SamlOAuthValidator.validate ->
++    // validateAuthenticationSubject requires the OAuth2 SAML2 *Bearer* grant profile confirmation
++    // method (RFC 7522: it returns false, throwing 401, unless a CONF_BEARER SubjectConfirmation is
++    // present), while the binding check accepts only a CONF_HOLDER_KEY confirmation -- the two are
++    // mutually exclusive on one assertion, so no unsigned assertion can satisfy both. (Verified: the
++    // Bearer-grant variant of this attack is rejected by SamlOAuthValidator's NotAuthorized/401, not
++    // by the binding check.) The Bearer sink's own no-binding routes are already covered RED by
++    // testUnsignedAssertionWithAnyTlsCertGrantsAccessTokenBearerGrant above.
++    // ==============================================================================================
++
++    // Sink #2 -- AbstractSamlInHandler.validateToken (line 196), driven through a concrete subclass.
++    @Test
++    public void testUnsignedHolderOfKeySelfAssertedPrivilegedSubjectAcceptedByInHandler()
++        throws Exception {
++        Crypto trustStore = loadCrypto("truststore.jks");
++        // Attacker's own cert used BOTH as the TLS peer cert AND as the assertion's HoK SubjectKeyInfo.
++        X509Certificate attackerCert = loadX509Certificate("attacker.jks", "attacker");
++        Certificate[] attackerTlsCerts = new Certificate[] {attackerCert};
++
++        // ...but the \u003cSubject\u003e NameID names the privileged identity 'administrator' the attacker
++        // does not own.
++        Element assertionElement = buildUnsignedHolderOfKeyAssertionElement(
++            IMPERSONATED_SUBJECT, "https://evil-idp.example.com", ENDPOINT, attackerCert);
++
++        Message message = newMessageWithTlsCerts(trustStore, attackerTlsCerts);
++        message.put(Message.HTTP_REQUEST_METHOD, "POST");
++
++        Object previous = setCurrentMessage(message);
++        try {
++            TestSamlInHandler inHandler = new TestSamlInHandler();
++            inHandler.setValidator(new ClaimsOnlyValidator());
++            try {
++                inHandler.drive(message, assertionElement);
++            } catch (RuntimeException ex) {
++                if (isAuthRejection(ex)) {
++                    return; // FIXED: the Subject NameID is bound to the TLS identity (or unsigned rejected)
++                }
++                throw ex;
++            }
++
++            SecurityContext sc = message.get(SecurityContext.class);
++            assertNotNull("VULNERABLE: SecurityContext set from an UNSIGNED Holder-of-Key assertion "
++                          + "whose Subject NameID is unbound", sc);
++            assertNotNull("VULNERABLE: SecurityContext principal set from an UNSIGNED assertion",
++                          sc.getUserPrincipal());
++            assertEquals("VULNERABLE (CWE-345): AbstractSamlInHandler authenticated the privileged "
++                         + "subject '" + IMPERSONATED_SUBJECT + "' from an UNSIGNED Holder-of-Key "
++                         + "assertion whose SubjectKeyInfo is merely the attacker's own TLS "
++                         + "certificate -- the Subject NameID was never bound to the TLS identity "
++                         + "(HoK-tautology bypass)",
++                         IMPERSONATED_SUBJECT, sc.getUserPrincipal().getName());
++            fail("VULNERABLE (CWE-345): AbstractSamlInHandler authenticated privileged subject '"
++                 + sc.getUserPrincipal().getName() + "' from an UNSIGNED Holder-of-Key assertion whose "
++                 + "SubjectKeyInfo is only the attacker's own certificate -- the attacker controls both "
++                 + "sides of the key comparison and the Subject NameID is never bound to the TLS "
++                 + "identity (HoK-tautology bypass)");
++        } finally {
++            restoreCurrentMessage(previous);
++        }
++    }
++
++    // ==============================================================================================
++    // Escape-hatch knob coverage (secure-patch-requirements §2a/§4): the strict boolean parse must
++    // engage the legacy presence-only acceptance ONLY on an explicit affirmative. Every other value
++    // -- "false", "False", "FALSE", "no", "off", "0", "", and junk -- must leave the protection ON
++    // (the unsigned unbound assertion is still rejected). One affirmative case proves the hatch works.
++    // The property is process-global state: captured and restored in a finally block (§5).
++    // ==============================================================================================
++    @Test
++    public void testAllowUnboundKnobFailsClosedForNonAffirmativeValues() throws Exception {
++        String previousProp = System.getProperty(ALLOW_UNBOUND_PROP);
++        try {
++            for (String falsy : new String[] {"false", "False", "FALSE", "no", "off", "0", "", "banana"}) {
++                System.setProperty(ALLOW_UNBOUND_PROP, falsy);
++                assertUnsignedBearerGrantRejected("knob value '" + falsy + "' must keep protection ON");
++            }
++            // Unset also means protection ON.
++            System.clearProperty(ALLOW_UNBOUND_PROP);
++            assertUnsignedBearerGrantRejected("unset knob must keep protection ON");
++        } finally {
++            restoreProperty(ALLOW_UNBOUND_PROP, previousProp);
++        }
++    }
++
++    @Test
++    public void testAllowUnboundKnobEngagesOnExplicitAffirmative() throws Exception {
++        String previousProp = System.getProperty(ALLOW_UNBOUND_PROP);
++        try {
++            System.setProperty(ALLOW_UNBOUND_PROP, "true");
++
++            Crypto trustStore = loadCrypto("truststore.jks");
++            Certificate[] attackerTlsCerts = loadCertChain("attacker.jks", "attacker");
++            String assertion = buildUnsignedAssertionBase64Url(
++                IMPERSONATED_SUBJECT, "https://evil-idp.example.com", ENDPOINT, SAML2Constants.CONF_BEARER);
++            Saml2BearerGrantHandler handler = newBearerGrantHandler();
++            Message message = newMessageWithTlsCerts(trustStore, attackerTlsCerts);
++            Object previous = setCurrentMessage(message);
++            try {
++                MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
++                params.putSingle(Constants.CLIENT_GRANT_ASSERTION_PARAM, assertion);
++                params.putSingle(OAuthConstants.GRANT_TYPE, Constants.SAML2_BEARER_GRANT);
++                // With the operator opt-in engaged, the legacy presence-only behavior returns.
++                ServerAccessToken token =
++                    handler.createAccessToken(new Client("clientId", "clientSecret", true), params);
++                assertNotNull("with the opt-in engaged, the legacy presence-only path issues a token",
++                              token);
++            } finally {
++                restoreCurrentMessage(previous);
++            }
++        } finally {
++            restoreProperty(ALLOW_UNBOUND_PROP, previousProp);
++        }
++    }
++
++    // ==============================================================================================
++    // Non-enumerated route (Red-Judge round 3) -- DUAL SubjectConfirmation bypass of Sink #1.
++    //
++    // Saml2BearerGrantHandler.validateToken runs TWO INDEPENDENT gates on an unsigned assertion:
++    // (1) SamlTlsIdentityBinding.isUnsignedAssertionTlsBound -- accepts if the assertion declares
++    //     ANY Holder-of-Key SubjectConfirmation whose SubjectKeyInfo matches the TLS peer cert;
++    // (2) SamlOAuthValidator.validateAuthenticationSubject -- accepts if the assertion declares
++    //     ANY Bearer SubjectConfirmation that is well-formed (recipient/timing correct).
++    // SAML 2.0 Core Sec. 2.4.1.1 explicitly permits a \u003cSubject\u003e to carry MORE THAN ONE
++    // \u003cSubjectConfirmation\u003e element ("satisfying any one of them is sufficient to confirm the
++    // subject"), so an attacker can construct a single unsigned assertion with TWO
++    // \u003cSubjectConfirmation\u003e siblings under the same \u003cSubject\u003e: one Method=Bearer
++    // (satisfying gate 2) and a SEPARATE Method=Holder-of-Key whose SubjectKeyInfo is merely the
++    // attacker's OWN TLS peer certificate (satisfying gate 1 as a tautology -- the attacker controls both sides of that
++    // comparison, per the same root cause as the HoK-tautology bypass above). Neither gate ties its
++    // decision to the OTHER gate's confirmation element, and neither binds the \u003cSubject\u003e NameID
++    // ('administrator', privileged, not the attacker's identity) to anything trustworthy. This
++    // reaches the OSV's PRIMARY named sink (Saml2BearerGrantHandler.validateToken:229) -- exactly the
++    // route ## Plan completeness property (a) requires rejected ("not merely 'some cert is present'")
++    // -- and directly contradicts the (incorrect) claim above that the HoK-tautology bypass "is NOT
++    // reachable through Sink #1": it is reachable, via a second, independently-satisfiable
++    // SubjectConfirmation rather than reusing the same one. Verified hands-on against the CURRENT
++    // tree (HEAD = patch commit 083c998642 + round 2 RED) before committing: this test fails there.
++    // ==============================================================================================
++    @Test
++    public void testUnsignedAssertionWithDualBearerAndHolderOfKeyConfirmationGrantsAccessToken()
++        throws Exception {
++        Crypto trustStore = loadCrypto("truststore.jks");
++        X509Certificate attackerCert = loadX509Certificate("attacker.jks", "attacker");
++        Certificate[] attackerTlsCerts = new Certificate[] {attackerCert};
++
++        // Gate 2 (SamlOAuthValidator): a properly-formed Bearer SubjectConfirmation.
++        Element bearerAssertion = buildUnsignedAssertionElement(
++            IMPERSONATED_SUBJECT, "https://evil-idp.example.com", ENDPOINT, SAML2Constants.CONF_BEARER);
++
++        // Gate 1 (SamlTlsIdentityBinding): a SEPARATE Holder-of-Key SubjectConfirmation bound to the
++        // attacker's own TLS peer cert -- built independently, then grafted on as a second sibling.
++        Element hokAssertion = buildUnsignedHolderOfKeyAssertionElement(
++            IMPERSONATED_SUBJECT, "https://evil-idp.example.com", ENDPOINT, attackerCert);
++
++        Element bearerSubject = firstChildByLocalName(bearerAssertion, "Subject");
++        Element hokSubject = firstChildByLocalName(hokAssertion, "Subject");
++        Element hokConfirmation = firstChildByLocalName(hokSubject, "SubjectConfirmation");
++        assertNotNull("expected a SubjectConfirmation in the HoK assertion", hokConfirmation);
++        org.w3c.dom.Node imported = bearerAssertion.getOwnerDocument().importNode(hokConfirmation, true);
++        bearerSubject.appendChild(imported);
++
++        byte[] xml = serialize(bearerAssertion.getOwnerDocument());
++        String assertionB64 = org.apache.cxf.common.util.Base64UrlUtility.encode(xml);
++
++        Saml2BearerGrantHandler handler = newBearerGrantHandler();
++        Message message = newMessageWithTlsCerts(trustStore, attackerTlsCerts);
++        Object previous = setCurrentMessage(message);
++        try {
++            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
++            params.putSingle(Constants.CLIENT_GRANT_ASSERTION_PARAM, assertionB64);
++            params.putSingle(OAuthConstants.GRANT_TYPE, Constants.SAML2_BEARER_GRANT);
++
++            ServerAccessToken token;
++            try {
++                token = handler.createAccessToken(new Client("clientId", "clientSecret", true), params);
++            } catch (OAuthServiceException ex) {
++                return; // FIXED: dual-confirmation assertion is rejected
++            }
++
++            assertNotNull("VULNERABLE: access token issued for a dual-confirmation UNSIGNED assertion",
++                          token);
++            assertNotNull("VULNERABLE: access token subject set from a dual-confirmation UNSIGNED "
++                          + "assertion", token.getSubject());
++            assertEquals("VULNERABLE (CWE-345): Saml2BearerGrantHandler issued an access token for the "
++                         + "attacker-chosen subject from an UNSIGNED assertion carrying TWO independent "
++                         + "SubjectConfirmation elements (Bearer + Holder-of-Key on the attacker's own "
++                         + "cert) -- each gate is individually satisfiable without binding the asserted "
++                         + "Subject to the TLS identity",
++                         IMPERSONATED_SUBJECT, token.getSubject().getLogin());
++            fail("VULNERABLE (CWE-345): Saml2BearerGrantHandler issued an access token for subject '"
++                 + token.getSubject().getLogin() + "' from an UNSIGNED assertion carrying TWO "
++                 + "independent SubjectConfirmation elements (Bearer + Holder-of-Key on the attacker's "
++                 + "own cert) -- dual-confirmation bypass of the TLS identity binding");
++        } finally {
++            restoreCurrentMessage(previous);
++        }
++    }
++
++    private static Element firstChildByLocalName(Element parent, String localName) {
++        org.w3c.dom.NodeList children = parent.getChildNodes();
++        for (int i = 0; i < children.getLength(); i++) {
++            org.w3c.dom.Node n = children.item(i);
++            if (n instanceof Element && localName.equals(((Element) n).getLocalName())) {
++                return (Element) n;
++            }
++        }
++        return null;
++    }
++
++    /** Drives the unsigned Bearer grant (attacker's own cert, privileged subject) and asserts it is
++     *  rejected with an OAuthServiceException -- the secure post-fix behavior. */
++    private void assertUnsignedBearerGrantRejected(String because) throws Exception {
++        Crypto trustStore = loadCrypto("truststore.jks");
++        Certificate[] attackerTlsCerts = loadCertChain("attacker.jks", "attacker");
++        String assertion = buildUnsignedAssertionBase64Url(
++            IMPERSONATED_SUBJECT, "https://evil-idp.example.com", ENDPOINT, SAML2Constants.CONF_BEARER);
++        Saml2BearerGrantHandler handler = newBearerGrantHandler();
++        Message message = newMessageWithTlsCerts(trustStore, attackerTlsCerts);
++        Object previous = setCurrentMessage(message);
++        try {
++            MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
++            params.putSingle(Constants.CLIENT_GRANT_ASSERTION_PARAM, assertion);
++            params.putSingle(OAuthConstants.GRANT_TYPE, Constants.SAML2_BEARER_GRANT);
++            try {
++                handler.createAccessToken(new Client("clientId", "clientSecret", true), params);
++            } catch (OAuthServiceException ex) {
++                return; // expected -- protection still enforced
++            }
++            fail("VULNERABLE: unsigned unbound assertion accepted -- " + because);
++        } finally {
++            restoreCurrentMessage(previous);
++        }
++    }
++
++    private static void restoreProperty(String key, String previous) {
++        if (previous == null) {
++            System.clearProperty(key);
++        } else {
++            System.setProperty(key, previous);
++        }
++    }
++
++    // ================================ helpers ====================================================
++
++    /**
++     * A supported, deployer-supplied Validator (installed via {@code setSamlValidator} /
++     * {@code setValidator}) that performs claims-only validation and does NOT itself require a
++     * signature or reject non-standard confirmation methods. This is a documented extension point;
++     * with it installed, the WSS4J default validator's Bearer-signature / standard-method requirements
++     * do not coincidentally pre-block these routes, so the harmful effect is attributable solely to
++     * CXF's own missing TLS-identity binding -- the finding's actual defect. A correct fix must add
++     * the binding check in CXF's own validateToken so it holds even with a non-blocking Validator.
++     */
++    private static final class ClaimsOnlyValidator implements Validator {
++        public Credential validate(Credential credential, RequestData data) {
++            return credential; // accept -- deliberately performs no trust/signature check
++        }
++    }
++
++    /** A minimal, real AbstractSamlInHandler subclass driving the shared validateToken sink. */
++    private static final class TestSamlInHandler extends AbstractSamlInHandler {
++        @Override
++        public void filter(ContainerRequestContext requestContext) {
++            // Not used directly; drive() invokes the inherited protected sink.
++        }
++
++        void drive(Message message, Element assertionElement) {
++            validateToken(message, assertionElement);
++        }
++    }
++
++    private Saml2BearerGrantHandler newBearerGrantHandler() {
++        Saml2BearerGrantHandler handler = new Saml2BearerGrantHandler();
++        handler.setDataProvider(new StubDataProvider());
++        SamlOAuthValidator oauthValidator = new SamlOAuthValidator();
++        oauthValidator.setAccessTokenServiceAddress(ENDPOINT);
++        handler.setSamlOAuthValidator(oauthValidator);
++        // Deployer-supplied custom Validator (supported via setSamlValidator) that does claims-only
++        // validation and does NOT require a signature -- CXF's own code must still reject an unsigned
++        // assertion that is not TLS-bound to its asserted identity.
++        handler.setSamlValidator(new ClaimsOnlyValidator());
++        return handler;
++    }
++
++    private static Crypto loadCrypto(String resource) throws Exception {
++        KeyStore keyStore = KeyStore.getInstance("JKS");
++        try (InputStream in =
++                 Saml2UnsignedAssertionTlsBindingExploitTest.class.getClassLoader().getResourceAsStream(resource)) {
++            assertNotNull("missing keystore fixture " + resource, in);
++            keyStore.load(in, KS_PASSWORD.toCharArray());
++        }
++        Merlin merlin = new Merlin();
++        merlin.setKeyStore(keyStore);
++        merlin.setTrustStore(keyStore);
++        return merlin;
++    }
++
++    /** Loads a certificate chain from a keystore alias -- the attacker's genuine client certificate. */
++    private static Certificate[] loadCertChain(String resource, String alias) throws Exception {
++        KeyStore keyStore = KeyStore.getInstance("JKS");
++        try (InputStream in =
++                 Saml2UnsignedAssertionTlsBindingExploitTest.class.getClassLoader().getResourceAsStream(resource)) {
++            assertNotNull("missing keystore fixture " + resource, in);
++            keyStore.load(in, KS_PASSWORD.toCharArray());
++        }
++        Certificate[] chain = keyStore.getCertificateChain(alias);
++        if (chain == null) {
++            Certificate single = keyStore.getCertificate(alias);
++            assertNotNull("no certificate for alias " + alias + " in " + resource, single);
++            chain = new Certificate[] {single};
++        }
++        return chain;
++    }
++
++    /** Loads a single X509 certificate from a keystore alias. */
++    private static X509Certificate loadX509Certificate(String resource, String alias) throws Exception {
++        Certificate[] chain = loadCertChain(resource, alias);
++        return (X509Certificate) chain[0];
++    }
++
++    /** Builds a well-formed but UNSIGNED Holder-of-Key SAML assertion whose SubjectKeyInfo carries
++     *  the given certificate (so it can be bound to the TLS peer certificate). */
++    private Element buildUnsignedHolderOfKeyAssertionElement(String subject, String issuer,
++                                                             String audience,
++                                                             X509Certificate keyInfoCert) throws Exception {
++        UnsignedSamlCallbackHandler callbackHandler = new UnsignedSamlCallbackHandler(
++            subject, issuer, audience, SAML2Constants.CONF_HOLDER_KEY, keyInfoCert);
++        SAMLCallback samlCallback = new SAMLCallback();
++        SAMLUtil.doSAMLCallback(callbackHandler, samlCallback);
++        SamlAssertionWrapper assertion = new SamlAssertionWrapper(samlCallback);
++        // Deliberately NO signAssertion(...) call -- the assertion is left unsigned.
++
++        Document doc = DOMUtils.createDocument();
++        Element assertionElement = assertion.toDOM(doc);
++        doc.appendChild(assertionElement);
++        return assertionElement;
++    }
++
++    /** Builds a well-formed SIGNED SAML assertion whose signing certificate is {@code alias} from
++     *  {@code signer}. Used only by the signed-path preservation control -- the fix must not touch
++     *  this path. */
++    private Element buildSignedAssertionElement(String subject, String issuer, String audience,
++                                               Crypto signer, String alias) throws Exception {
++        ExploitSamlCallbackHandler callbackHandler =
++            new ExploitSamlCallbackHandler(subject, issuer, audience);
++        SAMLCallback samlCallback = new SAMLCallback();
++        SAMLUtil.doSAMLCallback(callbackHandler, samlCallback);
++        SamlAssertionWrapper assertion = new SamlAssertionWrapper(samlCallback);
++
++        // sendKeyValue=false => the signer's X.509 certificate is embedded in <ds:KeyInfo>.
++        assertion.signAssertion(alias, KS_PASSWORD, signer, false);
++
++        Document doc = DOMUtils.createDocument();
++        Element assertionElement = assertion.toDOM(doc);
++        doc.appendChild(assertionElement);
++        return assertionElement;
++    }
++
++    private String buildUnsignedAssertionBase64Url(String subject, String issuer, String audience,
++                                                   String confirmationMethod) throws Exception {
++        Element element = buildUnsignedAssertionElement(subject, issuer, audience, confirmationMethod);
++        byte[] xml = serialize(element.getOwnerDocument());
++        return org.apache.cxf.common.util.Base64UrlUtility.encode(xml);
++    }
++
++    /** Builds a well-formed but UNSIGNED SAML assertion element (the exploit never signs it). */
++    private Element buildUnsignedAssertionElement(String subject, String issuer, String audience,
++                                                  String confirmationMethod) throws Exception {
++        UnsignedSamlCallbackHandler callbackHandler =
++            new UnsignedSamlCallbackHandler(subject, issuer, audience, confirmationMethod);
++        SAMLCallback samlCallback = new SAMLCallback();
++        SAMLUtil.doSAMLCallback(callbackHandler, samlCallback);
++        SamlAssertionWrapper assertion = new SamlAssertionWrapper(samlCallback);
++        // Deliberately NO assertion.signAssertion(...) call -- the assertion is left unsigned.
++
++        Document doc = DOMUtils.createDocument();
++        Element assertionElement = assertion.toDOM(doc);
++        doc.appendChild(assertionElement);
++        return assertionElement;
++    }
++
++    private static byte[] serialize(Document doc) throws Exception {
++        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
++        javax.xml.transform.TransformerFactory.newInstance().newTransformer()
++            .transform(new javax.xml.transform.dom.DOMSource(doc),
++                       new javax.xml.transform.stream.StreamResult(bos));
++        return bos.toByteArray();
++    }
++
++    private Message newMessageWithTlsCerts(Crypto sigVerCrypto, Certificate[] tlsCerts) {
++        Message m = new MessageImpl();
++        Exchange e = new ExchangeImpl();
++        e.put(Bus.class, BusFactory.getThreadDefaultBus());
++        m.setExchange(e);
++        e.setInMessage(m);
++        m.put(SecurityConstants.SIGNATURE_CRYPTO, sigVerCrypto);
++        // A documented SAML-over-mTLS deployment that accepts unsigned assertions to populate the
++        // principal. This property gates whether an unsigned assertion's principal may be USED; it
++        // performs NO binding between the TLS client identity and the assertion's Subject/Issuer --
++        // which is exactly the control this finding shows is missing. With it enabled the vulnerable
++        // validateToken's acceptance materializes as a concrete harm (token issued / SecurityContext
++        // installed for the attacker-chosen subject) rather than a null downstream context.
++        m.put(SecurityConstants.ENABLE_UNSIGNED_SAML_ASSERTION_PRINCIPAL, "true");
++        if (tlsCerts != null) {
++            TLSSessionInfo tlsInfo = new TLSSessionInfo("TLS", null, tlsCerts);
++            m.put(TLSSessionInfo.class, tlsInfo);
++        }
++        return m;
++    }
++
++    private static boolean isAuthRejection(Throwable ex) {
++        for (Throwable t = ex; t != null; t = t.getCause()) {
++            String n = t.getClass().getName();
++            if (n.contains("NotAuthorized") || n.contains("WSSecurityException")
++                || t instanceof OAuthServiceException) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    // --- process-global CURRENT_MESSAGE thread-local: capture and restore (secure-patch-requirements 5)
++
++    private static Object setCurrentMessage(Message m) throws Exception {
++        ThreadLocal<Message> tl = currentMessageThreadLocal();
++        Message previous = tl.get();
++        tl.set(m);
++        return previous;
++    }
++
++    private static void restoreCurrentMessage(Object previous) throws Exception {
++        ThreadLocal<Message> tl = currentMessageThreadLocal();
++        if (previous == null) {
++            tl.remove();
++        } else {
++            tl.set((Message) previous);
++        }
++    }
++
++    @SuppressWarnings("unchecked")
++    private static ThreadLocal<Message> currentMessageThreadLocal() throws Exception {
++        Field f = PhaseInterceptorChain.class.getDeclaredField("CURRENT_MESSAGE");
++        f.setAccessible(true);
++        return (ThreadLocal<Message>) f.get(null);
++    }
++
++    /** Minimal data provider so doCreateAccessToken produces a concrete token carrying the subject. */
++    private static final class StubDataProvider implements OAuthDataProvider {
++        public Client getClient(String clientId) {
++            return new Client(clientId, "secret", true);
++        }
++
++        public ServerAccessToken createAccessToken(AccessTokenRegistration reg) {
++            BearerAccessToken token = new BearerAccessToken(reg.getClient(), 3600L);
++            token.setSubject(reg.getSubject());
++            return token;
++        }
++
++        public ServerAccessToken getAccessToken(String accessToken) {
++            return null;
++        }
++
++        public ServerAccessToken getPreauthorizedToken(Client client, List<String> requestedScopes,
++                                                       UserSubject subject, String grantType) {
++            return null;
++        }
++
++        public ServerAccessToken refreshAccessToken(Client client, String refreshToken,
++                                                    List<String> requestedScopes) {
++            return null;
++        }
++
++        public List<ServerAccessToken> getAccessTokens(Client client, UserSubject subject) {
++            return Collections.emptyList();
++        }
++
++        public List<RefreshToken> getRefreshTokens(Client client, UserSubject subject) {
++            return Collections.emptyList();
++        }
++
++        public void revokeToken(Client client, String tokenId, String tokenTypeHint) {
++        }
++
++        public List<OAuthPermission> convertScopeToPermissions(Client client, List<String> requestedScopes) {
++            return Collections.emptyList();
++        }
++    }
++}
+diff --git a/rt/rs/security/oauth-parent/oauth2-saml/src/test/java/org/apache/cxf/rs/security/oauth2/grants/saml/UnsignedSamlCallbackHandler.java b/rt/rs/security/oauth-parent/oauth2-saml/src/test/java/org/apache/cxf/rs/security/oauth2/grants/saml/UnsignedSamlCallbackHandler.java
+new file mode 100644
+index 00000000000..59a127971d6
+--- /dev/null
++++ b/rt/rs/security/oauth-parent/oauth2-saml/src/test/java/org/apache/cxf/rs/security/oauth2/grants/saml/UnsignedSamlCallbackHandler.java
+@@ -0,0 +1,142 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements. See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership. The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License. You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied. See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++package org.apache.cxf.rs.security.oauth2.grants.saml;
++
++import java.io.IOException;
++import java.security.cert.X509Certificate;
++import java.time.Duration;
++import java.time.Instant;
++import java.util.Collections;
++
++import javax.security.auth.callback.Callback;
++import javax.security.auth.callback.CallbackHandler;
++import javax.security.auth.callback.UnsupportedCallbackException;
++
++import org.apache.wss4j.common.saml.SAMLCallback;
++import org.apache.wss4j.common.saml.bean.AudienceRestrictionBean;
++import org.apache.wss4j.common.saml.bean.AuthenticationStatementBean;
++import org.apache.wss4j.common.saml.bean.ConditionsBean;
++import org.apache.wss4j.common.saml.bean.KeyInfoBean;
++import org.apache.wss4j.common.saml.bean.SubjectBean;
++import org.apache.wss4j.common.saml.bean.SubjectConfirmationDataBean;
++import org.apache.wss4j.common.saml.bean.Version;
++
++/**
++ * Builds a fully well-formed SAML 2.0 authentication assertion whose Issuer, Audience,
++ * SubjectConfirmationData and Conditions all pass CXF's claims validators
++ * ({@code SamlAssertionValidator} + {@code SamlOAuthValidator}) -- but which is deliberately
++ * left UNSIGNED by the exploit test (the test never calls {@code signAssertion(...)}).
++ *
++ * <p>The subject name (and hence the identity the OAuth2 token / SecurityContext is created for)
++ * is attacker-chosen and is NOT bound in any way to the TLS client certificate the attacker
++ * happens to present. This is exactly the CGP-qjm4-c96g-8hhw (CWE-345) attacker model: a
++ * lower-trust party holding SOME accepted client certificate submits an unsigned assertion naming
++ * an arbitrary/privileged subject.
++ *
++ * <p>The {@code confirmationMethod} is configurable so the harness can drive every reachable
++ * no-binding branch of {@code AbstractSamlInHandler.checkSubjectConfirmationData}:
++ * <ul>
++ *   <li>Bearer confirmation (checkBearer),</li>
++ *   <li>Sender-Vouches confirmation (checkSenderVouches),</li>
++ *   <li>an unrecognized/custom confirmation method string (all three recogniser loops fall
++ *       through and implicitly return {@code true}),</li>
++ *   <li>no SubjectConfirmation element at all (pass {@code null}).</li>
++ * </ul>
++ */
++public class UnsignedSamlCallbackHandler implements CallbackHandler {
++
++    private final String subjectName;
++    private final String issuer;
++    private final String audienceAndRecipient;
++    private final String confirmationMethod;
++    private final X509Certificate keyInfoCertificate;
++
++    /**
++     * @param confirmationMethod the SubjectConfirmation Method URI to set, or {@code null} to emit
++     *                           a Subject with NO SubjectConfirmation element at all.
++     */
++    public UnsignedSamlCallbackHandler(String subjectName, String issuer, String audienceAndRecipient,
++                                       String confirmationMethod) {
++        this(subjectName, issuer, audienceAndRecipient, confirmationMethod, null);
++    }
++
++    /**
++     * @param keyInfoCertificate a certificate to embed in the SubjectConfirmation's KeyInfo (used to
++     *                           build a genuine Holder-of-Key assertion whose SubjectKeyInfo can be
++     *                           bound to the TLS peer certificate), or {@code null} for none.
++     */
++    public UnsignedSamlCallbackHandler(String subjectName, String issuer, String audienceAndRecipient,
++                                       String confirmationMethod, X509Certificate keyInfoCertificate) {
++        this.subjectName = subjectName;
++        this.issuer = issuer;
++        this.audienceAndRecipient = audienceAndRecipient;
++        this.confirmationMethod = confirmationMethod;
++        this.keyInfoCertificate = keyInfoCertificate;
++    }
++
++    public void handle(Callback[] callbacks) throws IOException, UnsupportedCallbackException {
++        for (Callback value : callbacks) {
++            if (value instanceof SAMLCallback) {
++                SAMLCallback callback = (SAMLCallback) value;
++                callback.setSamlVersion(Version.SAML_20);
++                callback.setIssuer(issuer);
++
++                SubjectBean subjectBean;
++                if (confirmationMethod == null) {
++                    // No SubjectConfirmation element at all.
++                    subjectBean = new SubjectBean();
++                    subjectBean.setSubjectName(subjectName);
++                    subjectBean.setSubjectNameQualifier("www.example.com");
++                } else {
++                    subjectBean = new SubjectBean(subjectName, "www.example.com", confirmationMethod);
++                    SubjectConfirmationDataBean subjectConfirmationData = new SubjectConfirmationDataBean();
++                    subjectConfirmationData.setRecipient(audienceAndRecipient);
++                    subjectConfirmationData.setNotAfter(Instant.now().plus(Duration.ofMinutes(30)));
++                    subjectBean.setSubjectConfirmationData(subjectConfirmationData);
++                    if (keyInfoCertificate != null) {
++                        // Holder-of-Key: embed the certificate in the SubjectConfirmation's KeyInfo so
++                        // the assertion's SubjectKeyInfo can be bound to the TLS peer certificate.
++                        KeyInfoBean keyInfo = new KeyInfoBean();
++                        keyInfo.setCertificate(keyInfoCertificate);
++                        keyInfo.setCertIdentifer(KeyInfoBean.CERT_IDENTIFIER.X509_CERT);
++                        subjectBean.setKeyInfo(keyInfo);
++                    }
++                }
++                callback.setSubject(subjectBean);
++
++                // Conditions: in-window NotBefore/NotOnOrAfter + AudienceRestriction matching the endpoint
++                ConditionsBean conditions = new ConditionsBean();
++                conditions.setNotBefore(Instant.now().minus(Duration.ofMinutes(5)));
++                conditions.setNotAfter(Instant.now().plus(Duration.ofMinutes(30)));
++                AudienceRestrictionBean audienceRestriction = new AudienceRestrictionBean();
++                audienceRestriction.setAudienceURIs(Collections.singletonList(audienceAndRecipient));
++                conditions.setAudienceRestrictions(Collections.singletonList(audienceRestriction));
++                callback.setConditions(conditions);
++
++                AuthenticationStatementBean authBean = new AuthenticationStatementBean();
++                authBean.setSubject(subjectBean);
++                authBean.setAuthenticationInstant(Instant.now());
++                authBean.setAuthenticationMethod("Password");
++                callback.setAuthenticationStatementData(Collections.singletonList(authBean));
++            } else {
++                throw new UnsupportedCallbackException(value, "Unrecognized Callback");
++            }
++        }
++    }
++}
+diff --git a/rt/rs/security/xml/src/main/java/org/apache/cxf/rs/security/saml/AbstractSamlInHandler.java b/rt/rs/security/xml/src/main/java/org/apache/cxf/rs/security/saml/AbstractSamlInHandler.java
+index dc027d54bf4..0e00e643cb2 100644
+--- a/rt/rs/security/xml/src/main/java/org/apache/cxf/rs/security/saml/AbstractSamlInHandler.java
++++ b/rt/rs/security/xml/src/main/java/org/apache/cxf/rs/security/saml/AbstractSamlInHandler.java
+@@ -193,8 +193,26 @@ public abstract class AbstractSamlInHandler implements ContainerRequestFilter {
+                 trustCredential.setPublicKey(samlKeyInfo.getPublicKey());
+                 trustCredential.setCertificates(samlKeyInfo.getCerts());
+                 signatureTrustValidator.validate(trustCredential, data);
+-            } else if (getTLSCertificates(message) == null) {
+-                throwFault("Assertion must be signed", null);
++            } else {
++                // Unsigned assertion. Presence of *some* accepted TLS client certificate is a channel
++                // property, not proof of who the peer claims to be: accepting an unsigned assertion on
++                // that basis alone lets any lower-trust party holding an accepted client certificate
++                // impersonate any subject (CGP-qjm4-c96g-8hhw / CWE-345). An unsigned assertion is
++                // authored in its entirety by the sender and nothing in it is authenticated by a trust
++                // anchor, so no field of it (Issuer, Subject NameID, or SubjectConfirmation/
++                // SubjectKeyInfo) can bind the presenter to the subject it names. Reject unsigned
++                // assertions here (fail closed) regardless of confirmation method; identity must be
++                // established by a signature that chains to the configured sigVerCrypto trust anchor.
++                // An operator that genuinely relies on the legacy weaker behavior may opt back in via
++                // SamlTlsIdentityBinding.ALLOW_UNBOUND_PROPERTY (default off, WARN-logged).
++                Certificate[] tlsCerts = getTLSCertificates(message);
++                if (tlsCerts == null) {
++                    throwFault("Assertion must be signed", null);
++                } else if (!SamlTlsIdentityBinding.isUnsignedAssertionTlsBound(assertion, tlsCerts, data)
++                    && !SamlTlsIdentityBinding.isUnboundAcceptanceAllowed()) {
++                    throwFault("Unsigned assertion is not accepted without a trust-anchored signature",
++                               null);
++                }
+             }
+             if (samlValidator != null) {
+                 Credential credential = new Credential();
+diff --git a/rt/rs/security/xml/src/main/java/org/apache/cxf/rs/security/saml/SamlTlsIdentityBinding.java b/rt/rs/security/xml/src/main/java/org/apache/cxf/rs/security/saml/SamlTlsIdentityBinding.java
+new file mode 100644
+index 00000000000..a71392cd52d
+--- /dev/null
++++ b/rt/rs/security/xml/src/main/java/org/apache/cxf/rs/security/saml/SamlTlsIdentityBinding.java
+@@ -0,0 +1,150 @@
++/**
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements. See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership. The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License. You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied. See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package org.apache.cxf.rs.security.saml;
++
++import java.util.Locale;
++import java.util.logging.Logger;
++
++import org.apache.cxf.common.logging.LogUtils;
++import org.apache.wss4j.common.saml.SamlAssertionWrapper;
++
++/**
++ * Shared, fail-closed decision point for whether an UNSIGNED SAML assertion may be trusted as proof
++ * of identity over a mutual-TLS connection (CGP-qjm4-c96g-8hhw / CWE-345, related
++ * CWE-287/346/347/940).
++ *
++ * <p>Historically both {@code Saml2BearerGrantHandler.validateToken} and
++ * {@code AbstractSamlInHandler.validateToken} accepted an unsigned assertion whenever the transport
++ * session presented <em>any</em> client TLS certificate ({@code getTLSCertificates(message) != null}).
++ * That is a channel property ("a two-way TLS handshake completed"), NOT proof of who the peer is
++ * claiming to be: any lower-trust party holding a certificate the container truststore accepts could
++ * submit an unsigned assertion naming any subject (including privileged accounts) and be authenticated
++ * as that subject.
++ *
++ * <p><b>Why "bind the TLS cert to the assertion's own key material" is not a fix.</b> An unsigned
++ * assertion is authored <em>in its entirety</em> by the sender: the {@code <Issuer>}, the
++ * {@code <Subject>} NameID that ultimately becomes the authenticated principal, the declared
++ * {@code SubjectConfirmation} method(s), and any {@code SubjectKeyInfo} are all attacker-controlled.
++ * Comparing the assertion's own {@code SubjectKeyInfo} to the presented TLS peer certificate is a
++ * tautology -- the attacker chooses both the certificate they present for the handshake and the key
++ * bytes they write into their own assertion, so they can always make the two match while writing any
++ * {@code <Subject>} NameID they like. Nothing in an unsigned assertion is authenticated by a trust
++ * anchor, so no field of it can establish that the presenter is the subject it names.
++ *
++ * <p><b>Invariant enforced here (fail closed).</b> An unsigned assertion is therefore never treated
++ * as proof of identity by default, regardless of which (or whether any) {@code SubjectConfirmation}
++ * method it declares -- Bearer, Sender-Vouches, Holder-of-Key, an unrecognized/custom method, or
++ * none. Identity over these paths must be established by a signature that chains to the configured
++ * {@code sigVerCrypto} trust anchor (the signed-assertion path, unchanged), i.e. the sender must
++ * demonstrate control of a key that a trust anchor vouches for -- exactly what an unsigned assertion
++ * cannot do.
++ *
++ * <p><b>Operator escape hatch.</b> A deployment that genuinely relies on the previous, weaker
++ * presence-only acceptance of unsigned assertions may re-enable it with the deployment-scoped system
++ * property {@value #ALLOW_UNBOUND_PROPERTY} set to an explicit affirmative ("true"/"1"/"yes"/"on").
++ * The default is off (secure); when engaged it logs a WARN naming the CVE/CWE so the weakened control
++ * is never silent. The property is read through a single strict true/false parser: every other value
++ * -- including {@code "false"}, {@code "0"}, empty, or junk -- leaves the protection ON (fail closed).
++ */
++public final class SamlTlsIdentityBinding {
++
++    /**
++     * Deployment-scoped escape hatch (default OFF). When set to an explicit affirmative, an unsigned
++     * assertion is accepted whenever any accepted TLS client certificate is present (the legacy,
++     * pre-CGP-qjm4-c96g-8hhw presence-only behavior). WARN-logged on every use.
++     */
++    public static final String ALLOW_UNBOUND_PROPERTY =
++        "org.apache.cxf.saml.allow-unbound-unsigned-assertion";
++
++    private static final Logger LOG = LogUtils.getL7dLogger(SamlTlsIdentityBinding.class);
++
++    private SamlTlsIdentityBinding() {
++    }
++
++    /**
++     * Decide whether an unsigned SAML assertion may be trusted as proof of identity.
++     *
++     * <p>This always returns {@code false} for an unsigned assertion: because the whole assertion is
++     * attacker-authored and nothing in it is authenticated by a trust anchor, no field of it (Issuer,
++     * Subject NameID, or SubjectConfirmation/SubjectKeyInfo) can establish that the presenter is the
++     * subject it names, no matter which confirmation method it declares. The caller must reject unless
++     * the operator has explicitly opted in via {@link #isUnboundAcceptanceAllowed()}.
++     *
++     * <p>The parameters are retained so that a future, genuinely-sound binding mechanism (e.g. an
++     * operator-configured mapping from a specific trusted certificate to a specific permitted
++     * subject/Issuer) could be added here without changing either sink; today none exists, so the
++     * method is fail closed.
++     *
++     * @return {@code false} always -- an unsigned assertion is never self-authenticating.
++     */
++    public static boolean isUnsignedAssertionTlsBound(SamlAssertionWrapper assertion,
++                                                      java.security.cert.Certificate[] tlsCerts,
++                                                      org.apache.wss4j.dom.handler.RequestData data) {
++        // Deliberately no accept branch: see the class javadoc. An unsigned assertion cannot bind its
++        // named identity to the verified TLS peer, so it is never trusted here.
++        return false;
++    }
++
++    /**
++     * @return {@code true} only when the operator has explicitly opted in to the legacy, weaker
++     *         presence-only acceptance of unsigned assertions. Logs a WARN on each engagement so the
++     *         weakened control is never silent.
++     */
++    public static boolean isUnboundAcceptanceAllowed() {
++        String value = getProperty(ALLOW_UNBOUND_PROPERTY);
++        if (parseStrictBoolean(value)) {
++            LOG.warning("SECURITY: '" + ALLOW_UNBOUND_PROPERTY + "' is enabled -- unsigned SAML "
++                + "assertions are accepted whenever any TLS client certificate is present, WITHOUT "
++                + "binding the TLS identity to the assertion's Subject/Issuer. This re-enables the "
++                + "impersonation weakness CGP-qjm4-c96g-8hhw (CWE-345) and must not be used in "
++                + "production.");
++            return true;
++        }
++        return false;
++    }
++
++    private static String getProperty(String key) {
++        try {
++            return System.getProperty(key);
++        } catch (SecurityException ex) {
++            return null;
++        }
++    }
++
++    /**
++     * The single strict boolean parse for every knob this fix introduces. Engages only on an explicit
++     * affirmative; {@code "false"}, {@code "0"}, empty, unset, and unparseable values all return
++     * {@code false} (protection ON).
++     */
++    static boolean parseStrictBoolean(String value) {
++        if (value == null) {
++            return false;
++        }
++        switch (value.trim().toLowerCase(Locale.ROOT)) {
++        case "1":
++        case "true":
++        case "yes":
++        case "on":
++            return true;
++        default:
++            return false;
++        }
++    }
++}
+-- 
+2.55.0
+

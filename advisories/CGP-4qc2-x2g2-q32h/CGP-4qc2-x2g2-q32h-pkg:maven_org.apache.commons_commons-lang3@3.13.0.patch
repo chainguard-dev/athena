@@ -1,0 +1,359 @@
+From 73fc86f5115a9f25c5c84fcb132fa1891b5dae5d Mon Sep 28 16:00:00 2026
+From: Chainguard Bot <noreply@chainguard.dev>
+Date: Mon, 28 Sep 2026 16:00:00 +0000
+Subject: [PATCH] fix CGP-4qc2-x2g2-q32h: use SecureRandom in
+ RandomStringUtils/RandomUtils
+
+RandomStringUtils and RandomUtils (CWE-338: Use of Cryptographically
+Weak PRNG) generate all default random values through
+java.util.concurrent.ThreadLocalRandom. The private random() factory
+method in each class (RandomStringUtils.java, RandomUtils.java)
+returned ThreadLocalRandom.current(), and every public generation
+method in both classes -- randomAlphanumeric(), randomAlpha(),
+randomNumeric(), randomAscii(), random(int), nextBoolean(),
+nextBytes(), nextInt(), nextLong(), nextFloat(), nextDouble(), and
+all of their overloads, including the (int,int) range overloads that
+route through RandomUtils.nextInt(min,max) -- delegated to this
+factory. ThreadLocalRandom is a high-throughput, non-cryptographic
+PRNG whose 64-bit internal state can be reconstructed from a small
+number of observed outputs, so any value it produces is predictable
+to an attacker who has observed prior output. Downstream applications
+that misuse these classes to generate session identifiers,
+password-reset tokens, CSRF tokens, API keys, or other
+security-sensitive values are therefore exposed to token forgery,
+session hijacking, and password-reset or CSRF bypass.
+
+The fix replaces the private random() factory in both
+RandomStringUtils and RandomUtils with a shared, self-seeded
+java.security.SecureRandom instance (a static final field, so
+construction happens once, eagerly, and any construction failure
+propagates rather than silently falling back to a weaker source).
+This closes the single chokepoint each class funnels its default
+random draws through, so the fix covers every public entry point
+that does not accept a caller-supplied java.util.Random -- including
+the chained (int,int) range overloads -- without changing any public
+signature, thrown-exception behavior, or output length/charset
+semantics. RandomStringUtils.random(count, start, end, letters,
+numbers, chars, java.util.Random) and its call-through overloads,
+which let a caller supply their own Random for reproducible output,
+are left untouched by design.
+
+The regression test org.apache.commons.lang3.WeakPrngExploitTest
+asserts, via reflection on the private random() factories, that the
+runtime type returned is java.security.SecureRandom rather than
+ThreadLocalRandom for both RandomStringUtils and RandomUtils; it also
+demonstrates that on the unpatched build an attacker who recovers a
+thread's ThreadLocalRandom state can forge, byte-for-byte, the output
+of RandomStringUtils.randomAlphanumeric(), RandomUtils.nextBytes(),
+and the chained RandomStringUtils.randomAlphanumeric(min,max) route,
+and that this forgery is no longer possible once SecureRandom backs
+the default source. A positive control in the same test class
+confirms the caller-supplied-Random overload keeps producing
+identical output for a fixed-seed Random and a caller-defined Random
+subclass, preserving that documented, intentional behavior.
+
+CGP: CGP-4qc2-x2g2-q32h
+Cgp-Finding: CGP-4qc2-x2g2-q32h
+---
+ .../commons/lang3/RandomStringUtils.java      |  17 +-
+ .../org/apache/commons/lang3/RandomUtils.java |  15 +-
+ .../commons/lang3/WeakPrngExploitTest.java    | 217 ++++++++++++++++++
+ 3 files changed, 243 insertions(+), 6 deletions(-)
+ create mode 100644 src/test/java/org/apache/commons/lang3/WeakPrngExploitTest.java
+
+diff --git a/src/main/java/org/apache/commons/lang3/RandomStringUtils.java b/src/main/java/org/apache/commons/lang3/RandomStringUtils.java
+index e182d7ee8..a01dfff17 100644
+--- a/src/main/java/org/apache/commons/lang3/RandomStringUtils.java
++++ b/src/main/java/org/apache/commons/lang3/RandomStringUtils.java
+@@ -16,8 +16,8 @@
+  */
+ package org.apache.commons.lang3;
+ 
++import java.security.SecureRandom;
+ import java.util.Random;
+-import java.util.concurrent.ThreadLocalRandom;
+ 
+ /**
+  * Generates random {@link String}s.
+@@ -49,8 +49,19 @@ import java.util.concurrent.ThreadLocalRandom;
+  */
+ public class RandomStringUtils {
+ 
+-    private static ThreadLocalRandom random() {
+-        return ThreadLocalRandom.current();
++    /**
++     * The default source of randomness. A single self-seeded
++     * {@link SecureRandom} (CSPRNG) is used instead of a non-cryptographic PRNG so that
++     * values generated without an explicit caller-supplied {@link Random} are not predictable
++     * (CWE-338/CWE-330). {@link SecureRandom} is thread-safe, preserving this class's
++     * {@code #ThreadSafe#} contract; construction is self-seeded (never a fixed or derivable seed)
++     * and any failure to construct it propagates rather than silently falling back to an insecure
++     * source.
++     */
++    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
++
++    private static SecureRandom random() {
++        return SECURE_RANDOM;
+     }
+ 
+     // Random
+diff --git a/src/main/java/org/apache/commons/lang3/RandomUtils.java b/src/main/java/org/apache/commons/lang3/RandomUtils.java
+index 95349685d..47ebb51fd 100644
+--- a/src/main/java/org/apache/commons/lang3/RandomUtils.java
++++ b/src/main/java/org/apache/commons/lang3/RandomUtils.java
+@@ -16,8 +16,8 @@
+  */
+ package org.apache.commons.lang3;
+ 
++import java.security.SecureRandom;
+ import java.util.Random;
+-import java.util.concurrent.ThreadLocalRandom;
+ 
+ /**
+  * Utility library that supplements the standard {@link Random} class.
+@@ -222,8 +222,17 @@ public class RandomUtils {
+         return startInclusive + nextLong(endExclusive - startInclusive);
+     }
+ 
+-    private static ThreadLocalRandom random() {
+-        return ThreadLocalRandom.current();
++    /**
++     * The default source of randomness. A single self-seeded
++     * {@link SecureRandom} (CSPRNG) is used instead of a non-cryptographic PRNG so that the values
++     * generated by this class are not predictable (CWE-338/CWE-330). {@link SecureRandom} is
++     * thread-safe; construction is self-seeded (never a fixed or derivable seed) and any failure to
++     * construct it propagates rather than silently falling back to an insecure source.
++     */
++    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
++
++    private static SecureRandom random() {
++        return SECURE_RANDOM;
+     }
+ 
+     /**
+diff --git a/src/test/java/org/apache/commons/lang3/WeakPrngExploitTest.java b/src/test/java/org/apache/commons/lang3/WeakPrngExploitTest.java
+new file mode 100644
+index 000000000..939032e9e
+--- /dev/null
++++ b/src/test/java/org/apache/commons/lang3/WeakPrngExploitTest.java
+@@ -0,0 +1,217 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements.  See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License.  You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.commons.lang3;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++import java.lang.reflect.Field;
++import java.lang.reflect.Method;
++import java.security.SecureRandom;
++import java.util.Arrays;
++import java.util.Random;
++import java.util.concurrent.ThreadLocalRandom;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import org.junit.jupiter.api.Test;
++
++/**
++ * Exploit harness for CGP-4qc2-x2g2-q32h (CWE-338 / CWE-330): {@link RandomStringUtils} and
++ * {@link RandomUtils} back every default-source random draw with {@link ThreadLocalRandom}, a
++ * non-cryptographic 64-bit-state PRNG whose output is predictable to an attacker who can recover its
++ * state.
++ *
++ * <p>Each {@code exploit*} method below asserts the SECURITY INVARIANT ("the default randomness source
++ * is a CSPRNG, so its output cannot be predicted/reproduced from recovered PRNG state"). On the
++ * UNPATCHED build every assertion fails, so the suite exits non-zero (RED). Once the default source is
++ * a self-seeded {@link SecureRandom}, every assertion holds and the suite exits zero (GREEN).</p>
++ *
++ * <p>Full PRNG-state cryptanalysis is impractical inside a fast unit test, so the concrete harmful
++ * effect is demonstrated by <em>state replay</em>: {@code ThreadLocalRandom.current()} is driven
++ * entirely by the mutable {@code Thread.threadLocalRandomSeed} field, so an attacker who can snapshot
++ * that 64-bit state, observe a victim generate a token, then restore the snapshot and re-run the same
++ * generation call, reproduces the victim's secret token byte-for-byte — a forgery. A properly
++ * self-seeded {@link SecureRandom} does not read that field, so the replay produces a DIFFERENT value
++ * and the forgery fails (GREEN). The private {@code random()} factories named as the sinks are also
++ * probed directly by reflection as a falsifiable stand-in for "not predictable".</p>
++ */
++public class WeakPrngExploitTest extends AbstractLangTest {
++
++    /** {@code Thread.threadLocalRandomSeed} is the entire mutable state of the calling thread's TLR. */
++    private static Field threadLocalRandomSeedField() throws Exception {
++        final Field f = Thread.class.getDeclaredField("threadLocalRandomSeed");
++        f.setAccessible(true);
++        return f;
++    }
++
++    private static long snapshotTlrSeed(final Field seed) throws Exception {
++        return seed.getLong(Thread.currentThread());
++    }
++
++    private static void restoreTlrSeed(final Field seed, final long value) throws Exception {
++        seed.setLong(Thread.currentThread(), value);
++    }
++
++    /** Reflectively invoke the private static {@code random()} factory named as the sink. */
++    private static Object invokePrivateRandomFactory(final Class<?> owner) throws Exception {
++        final Method m = owner.getDeclaredMethod("random");
++        m.setAccessible(true);
++        return m.invoke(null);
++    }
++
++    // ------------------------------------------------------------------------------------------------
++    // Sink #1: RandomStringUtils.random() -- concrete forgery of a generated security token.
++    // ------------------------------------------------------------------------------------------------
++
++    /**
++     * Harmful effect: an attacker who recovers the PRNG state reproduces the victim's 32-char
++     * alphanumeric token (as used for session IDs / reset tokens / API keys) byte-for-byte.
++     */
++    @Test
++    public void exploitForgeRandomStringToken() throws Exception {
++        final Field seed = threadLocalRandomSeedField();
++        ThreadLocalRandom.current(); // ensure the calling thread's TLR state exists
++
++        final long captured = snapshotTlrSeed(seed);
++        final String victimToken = RandomStringUtils.randomAlphanumeric(32);
++
++        // Attacker: restore the captured 64-bit state, re-run the SAME generation call.
++        restoreTlrSeed(seed, captured);
++        final String forgedToken = RandomStringUtils.randomAlphanumeric(32);
++
++        // INVARIANT: a CSPRNG-backed generator cannot be replayed from a recovered seed value.
++        assertFalse(victimToken.equals(forgedToken),
++                "RandomStringUtils token was PREDICTED/forged from recovered ThreadLocalRandom state: "
++                        + "victim=" + victimToken + " forged=" + forgedToken
++                        + " -- default source is not a CSPRNG (CWE-338/CWE-330).");
++    }
++
++    // ------------------------------------------------------------------------------------------------
++    // Sink #2: RandomUtils.random() -- concrete forgery of generated random bytes.
++    // ------------------------------------------------------------------------------------------------
++
++    /**
++     * Harmful effect: an attacker reproduces the raw random bytes {@code RandomUtils.nextBytes(int)}
++     * hands out (as used for nonces / keys / tokens) byte-for-byte.
++     */
++    @Test
++    public void exploitForgeRandomUtilsBytes() throws Exception {
++        final Field seed = threadLocalRandomSeedField();
++        ThreadLocalRandom.current();
++
++        final long captured = snapshotTlrSeed(seed);
++        final byte[] victimBytes = RandomUtils.nextBytes(24);
++
++        restoreTlrSeed(seed, captured);
++        final byte[] forgedBytes = RandomUtils.nextBytes(24);
++
++        assertFalse(Arrays.equals(victimBytes, forgedBytes),
++                "RandomUtils.nextBytes output was PREDICTED/forged from recovered ThreadLocalRandom "
++                        + "state -- default source is not a CSPRNG (CWE-338/CWE-330). victim="
++                        + Arrays.toString(victimBytes) + " forged=" + Arrays.toString(forgedBytes));
++    }
++
++    // ------------------------------------------------------------------------------------------------
++    // Non-enumerated CHAINED route (completeness property): RandomStringUtils.randomAlphanumeric(min,max)
++    // -> RandomUtils.nextInt(min,max) -> RandomUtils.random(). Neither of the two cited sink lines is
++    // touched directly here, so a fix that only edits the two literal random() methods but overlooks
++    // that RandomUtils.nextInt is also on this call graph would still leave this route forgeable.
++    // ------------------------------------------------------------------------------------------------
++
++    /**
++     * Harmful effect: the length-range overload draws from {@code RandomUtils.nextInt} first (to pick
++     * the length) and then from {@code RandomStringUtils.random()} — both replayed from one captured
++     * seed, reproducing the victim token completely.
++     */
++    @Test
++    public void exploitForgeChainedRangeOverload() throws Exception {
++        final Field seed = threadLocalRandomSeedField();
++        ThreadLocalRandom.current();
++
++        final long captured = snapshotTlrSeed(seed);
++        final String victimToken = RandomStringUtils.randomAlphanumeric(20, 33);
++
++        restoreTlrSeed(seed, captured);
++        final String forgedToken = RandomStringUtils.randomAlphanumeric(20, 33);
++
++        assertFalse(victimToken.equals(forgedToken),
++                "Chained randomAlphanumeric(min,max) route (via RandomUtils.nextInt) was "
++                        + "PREDICTED/forged from recovered ThreadLocalRandom state: victim=" + victimToken
++                        + " forged=" + forgedToken + " -- CSPRNG did not propagate through the call graph "
++                        + "(CWE-338/CWE-330 completeness).");
++    }
++
++    // ------------------------------------------------------------------------------------------------
++    // Direct probes of the two named private random() factories (falsifiable stand-in for
++    // "not predictable"): the default source object MUST be a java.security.SecureRandom, never a
++    // ThreadLocalRandom or a plain java.util.Random.
++    // ------------------------------------------------------------------------------------------------
++
++    @Test
++    public void assertRandomStringUtilsFactoryIsCsprng() throws Exception {
++        final Object src = invokePrivateRandomFactory(RandomStringUtils.class);
++        assertNotNull(src, "RandomStringUtils.random() returned null");
++        assertFalse(src instanceof ThreadLocalRandom,
++                "RandomStringUtils.random() default source is ThreadLocalRandom (non-CSPRNG) -- CWE-338/CWE-330");
++        assertTrue(src instanceof SecureRandom,
++                "RandomStringUtils.random() default source is not a SecureRandom CSPRNG; got "
++                        + src.getClass().getName());
++    }
++
++    @Test
++    public void assertRandomUtilsFactoryIsCsprng() throws Exception {
++        final Object src = invokePrivateRandomFactory(RandomUtils.class);
++        assertNotNull(src, "RandomUtils.random() returned null");
++        assertFalse(src instanceof ThreadLocalRandom,
++                "RandomUtils.random() default source is ThreadLocalRandom (non-CSPRNG) -- CWE-338/CWE-330");
++        assertTrue(src instanceof SecureRandom,
++                "RandomUtils.random() default source is not a SecureRandom CSPRNG; got "
++                        + src.getClass().getName());
++    }
++
++    // ------------------------------------------------------------------------------------------------
++    // POSITIVE CONTROL (preservation boundary -- NOT an attack): the caller-supplied-Random overload
++    // RandomStringUtils.random(...,Random) is intentionally, documentedly reproducible. This must keep
++    // producing identical output for the same fixed-seed Random both before and after the fix; a fix
++    // that "upgrades" this path would break the documented reproducibility contract. Stays GREEN.
++    // ------------------------------------------------------------------------------------------------
++
++    @Test
++    public void positiveControlCallerSuppliedRandomStaysReproducible() {
++        final long fixedSeed = 0x0CAFEBABEL;
++        final String a = RandomStringUtils.random(40, 0, 0, true, true, null, new Random(fixedSeed));
++        final String b = RandomStringUtils.random(40, 0, 0, true, true, null, new Random(fixedSeed));
++        assertEquals(a, b,
++                "Preservation regression: caller-supplied fixed-seed Random must still reproduce output.");
++
++        // A caller-defined non-SecureRandom subclass must drive selection exactly (mirrors testCharOverflow).
++        final AtomicInteger counter = new AtomicInteger();
++        final Random custom = new Random() {
++            private static final long serialVersionUID = 1L;
++            @Override
++            public int nextInt(final int bound) {
++                return counter.getAndIncrement() % bound;
++            }
++        };
++        final char[] alphabet = {'a', 'b', 'c', 'd', 'e', 'f'};
++        final String forced = RandomStringUtils.random(6, 0, alphabet.length, false, false, alphabet, custom);
++        assertEquals("abcdef", forced,
++                "Preservation regression: caller-supplied custom Random subclass must drive selection exactly.");
++    }
++}
+-- 
+2.55.0
+
