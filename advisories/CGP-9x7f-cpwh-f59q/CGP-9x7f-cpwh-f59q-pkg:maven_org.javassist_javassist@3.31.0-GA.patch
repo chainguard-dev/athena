@@ -1,0 +1,689 @@
+From 4ab9a8d5b0176f5aef858ef45960e51f1377257a Mon Sep 17 00:00:00 2001
+From: Vuln Patch Pipeline <vuln-patch@chainguard.dev>
+Date: Tue, 10 Nov 2026 12:15:45 -0700
+Subject: [PATCH] Close Webserver.doReply streams and reject malformed request
+ lines
+
+javassist.tools.web.Webserver.doReply read the request path with
+cmd.substring(5, cmd.indexOf(' ', 5)). A "GET /" request line with no
+space after the path made indexOf return -1, so substring threw an
+unchecked StringIndexOutOfBoundsException that skipped the socket
+cleanup (CWE-20, CWE-755). The file and class-file branches also opened
+a FileInputStream and closed it only after the whole response was
+written, so a client that disconnected mid-transfer left the stream
+open (CWE-404, CWE-772). Repeated requests could exhaust file
+descriptors.
+
+A request line with no space after the path is now refused with the
+existing BadHttpRequest (400 Bad Request). Both file-serving branches
+read and write inside try/finally and always close the input stream,
+including when the client disconnects. Well-formed requests are served
+as before.
+
+Adds WebserverResourceLeakExploitTest.
+
+Cgp-Finding: CGP-9x7f-cpwh-f59q
+---
+ src/main/javassist/tools/web/Webserver.java   |  89 ++-
+ .../web/WebserverResourceLeakExploitTest.java | 525 ++++++++++++++++++
+ 2 files changed, 592 insertions(+), 22 deletions(-)
+ create mode 100644 src/test/javassist/tools/web/WebserverResourceLeakExploitTest.java
+
+diff --git a/src/main/javassist/tools/web/Webserver.java b/src/main/javassist/tools/web/Webserver.java
+index 684cb53..2a46300 100644
+--- a/src/main/javassist/tools/web/Webserver.java
++++ b/src/main/javassist/tools/web/Webserver.java
+@@ -221,6 +221,12 @@ public class Webserver {
+         clnt.close();
+     }
+ 
++    private static void closeQuietly(java.io.Closeable c) {
++        if (c != null)
++            try { c.close(); }
++            catch (IOException ignore) { }
++    }
++
+     private String readLine(InputStream in) throws IOException {
+         StringBuilder buf = new StringBuilder();
+         int c;
+@@ -254,8 +260,24 @@ public class Webserver {
+         int fileType;
+         String filename, urlName;
+ 
+-        if (cmd.startsWith("GET /"))
+-            filename = urlName = cmd.substring(5, cmd.indexOf(' ', 5));
++        if (cmd.startsWith("GET /")) {
++            // CWE-20/755 (CGP-9x7f-cpwh-f59q): validate the request-line
++            // delimiter offset BEFORE using it as a substring bound.  A
++            // malformed line with no space after the path (e.g. "GET /" or
++            // "GET /somepath") makes indexOf(' ', 5) return -1, and the raw
++            // cmd.substring(5, -1) would throw an internal unchecked
++            // StringIndexOutOfBoundsException that escapes doReply()/process()
++            // (bypassing the BadHttpRequest -> 400 contract and, historically,
++            // socket closure).  Guard the whole "missing delimiter" SHAPE, not
++            // one literal, and route it through the server's own error
++            // contract.  The guard lives at this single doReply implementation
++            // that every GET dispatch route (including AppletServer's override
++            // falling through to super.doReply) funnels through.
++            int sp = cmd.indexOf(' ', 5);
++            if (sp < 5)
++                throw new BadHttpRequest();
++            filename = urlName = cmd.substring(5, sp);
++        }
+         else
+             throw new BadHttpRequest();
+ 
+@@ -299,16 +321,28 @@ public class Webserver {
+         checkContained(file);
+         if (file.canRead()) {
+             sendHeader(out, file.length(), fileType);
++            // CWE-404/772 (CGP-9x7f-cpwh-f59q): release this doReply-local
++            // FileInputStream on EVERY exit path, including a mid-transfer
++            // client disconnect that makes out.write(...) throw.  The
++            // pre-existing process()-level finally closes in/out/clnt but
++            // cannot see this local `fin`, so it needs its own guarantee.  Only
++            // `fin` is closed here, never the shared `out`/`in` (owned by
++            // process() and still needed after doReply returns).  The close
++            // IOException is swallowed in finally so it cannot mask the primary
++            // in-body exception.
+             FileInputStream fin = new FileInputStream(file);
+-            byte[] filebuffer = new byte[4096];
+-            for (;;) {
+-                len = fin.read(filebuffer);
+-                if (len <= 0)
+-                    break;
+-                out.write(filebuffer, 0, len);
++            try {
++                byte[] filebuffer = new byte[4096];
++                for (;;) {
++                    len = fin.read(filebuffer);
++                    if (len <= 0)
++                        break;
++                    out.write(filebuffer, 0, len);
++                }
++            }
++            finally {
++                closeQuietly(fin);
+             }
+-
+-            fin.close();
+             return;
+         }
+ 
+@@ -319,19 +353,30 @@ public class Webserver {
+             InputStream fin
+                 = getClass().getResourceAsStream("/" + urlName);
+             if (fin != null) {
+-                ByteArrayOutputStream barray = new ByteArrayOutputStream();
+-                byte[] filebuffer = new byte[4096];
+-                for (;;) {
+-                    len = fin.read(filebuffer);
+-                    if (len <= 0)
+-                        break;
+-                    barray.write(filebuffer, 0, len);
++                // CWE-404/772 (CGP-9x7f-cpwh-f59q): release this doReply-local
++                // classpath InputStream on EVERY exit path, including a
++                // mid-transfer client disconnect that makes out.write(...)
++                // throw.  Only `fin` is closed here, never the shared
++                // `out`/`in` (owned by process()); the close IOException is
++                // swallowed in finally so it cannot mask the primary in-body
++                // exception.
++                try {
++                    ByteArrayOutputStream barray = new ByteArrayOutputStream();
++                    byte[] filebuffer = new byte[4096];
++                    for (;;) {
++                        len = fin.read(filebuffer);
++                        if (len <= 0)
++                            break;
++                        barray.write(filebuffer, 0, len);
++                    }
++
++                    byte[] classfile = barray.toByteArray();
++                    sendHeader(out, classfile.length, typeClass);
++                    out.write(classfile);
++                }
++                finally {
++                    closeQuietly(fin);
+                 }
+-
+-                byte[] classfile = barray.toByteArray();
+-                sendHeader(out, classfile.length, typeClass);
+-                out.write(classfile);
+-                fin.close();
+                 return;
+             }
+         }
+diff --git a/src/test/javassist/tools/web/WebserverResourceLeakExploitTest.java b/src/test/javassist/tools/web/WebserverResourceLeakExploitTest.java
+new file mode 100644
+index 0000000..50af7cb
+--- /dev/null
++++ b/src/test/javassist/tools/web/WebserverResourceLeakExploitTest.java
+@@ -0,0 +1,525 @@
++/*
++ * Regression tests for CGP-9x7f-cpwh-f59q
++ * (CWE-404 Improper Resource Shutdown or Release; related CWE-772/CWE-20/CWE-755)
++ * in javassist.tools.web.Webserver.
++ *
++ * Without the fix these tests fail; with it, every malformed request line is
++ * answered through the BadHttpRequest / "HTTP/1.0 400 Bad Request" contract and
++ * every resource opened while composing a reply is released on every exit
++ * path.
++ *
++ * Two invariants, each pinned as an assertion of the SECURE
++ * behaviour so that observing the vulnerability FAILS the run:
++ *
++ *  (1) Resource-release invariant (CWE-404/772): every FileInputStream /
++ *      classpath InputStream opened inside doReply() to compose a reply is
++ *      released on the exception path (a client disconnect mid-transfer). The
++ *      pre-existing process()-level finally cannot see these doReply-local
++ *      streams, so we drive doReply() DIRECTLY and observe the leaked file
++ *      descriptor via /proc/self/fd. A leak on the unpatched build => the FD
++ *      is still open after the aborted transfer => assertion fails.
++ *
++ *  (2) Input/exception-handling invariant (CWE-20/755): NO client-supplied
++ *      request line may cause an exception to escape process()/doReply() other
++ *      than through the defined BadHttpRequest -> 400 contract. A malformed
++ *      request line with no delimiter after the path (the documented "GET /",
++ *      AND any other value sharing that SHAPE) currently throws the internal
++ *      unchecked StringIndexOutOfBoundsException. We assert doReply throws
++ *      BadHttpRequest (not the unchecked exception), and that the full
++ *      process() path answers the client with 400 Bad Request.
++ */
++package javassist.tools.web;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
++
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.net.InetAddress;
++import java.net.InetSocketAddress;
++import java.net.ServerSocket;
++import java.net.Socket;
++import java.nio.file.Files;
++import java.nio.file.Paths;
++
++import org.junit.Test;
++
++public class WebserverResourceLeakExploitTest {
++
++    // ------------------------------------------------------------------
++    // Utilities
++    // ------------------------------------------------------------------
++
++    /**
++     * Counts the open file descriptors of THIS process whose symlink target
++     * contains {@code needle}. We use a delta (after - before) so an unrelated
++     * FD left open elsewhere in the same forked JVM cannot skew the result.
++     */
++    private static int countOpenFds(String needle) {
++        File dir = new File("/proc/self/fd");
++        File[] fds = dir.listFiles();
++        if (fds == null)
++            throw new IllegalStateException(
++                "/proc/self/fd unavailable; cannot observe the FD leak on this platform");
++        int count = 0;
++        for (File fd : fds) {
++            try {
++                String target = Files.readSymbolicLink(
++                        Paths.get(fd.getAbsolutePath())).toString();
++                if (target.contains(needle))
++                    count++;
++            } catch (IOException ignore) {
++                // fd closed between listing and reading; not our leak.
++            }
++        }
++        return count;
++    }
++
++    private static void closeQuietly(Webserver s) {
++        if (s != null) try { s.end(); } catch (Throwable ignore) { }
++    }
++
++    private static void closeQuietly(Socket s) {
++        if (s != null) try { s.close(); } catch (Throwable ignore) { }
++    }
++
++    private static void closeQuietly(ServerSocket s) {
++        if (s != null) try { s.close(); } catch (Throwable ignore) { }
++    }
++
++    /**
++     * An OutputStream that simulates a client that disconnects mid-transfer:
++     * the small header writes (all &lt;= 100 bytes) succeed, and the first
++     * body/classfile write (the large payload) throws IOException. This forces
++     * the exception path AFTER the file/classpath stream inside doReply() has
++     * been opened but BEFORE its close() call is reached.
++     */
++    private static final class DisconnectingOutputStream extends OutputStream {
++        private static final int BODY_THRESHOLD = 100;
++        int bodyWrites = 0;
++
++        @Override public void write(int b) throws IOException {
++            throw new IOException("client disconnected (single byte)");
++        }
++        @Override public void write(byte[] b) throws IOException {
++            if (b.length > BODY_THRESHOLD) {
++                bodyWrites++;
++                throw new IOException("client disconnected (payload write)");
++            }
++            // header write: accept.
++        }
++        @Override public void write(byte[] b, int off, int len) throws IOException {
++            if (len > BODY_THRESHOLD) {
++                bodyWrites++;
++                throw new IOException("client disconnected (body write)");
++            }
++        }
++        @Override public void flush() { }
++    }
++
++    private static long uniq = 0;
++
++    /**
++     * Creates a readable file whose NAME contains only characters that
++     * Webserver.checkFilename() accepts (Java-identifier parts, '.' and '/'),
++     * so the request reaches the FileInputStream sink rather than being
++     * rejected as a bad filename. The name is made unique per call so
++     * per-test FD counting (which matches on the file name) does not collide
++     * across methods in the same forked JVM.
++     */
++    private static File createServableFile(int size) throws IOException {
++        File dir = Files.createTempDirectory("cgp9x7fdir").toFile();
++        dir.deleteOnExit();
++        String name = "probe" + (uniq++) + "file.gif"; // only valid chars
++        File tmp = new File(dir, name);
++        tmp.deleteOnExit();
++        try (FileOutputStream fos = new FileOutputStream(tmp)) {
++            fos.write(new byte[size]);
++        }
++        return tmp;
++    }
++
++    // ==================================================================
++    // Invariant (2): malformed request-line SHAPE must be handled through
++    // the BadHttpRequest / 400 contract, never via an escaped unchecked
++    // exception.
++    // ==================================================================
++
++    /** Documented payload, verbatim: "GET /". */
++    @Test
++    public void malformedLine_documentedPayload_isBadHttpRequest_notUnchecked()
++            throws Exception {
++        assertMalformedLineRejectedCleanly("GET /");
++    }
++
++    /**
++     * Non-literal variant sharing the SAME "no delimiter after the path"
++     * shape (cmd.indexOf(' ', 5) == -1). Proves the invariant is about the
++     * whole malformed-line SHAPE, not the single quoted string: a fix that
++     * only special-cases "GET /" still fails here.
++     */
++    @Test
++    public void malformedLine_nonLiteralVariant_isBadHttpRequest_notUnchecked()
++            throws Exception {
++        assertMalformedLineRejectedCleanly("GET /somepath");
++    }
++
++    private void assertMalformedLineRejectedCleanly(String cmd) throws Exception {
++        Webserver server = new Webserver(0);
++        try {
++            InputStream in = new ByteArrayInputStream(new byte[0]);
++            OutputStream out = new ByteArrayOutputStream();
++            try {
++                server.doReply(in, out, cmd);
++                fail("doReply(\"" + cmd + "\") returned normally; a malformed "
++                     + "request line must be rejected as BadHttpRequest.");
++            } catch (BadHttpRequest expected) {
++                // Correct: the malformed line was classified through the
++                // server's own error contract.
++            } catch (RuntimeException unchecked) {
++                // On the unpatched build this is StringIndexOutOfBoundsException
++                // escaping doReply() -- an internal unchecked exception used as
++                // the "handling" mechanism, which then escapes process() and
++                // (before the fix) skipped socket closure.
++                fail("VULNERABLE (CWE-20/755, CGP-9x7f-cpwh-f59q): malformed "
++                     + "request line \"" + cmd + "\" caused an internal "
++                     + "unchecked exception to escape doReply() instead of "
++                     + "being classified as BadHttpRequest: " + unchecked);
++            }
++        } finally {
++            closeQuietly(server);
++        }
++    }
++
++    /**
++     * End-to-end through the REAL runtime path: run()/ServiceThread ->
++     * process(Socket) -> doReply(). A client sending the documented malformed
++     * line "GET /" must receive a "HTTP/1.0 400 Bad Request" reply. On the
++     * unpatched build the StringIndexOutOfBoundsException escapes doReply()
++     * (the inner catch only handles BadHttpRequest), propagates past
++     * out.flush() and out of process(), so the client receives NOTHING.
++     */
++    @Test
++    public void malformedLine_fullProcessPath_clientGets400() throws Exception {
++        ServerSocket listener = new ServerSocket(0);
++        int port = listener.getLocalPort();
++        final Webserver server = new Webserver(0);
++        Socket client = null;
++        Socket accepted = null;
++        try {
++            client = new Socket();
++            client.connect(new InetSocketAddress(
++                    InetAddress.getLoopbackAddress(), port), 2000);
++            accepted = listener.accept();
++
++            final Socket serverSide = accepted;
++            final Throwable[] escaped = new Throwable[1];
++            Thread worker = new Thread(new Runnable() {
++                public void run() {
++                    try {
++                        server.process(serverSide);
++                    } catch (Throwable t) {
++                        escaped[0] = t;
++                    }
++                }
++            }, "cgp9x7f-process");
++            worker.setDaemon(true);
++            worker.start();
++
++            OutputStream cout = client.getOutputStream();
++            cout.write("GET /\r\n\r\n".getBytes("US-ASCII"));
++            cout.flush();
++
++            client.setSoTimeout(4000);
++            InputStream cin = client.getInputStream();
++            ByteArrayOutputStream resp = new ByteArrayOutputStream();
++            byte[] buf = new byte[256];
++            try {
++                int n;
++                while ((n = cin.read(buf)) > 0) {
++                    resp.write(buf, 0, n);
++                    if (resp.size() > 16) break;
++                }
++            } catch (IOException ignore) {
++                // socket closed / reset with no reply written -> the escaped
++                // unchecked exception path.
++            }
++            worker.join(4000);
++
++            String reply = new String(resp.toByteArray(), "US-ASCII");
++            assertTrue("VULNERABLE (CWE-20/755, CGP-9x7f-cpwh-f59q): the "
++                    + "malformed request line \"GET /\" did not produce a "
++                    + "400 Bad Request reply; the client received "
++                    + (reply.isEmpty() ? "NOTHING" : ("\"" + reply + "\""))
++                    + " (an internal exception escaped process() instead of "
++                    + "the server's error contract; escaped=" + escaped[0]
++                    + ")",
++                    reply.startsWith("HTTP/1.0 400"));
++        } finally {
++            closeQuietly(client);
++            closeQuietly(accepted);
++            closeQuietly(listener);
++            closeQuietly(server);
++        }
++    }
++
++    // ==================================================================
++    // Invariant (1): resource release on the exception path for the two
++    // doReply-local streams. Driven at the doReply() level directly so the
++    // unrelated process()-level finally cannot mask the leak.
++    // ==================================================================
++
++    /**
++     * Disk-file branch: a real readable file inside the servable root is
++     * served, but the client disconnects during the body write. The
++     * FileInputStream opened by doReply() must be closed on that exception
++     * path. On the unpatched build it leaks (its FD stays open).
++     */
++    @Test
++    public void diskFileStream_leaksOnMidTransferDisconnect() throws Exception {
++        Webserver server = new Webserver(0);
++        File file = createServableFile(8192);
++        String needle = file.getName();
++        try {
++            server.htmlfileBase = file.getParentFile().getCanonicalPath() + "/";
++            String cmd = "GET /" + needle + " HTTP/1.0";
++
++            int before = countOpenFds(needle);
++            InputStream in = new ByteArrayInputStream(new byte[0]);
++            DisconnectingOutputStream out = new DisconnectingOutputStream();
++            try {
++                server.doReply(in, out, cmd);
++            } catch (IOException expectedDisconnect) {
++                // expected: the client "went away" mid-transfer.
++            }
++            assertTrue("test setup: the body write must have been reached "
++                    + "(the disconnect must occur AFTER the file stream is "
++                    + "opened)", out.bodyWrites >= 1);
++
++            int after = countOpenFds(needle);
++            int leaked = after - before;
++            assertEquals("VULNERABLE (CWE-404/772, CGP-9x7f-cpwh-f59q): the "
++                    + "FileInputStream opened in doReply() for the disk-file "
++                    + "transfer was NOT closed when the client disconnected "
++                    + "mid-transfer (leaked file descriptors=" + leaked + ")",
++                    0, leaked);
++        } finally {
++            closeQuietly(server);
++            file.delete();
++        }
++    }
++
++    /**
++     * Classpath-fallback branch: a ".class" resource not found on disk under
++     * the root is served from the classpath (getResourceAsStream), but the
++     * client disconnects during the classfile write. That InputStream must be
++     * closed on the exception path. On the unpatched build it leaks.
++     */
++    @Test
++    public void classpathStream_leaksOnMidTransferDisconnect() throws Exception {
++        Webserver server = new Webserver(0);
++        // classPool == null (default) => letUsersSendClassfile returns false.
++        // htmlfileBase == null => base is the CWD; the requested .class is not
++        // present there, so doReply falls through to the classpath resource.
++        String needle = "BadHttpRequest.class";
++        String urlName = "javassist/tools/web/" + needle;
++        try {
++            String cmd = "GET /" + urlName + " HTTP/1.0";
++
++            int before = countOpenFds(needle);
++            InputStream in = new ByteArrayInputStream(new byte[0]);
++            DisconnectingOutputStream out = new DisconnectingOutputStream();
++            try {
++                server.doReply(in, out, cmd);
++            } catch (IOException expectedDisconnect) {
++                // expected: client went away during the classfile write.
++            }
++            assertTrue("test setup: the classfile write must have been reached",
++                    out.bodyWrites >= 1);
++
++            int after = countOpenFds(needle);
++            int leaked = after - before;
++            assertEquals("VULNERABLE (CWE-404/772, CGP-9x7f-cpwh-f59q): the "
++                    + "classpath InputStream opened in doReply() "
++                    + "(getResourceAsStream) was NOT closed when the client "
++                    + "disconnected mid-transfer (leaked file descriptors="
++                    + leaked + ")",
++                    0, leaked);
++        } finally {
++            closeQuietly(server);
++        }
++    }
++
++    /**
++     * DoS / accumulation: the OSV impact is FD exhaustion under repeated
++     * abuse, not a single-shot leak. Repeat the disk-file mid-transfer abort N
++     * times and assert the process does not accumulate open descriptors. On
++     * the unpatched build the count grows by ~N.
++     */
++    @Test
++    public void repeatedMidTransferDisconnects_doNotAccumulateFds()
++            throws Exception {
++        final int N = 40;
++        Webserver server = new Webserver(0);
++        File file = createServableFile(8192);
++        String needle = file.getName();
++        try {
++            server.htmlfileBase = file.getParentFile().getCanonicalPath() + "/";
++            String cmd = "GET /" + needle + " HTTP/1.0";
++
++            int before = countOpenFds(needle);
++            for (int i = 0; i < N; i++) {
++                InputStream in = new ByteArrayInputStream(new byte[0]);
++                DisconnectingOutputStream out = new DisconnectingOutputStream();
++                try {
++                    server.doReply(in, out, cmd);
++                } catch (IOException expectedDisconnect) {
++                    // expected each iteration.
++                }
++            }
++            int after = countOpenFds(needle);
++            int leaked = after - before;
++            assertTrue("VULNERABLE (CWE-404/772/770, CGP-9x7f-cpwh-f59q): "
++                    + N + " aborted mid-transfer requests leaked " + leaked
++                    + " file descriptors (repeated abuse exhausts the FD "
++                    + "limit -> denial of service). A correct fix keeps this "
++                    + "at 0.",
++                    leaked == 0);
++        } finally {
++            closeQuietly(server);
++            file.delete();
++        }
++    }
++
++    // ==================================================================
++    // Preservation / positive controls: the fix must NOT break legitimate
++    // request handling. Each drives a WELL-FORMED GET that completes normally
++    // and asserts (i) the served bytes/headers are correct and (ii) the
++    // doReply-local stream was closed EXACTLY once on the success path -- not
++    // leaked, and not over-eagerly double-closed by the new finally.
++    // ==================================================================
++
++    /**
++     * Legitimate on-disk GET served completely: correct Content-Length and
++     * body, and the FileInputStream opened in doReply() closed exactly once
++     * (no leaked FD after a successful transfer).
++     */
++    @Test
++    public void legitimateDiskFileGet_servedAndStreamClosed() throws Exception {
++        Webserver server = new Webserver(0);
++        File file = createServableFile(4096);
++        String needle = file.getName();
++        try {
++            server.htmlfileBase = file.getParentFile().getCanonicalPath() + "/";
++            String cmd = "GET /" + needle + " HTTP/1.0";
++
++            int before = countOpenFds(needle);
++            InputStream in = new ByteArrayInputStream(new byte[0]);
++            ByteArrayOutputStream out = new ByteArrayOutputStream();
++            server.doReply(in, out, cmd);
++            int after = countOpenFds(needle);
++
++            String reply = new String(out.toByteArray(), "US-ASCII");
++            assertTrue("legitimate on-disk GET must return 200 OK; got: "
++                    + reply, reply.startsWith("HTTP/1.0 200 OK"));
++            assertTrue("legitimate on-disk GET must send Content-Length: 4096",
++                    reply.contains("Content-Length: 4096"));
++            assertEquals("the FileInputStream must close exactly once on the "
++                    + "success path (no leak, no double-close)",
++                    before, after);
++        } finally {
++            closeQuietly(server);
++            file.delete();
++        }
++    }
++
++    /**
++     * Legitimate classpath-fallback GET served completely: a real .class
++     * resource resolved via getResourceAsStream is served with correct bytes and the
++     * classpath InputStream closed exactly once on success.
++     */
++    @Test
++    public void legitimateClasspathGet_servedAndStreamClosed() throws Exception {
++        Webserver server = new Webserver(0);
++        // classPool == null (default) and htmlfileBase == null => the .class
++        // is not on disk under CWD, so doReply falls through to the classpath
++        // resource, which exists (this test class's own package ships it).
++        String needle = "BadHttpRequest.class";
++        String urlName = "javassist/tools/web/" + needle;
++        try {
++            String cmd = "GET /" + urlName + " HTTP/1.0";
++
++            int before = countOpenFds(needle);
++            InputStream in = new ByteArrayInputStream(new byte[0]);
++            ByteArrayOutputStream out = new ByteArrayOutputStream();
++            server.doReply(in, out, cmd);
++            int after = countOpenFds(needle);
++
++            String reply = new String(out.toByteArray(), "US-ASCII");
++            assertTrue("legitimate classpath GET must return 200 OK; got: "
++                    + reply, reply.startsWith("HTTP/1.0 200 OK"));
++            assertTrue("legitimate classpath GET must carry the class-file "
++                    + "content type", reply.contains(
++                    "Content-Type: application/octet-stream"));
++            assertEquals("the classpath InputStream must close exactly once on "
++                    + "the success path (no leak, no double-close)",
++                    before, after);
++        } finally {
++            closeQuietly(server);
++        }
++    }
++
++    /**
++     * AppletServer's doReply() override falls through to super.doReply() for an
++     * ordinary GET; the guarded parse + stream-lifecycle fix in the single
++     * Webserver.doReply() implementation must keep serving that fallthrough
++     * path polymorphically, and must still route a malformed line through the
++     * BadHttpRequest contract (not an escaped unchecked exception).
++     */
++    @Test
++    public void appletServerFallthrough_servesGetAndRejectsMalformed()
++            throws Exception {
++        File file = createServableFile(2048);
++        String needle = file.getName();
++        javassist.tools.rmi.AppletServer server =
++                new javassist.tools.rmi.AppletServer(0);
++        try {
++            server.htmlfileBase = file.getParentFile().getCanonicalPath() + "/";
++
++            // (a) well-formed GET fallthrough still serves and closes.
++            int before = countOpenFds(needle);
++            InputStream in = new ByteArrayInputStream(new byte[0]);
++            ByteArrayOutputStream out = new ByteArrayOutputStream();
++            server.doReply(in, out, "GET /" + needle + " HTTP/1.0");
++            int after = countOpenFds(needle);
++            String reply = new String(out.toByteArray(), "US-ASCII");
++            assertTrue("AppletServer GET fallthrough must still serve the file; "
++                    + "got: " + reply, reply.startsWith("HTTP/1.0 200 OK"));
++            assertEquals("AppletServer fallthrough must close its stream once",
++                    before, after);
++
++            // (b) malformed line through the override's fallthrough is routed
++            // through the SAME single guarded doReply -> BadHttpRequest.
++            try {
++                server.doReply(new ByteArrayInputStream(new byte[0]),
++                        new ByteArrayOutputStream(), "GET /");
++                fail("AppletServer fallthrough must reject a malformed line as "
++                        + "BadHttpRequest");
++            } catch (BadHttpRequest expected) {
++                // correct
++            } catch (RuntimeException unchecked) {
++                fail("AppletServer fallthrough leaked an unchecked exception "
++                        + "for a malformed line: " + unchecked);
++            }
++        } finally {
++            try { server.end(); } catch (Throwable ignore) { }
++            file.delete();
++        }
++    }
++}
+-- 
+2.55.0
+

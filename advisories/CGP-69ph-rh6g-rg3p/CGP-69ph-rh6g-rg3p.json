@@ -1,0 +1,48 @@
+{
+  "id": "CGP-69ph-rh6g-rg3p",
+  "schema_version": "1.6.0",
+  "summary": "Non-constant-time password comparison in AbstractPasswordFilePrincipalDatabase enables timing side-channel credential recovery",
+  "details": "### Root Cause\n\n`AbstractPasswordFilePrincipalDatabase.compareCharArray(char[], char[])` (line 140, `broker-core/src/main/java/org/apache/qpid/server/security/auth/database/AbstractPasswordFilePrincipalDatabase.java`) implements password comparison with an early-exit loop:\n\n```java\nprotected boolean compareCharArray(char[] a, char[] b) {\n    ...\n    while (equal && index < a.length) {\n        equal = a[index] == b[index];\n        index++;\n    }\n    ...\n}\n```\n\nThe loop exits immediately when `equal` becomes `false` (i.e., on the first mismatching character). This causes the comparison to complete faster for passwords that differ at an earlier position, leaking information about the stored password through response timing.\n\nThis method is called in two contexts:\n\n1. **PlainPasswordFilePrincipalDatabase.verifyPassword()** (line 103): compares the stored plaintext password against the attacker-supplied password. The stored value is the raw plaintext, so a timing attack can in principle recover the password one character at a time.\n2. **Base64MD5PasswordFilePrincipalDatabase.verifyPassword()** (line 106): compares an unsalted MD5 digest of the stored password against an MD5 digest of the attacker-supplied password. The comparison is over digest bytes, which is harder to exploit due to the non-linear relationship between input and digest, but the comparison itself is still non-constant-time.\n\n### Affected Locations\n\n- `org.apache.qpid.server.security.auth.database.AbstractPasswordFilePrincipalDatabase.compareCharArray(char[], char[])` at lines 140–155 of `broker-core/src/main/java/org/apache/qpid/server/security/auth/database/AbstractPasswordFilePrincipalDatabase.java`: the non-constant-time comparison sink, called by both `PlainPasswordFilePrincipalDatabase` and `Base64MD5PasswordFilePrincipalDatabase`.\n\n### Attack Vectors\n\n**Vector 1 — Timing side-channel against PlainPasswordFile provider:**\nA remote attacker sends many SASL PLAIN authentication attempts with varying password prefixes and measures the response time for each. Because `compareCharArray` exits on the first mismatch, a password that matches the first N characters of the stored plaintext takes longer to compare than one that mismatches at position 0. By iterating over candidate characters at each position, the attacker can recover the stored plaintext password one character at a time. Network jitter makes practical exploitation difficult (AC:H), but the attack is feasible in low-latency or co-located environments.\n\n**Vector 2 — Timing side-channel against Base64MD5PasswordFile provider:**\nThe same early-exit comparison is used when verifying MD5 digests. The non-linear relationship between plaintext and MD5 digest makes direct character-by-character recovery infeasible, but the non-constant-time comparison still leaks information about digest byte values, which could assist in distinguishing candidate passwords.\n\n### Impact\n\nA remote, unauthenticated attacker can in principle recover stored plaintext passwords from the PlainPasswordFile authentication provider via a timing side-channel attack. The attack requires high-precision timing measurements and many authentication attempts (AC:H). Confidentiality of stored credentials is at risk.\n\n### Trace\n\n1. Attacker sends SASL PLAIN authentication request with candidate password\n2. `PlainNegotiator.handleResponse` → `PrincipalDatabaseAuthenticationManager.authenticate`\n3. `PlainPasswordFilePrincipalDatabase.verifyPassword(principal, password)` → `compareCharArray(storedPlaintext, suppliedPassword)`\n4. Early-exit loop terminates on first mismatch — response time varies with position of first differing character\n5. Attacker measures response time and iterates to recover password character by character",
+  "severity": [
+    {
+      "type": "CVSS_V3",
+      "score": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:N/A:N/E:X/RL:X/RC:R"
+    }
+  ],
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Maven",
+        "name": "org.apache.qpid:qpid-broker-core",
+        "purl": "pkg:maven/org.apache.qpid/qpid-broker-core"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "10.0.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "cwe_ids": [
+          "CWE-208"
+        ],
+        "sink_locator": [
+          {
+            "class": "org.apache.qpid.server.security.auth.database.AbstractPasswordFilePrincipalDatabase",
+            "method": "compareCharArray(char[],char[])",
+            "file_line": "broker-core/src/main/java/org/apache/qpid/server/security/auth/database/AbstractPasswordFilePrincipalDatabase.java:140-155"
+          }
+        ]
+      }
+    }
+  ],
+  "published": "2026-11-12T16:00:00Z",
+  "modified": "2026-11-12T16:00:00Z"
+}

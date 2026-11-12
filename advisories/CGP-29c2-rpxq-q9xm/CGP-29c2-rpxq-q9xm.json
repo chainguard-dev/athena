@@ -1,0 +1,48 @@
+{
+  "id": "CGP-29c2-rpxq-q9xm",
+  "schema_version": "1.6.0",
+  "summary": "AbstractFileSource path containment check uses startsWith() without a separator, allowing sibling-directory escape in WireMock file operations.",
+  "details": "### Root Cause\n\n`AbstractFileSource.assertFilePathIsUnderRoot(String path)` (lines 150–166 of `AbstractFileSource.java`) performs the following check:\n\n```java\nString rootPath = rootDirectory.getCanonicalPath();\nString filePath = file.isAbsolute() ?\n    new File(path).getCanonicalPath() :\n    new File(rootDirectory, path).getCanonicalPath();\nif (!filePath.startsWith(rootPath)) {\n    throw new NotAuthorisedException(...);\n}\n```\n\nBoth paths are canonicalised, which correctly defeats `../` traversal sequences. However, the containment check uses `String.startsWith(rootPath)` without appending a file separator character (`/` or the platform separator). As a result, a sibling directory whose name shares the root directory name as a prefix passes the check:\n\n- Root: `/opt/wiremock/__files`\n- Sibling: `/opt/wiremock/__files-archive`\n- Check: `\"/opt/wiremock/__files-archive/secret.txt\".startsWith(\"/opt/wiremock/__files\")` → `true` (incorrectly passes)\n\nThis check guards all file access operations in `AbstractFileSource`:\n- `getBinaryFileNamed(String)` and `getTextFileNamed(String)` — read operations used when serving stub body files\n- `writableFileFor(String)` — called by `writeTextFile()`, `writeBinaryFile()`, and `deleteFile()` — write and delete operations\n\nThe `bodyFileName` field in stub mappings (set via the admin API) and the rendered `filePathTemplate` in `ResponseTemplateTransformer` (when response templating is enabled) both flow into `getBinaryFileNamed()`. The `PUT /__admin/files/{name}` endpoint and recorder snapshot feature flow into `writeBinaryFile()`/`writeTextFile()`.\n\n### Affected Locations\n\n- `com.github.tomakehurst.wiremock.common.AbstractFileSource.assertFilePathIsUnderRoot(String)` (lines 150–166): the flawed containment check that guards all read and write operations.\n- `com.github.tomakehurst.wiremock.common.AbstractFileSource.getBinaryFileNamed(String)` (line 42): calls `assertFilePathIsUnderRoot` before constructing a `BinaryFile` — read path.\n- `com.github.tomakehurst.wiremock.common.AbstractFileSource.getTextFileNamed(String)` (line 48): calls `assertFilePathIsUnderRoot` before constructing a `TextFile` — read path.\n- `com.github.tomakehurst.wiremock.common.AbstractFileSource.writableFileFor(String)` (line 113): calls `assertFilePathIsUnderRoot` before returning a writable `File` — write/delete path.\n\n### Attack Vectors\n\n**Sibling-directory read via bodyFileName:** An attacker registers a stub mapping (via the unauthenticated admin API) with `bodyFileName` set to a path that resolves into a sibling directory sharing the `__files` prefix (e.g. `../wiremock/__files-archive/sensitive.json`). When a request matches the stub, WireMock reads the file from the sibling directory and returns its contents as the response body.\n\n**Sibling-directory write via PUT /__admin/files/{name}:** An attacker sends `PUT /__admin/files/../__files-archive/injected.txt` (or a name that after canonicalisation resolves into the sibling directory). WireMock writes the supplied content to the sibling directory.\n\n**Templated bodyFileName (response templating enabled):** When response templating is active, the `bodyFileName` field is rendered as a Handlebars template. An attacker can craft a stub where the rendered path escapes into a sibling directory.\n\n### Impact\n\nAn attacker who can reach the admin API (unauthenticated by default) can read files from sibling directories that share the `__files` directory name as a prefix, and write or delete files in those sibling directories. Practical exploitation requires a sibling directory with a matching name prefix to exist on the filesystem, which limits real-world impact but represents a classic CWE-22 boundary failure.\n\n### Trace\n\n`bodyFileName` in stub mapping JSON (admin API) or templated `filePathTemplate` → `AbstractFileSource.getBinaryFileNamed(name)` → `assertFilePathIsUnderRoot(name)`: `filePath.startsWith(rootPath)` passes for sibling-prefix directories → `new BinaryFile(new File(rootDirectory, name).toURI())` reads file outside intended root",
+  "severity": [
+    {
+      "type": "CVSS_V3",
+      "score": "CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:N/E:X/RL:X/RC:R"
+    }
+  ],
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Maven",
+        "name": "com.github.tomakehurst:wiremock-standalone",
+        "purl": "pkg:maven/com.github.tomakehurst/wiremock-standalone"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "2.16.0"
+            },
+            {
+              "fixed": "3.0.0-beta-1"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "cwe_ids": [
+          "CWE-22"
+        ],
+        "sink_locator": [
+          {
+            "class": "com.github.tomakehurst.wiremock.common.AbstractFileSource",
+            "method": "assertFilePathIsUnderRoot(String)",
+            "file_line": "src/main/java/com/github/tomakehurst/wiremock/common/AbstractFileSource.java:150-166"
+          }
+        ]
+      }
+    }
+  ],
+  "published": "2026-11-12T16:00:00Z",
+  "modified": "2026-11-12T16:00:00Z"
+}

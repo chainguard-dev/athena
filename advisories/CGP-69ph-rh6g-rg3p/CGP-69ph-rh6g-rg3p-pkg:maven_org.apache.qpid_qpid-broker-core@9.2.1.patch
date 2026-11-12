@@ -1,0 +1,718 @@
+From 3695c63dd85f4f4a6f98ae0cd04462187aaa04f2 Mon Sep 17 00:00:00 2001
+From: Vuln Patch Pipeline <vuln-patch@chainguard.dev>
+Date: Thu, 22 Oct 2026 18:48:07 +0000
+Subject: [PATCH] Compare password-file passwords in constant time
+
+AbstractPasswordFilePrincipalDatabase.compareCharArray, which the
+password-file principal databases use to check a supplied password
+against the stored one, returned as soon as the lengths differed and
+stopped at the first differing character (CWE-208, CWE-697). The time a
+failed login took therefore depended on how much of the stored password
+the guess matched and on whether its length was right, which lets an
+attacker recover the password one character at a time.
+
+compareCharArray now accumulates the differences across every
+character of the stored value and folds a length mismatch into the
+same result, so it does the same work and takes no early exit whatever
+the supplied password is. An empty supplied password is compared
+against the stored value itself, so it still does the full scan and is
+still refused. The result of every comparison is unchanged: equal
+passwords match and every other input is refused.
+
+Adds PasswordFilePrincipalDatabaseTimingTest.
+
+Cgp-Finding: CGP-69ph-rh6g-rg3p
+---
+ ...AbstractPasswordFilePrincipalDatabase.java |  61 +-
+ ...sswordFilePrincipalDatabaseTimingTest.java | 603 ++++++++++++++++++
+ 2 files changed, 654 insertions(+), 10 deletions(-)
+ create mode 100644 broker-core/src/test/java/org/apache/qpid/server/security/auth/database/PasswordFilePrincipalDatabaseTimingTest.java
+
+diff --git a/broker-core/src/main/java/org/apache/qpid/server/security/auth/database/AbstractPasswordFilePrincipalDatabase.java b/broker-core/src/main/java/org/apache/qpid/server/security/auth/database/AbstractPasswordFilePrincipalDatabase.java
+index a9dc86e2a..191f59ba2 100644
+--- a/broker-core/src/main/java/org/apache/qpid/server/security/auth/database/AbstractPasswordFilePrincipalDatabase.java
++++ b/broker-core/src/main/java/org/apache/qpid/server/security/auth/database/AbstractPasswordFilePrincipalDatabase.java
+@@ -136,20 +136,61 @@ public abstract class AbstractPasswordFilePrincipalDatabase<U extends PasswordPr
+         }
+     }
+ 
++    /**
++     * Compares a stored password (or password digest) with a supplied one. The comparison takes time that depends
++     * only on the length of the stored operand: it neither stops at the first differing character nor returns
++     * early when the lengths differ, so its running time does not reveal how much of the stored value a candidate
++     * matches.
++     *
++     * @param a the stored password or digest
++     * @param b the supplied password or digest
++     *
++     * @return true if both arrays have the same length and contain the same characters
++     */
+     protected boolean compareCharArray(char[] a, char[] b)
+     {
+-        boolean equal = false;
+-        if (a.length == b.length)
++        return constantTimeEquals(a, b);
++    }
++
++    /**
++     * Compares a stored secret with a supplied candidate without an early exit. The loop always runs over the full
++     * length of the stored operand, accumulates the differences of the full 16-bit characters without branching on
++     * them, and folds the length difference into the verdict instead of returning early on it.
++     *
++     * @param stored   the stored secret; its length bounds the amount of work done
++     * @param supplied the candidate to check, typically attacker supplied
++     *
++     * @return true if both arrays have the same length and contain the same characters
++     */
++    private static boolean constantTimeEquals(final char[] stored, final char[] supplied)
++    {
++        final int storedLength = stored.length;
++        final int suppliedLength = supplied.length;
++        // An empty candidate is scanned against the stored secret itself so that the loop below still runs over
++        // the full stored length; the length term keeps the verdict false.
++        final char[] other = suppliedLength == 0 ? stored : supplied;
++        final int otherLength = other.length;
++        int difference = storedLength ^ suppliedLength;
++        for (int i = 0; i < storedLength; i++)
+         {
+-            equal = true;
+-            int index = 0;
+-            while (equal && index < a.length)
+-            {
+-                equal = a[index] == b[index];
+-                index++;
+-            }
++            difference |= stored[i] ^ other[candidateIndex(i, otherLength)];
+         }
+-        return equal;
++        return difference == 0;
++    }
++
++    /**
++     * Returns {@code i} when {@code i < length} and {@code 0} otherwise, without a branch, so that indexing the
++     * supplied operand never reads past its end while the scan runs over the stored operand's full length.
++     *
++     * @param i      the current position in the stored operand, never negative
++     * @param length the length of the operand being read (the supplied one, or the stored one when the supplied
++     *               one is empty), greater than zero whenever this method is called
++     *
++     * @return the position to read in the supplied operand
++     */
++    private static int candidateIndex(final int i, final int length)
++    {
++        return ((i - length) >>> 31) * i;
+     }
+ 
+     /**
+diff --git a/broker-core/src/test/java/org/apache/qpid/server/security/auth/database/PasswordFilePrincipalDatabaseTimingTest.java b/broker-core/src/test/java/org/apache/qpid/server/security/auth/database/PasswordFilePrincipalDatabaseTimingTest.java
+new file mode 100644
+index 000000000..0ec72951e
+--- /dev/null
++++ b/broker-core/src/test/java/org/apache/qpid/server/security/auth/database/PasswordFilePrincipalDatabaseTimingTest.java
+@@ -0,0 +1,603 @@
++/*
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied.  See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ *
++ */
++package org.apache.qpid.server.security.auth.database;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.junit.jupiter.api.Assertions.fail;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++import java.io.BufferedWriter;
++import java.io.File;
++import java.io.FileWriter;
++import java.io.IOException;
++import java.lang.reflect.Method;
++import java.lang.reflect.Modifier;
++import java.nio.charset.StandardCharsets;
++import java.security.MessageDigest;
++import java.security.NoSuchAlgorithmException;
++import java.security.Principal;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.Base64;
++import java.util.List;
++import java.util.Random;
++
++import javax.security.auth.login.AccountNotFoundException;
++
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import org.apache.qpid.server.model.PasswordCredentialManagingAuthenticationProvider;
++import org.apache.qpid.server.security.auth.UsernamePrincipal;
++import org.apache.qpid.server.security.auth.manager.AbstractScramAuthenticationManager;
++import org.apache.qpid.server.security.auth.sasl.SaslNegotiator;
++import org.apache.qpid.server.security.auth.sasl.SaslSettings;
++import org.apache.qpid.test.utils.UnitTestBase;
++
++/**
++ * Regression tests for CGP-69ph-rh6g-rg3p (CWE-208, observable timing discrepancy, and CWE-697, incorrect
++ * comparison): {@link AbstractPasswordFilePrincipalDatabase#compareCharArray(char[], char[])}, the password
++ * comparison reached from {@link PlainPasswordFilePrincipalDatabase#verifyPassword(String, char[])} and
++ * {@link Base64MD5PasswordFilePrincipalDatabase#verifyPassword(String, char[])} and inherited by any subclass,
++ * must take an amount of time that depends only on the length of the stored operand. It must not depend on the
++ * position of the first differing character, on how many leading characters of the candidate match, on whether the
++ * candidate matches at all, or on the candidate's length (shorter, longer, empty).
++ * <p>
++ * The timing tests use a stored secret of several million characters so that an early-exit comparison (a single
++ * iteration, or none on a length mismatch) and a full-width comparison (millions of iterations) differ by orders of
++ * magnitude, far above JIT, GC and timer noise. Each test measures several candidate classes in interleaved rounds
++ * after a warm-up, takes the median per class, and fails when any class is materially faster than the slowest one.
++ * Every measured call also asserts its verdict, so a fix that changes a verdict fails too.
++ * <p>
++ * The verdict tests are positive controls that hold before and after the fix: they pin the exact, full-width,
++ * full-length verdict that any constant-time comparison must preserve (prefix-sharing, strict prefix/extension,
++ * zero padding, high-byte-only and unpaired-surrogate differences, non-ASCII and non-BMP exact matches, empty,
++ * identical-reference and null operands, the sign-extended Base64 MD5 digest round trip) and the protected,
++ * non-final signature of the method that subclasses inherit.
++ */
++public class PasswordFilePrincipalDatabaseTimingTest extends UnitTestBase
++{
++    /** Length of the stored secret used by the timing tests. */
++    private static final int SECRET_LENGTH = 1 << 22;
++
++    /** Number of un-measured invocations per candidate before measuring (JIT warm-up). */
++    private static final int WARM_UP_ROUNDS = 5;
++
++    /** Number of measured invocations per candidate. */
++    private static final int MEASURED_ROUNDS = 21;
++
++    /** A candidate class whose median time is this many times smaller than the slowest one is a timing oracle. */
++    private static final long MAX_TIMING_RATIO = 10;
++
++    /** Name of the user holding the long secret in the timing tests. */
++    private static final String TIMING_USER = "timingUser";
++
++    /** Characters used for the generated plaintext secret; deliberately excludes the password-file separator ':'. */
++    private static final char[] SECRET_ALPHABET =
++            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".toCharArray();
++
++    private final List<File> _passwordFiles = new ArrayList<>();
++    private PasswordCredentialManagingAuthenticationProvider<?> _authenticationProvider;
++    private PlainPasswordFilePrincipalDatabase _plainDatabase;
++    private Base64MD5PasswordFilePrincipalDatabase _md5Database;
++    private char[] _secret;
++    private int _verdictUsers;
++    private volatile int _sink;
++
++    /**
++     * Creates the databases under test and a long, deterministic plaintext secret.
++     */
++    @BeforeEach
++    public void setUp()
++    {
++        _authenticationProvider = mock(PasswordCredentialManagingAuthenticationProvider.class);
++        when(_authenticationProvider.getContextValue(Integer.class,
++                AbstractScramAuthenticationManager.QPID_AUTHMANAGER_SCRAM_ITERATION_COUNT)).thenReturn(4096);
++        _plainDatabase = new PlainPasswordFilePrincipalDatabase(_authenticationProvider);
++        _md5Database = new Base64MD5PasswordFilePrincipalDatabase(_authenticationProvider);
++
++        final Random random = new Random(0x5EC12E7L);
++        _secret = new char[SECRET_LENGTH];
++        for (int i = 0; i < _secret.length; i++)
++        {
++            _secret[i] = SECRET_ALPHABET[random.nextInt(SECRET_ALPHABET.length)];
++        }
++    }
++
++    /**
++     * Deletes the password files created by the test.
++     */
++    @AfterEach
++    public void tearDown()
++    {
++        for (final File file : _passwordFiles)
++        {
++            final File old = new File(file.getAbsolutePath() + ".old");
++            if (old.exists())
++            {
++                old.delete();
++            }
++            file.delete();
++        }
++        _secret = null;
++    }
++
++    // ******* Timing tests (CWE-208): each must fail on the unpatched tree ********** //
++
++    /**
++     * Position oracle in compareCharArray: a candidate wrong at its first character, or in the middle, must not be
++     * compared materially faster than one wrong only at its last character or than the exact match.
++     */
++    @Test
++    public void testCompareCharArrayTimingIsIndependentOfMismatchPosition() throws Exception
++    {
++        assertTimingIndependentOfCandidate("AbstractPasswordFilePrincipalDatabase.compareCharArray",
++                                           candidate -> _plainDatabase.compareCharArray(_secret, candidate),
++                                           positionCandidates(_secret));
++    }
++
++    /**
++     * Length oracle in compareCharArray: candidates of a different length than the stored secret (empty, length 1,
++     * strict prefix, strict extension) must not be compared materially faster than a same-length one.
++     */
++    @Test
++    public void testCompareCharArrayTimingIsIndependentOfLengthDifference() throws Exception
++    {
++        assertTimingIndependentOfCandidate("AbstractPasswordFilePrincipalDatabase.compareCharArray",
++                                           candidate -> _plainDatabase.compareCharArray(_secret, candidate),
++                                           lengthCandidates(_secret, 'x'));
++    }
++
++    /**
++     * Real decision path: {@link PlainPasswordFilePrincipalDatabase#verifyPassword(String, char[])} on a database
++     * loaded from a password file holding the plaintext secret.
++     */
++    @Test
++    public void testPlainVerifyPasswordTimingIsIndependentOfCandidate() throws Exception
++    {
++        final File passwordFile = writePasswordFile(TIMING_USER + ":" + new String(_secret));
++        _plainDatabase.open(passwordFile);
++        assertTrue(_plainDatabase.verifyPassword(TIMING_USER, _secret.clone()), "Stored secret must verify");
++
++        assertTimingIndependentOfCandidate("PlainPasswordFilePrincipalDatabase.verifyPassword",
++                                           candidate -> _plainDatabase.verifyPassword(TIMING_USER, candidate),
++                                           allCandidates(_secret, 'x'));
++    }
++
++    /**
++     * The comparison that {@link Base64MD5PasswordFilePrincipalDatabase#verifyPassword(String, char[])} dispatches
++     * to, on a Base64 MD5 database whose stored operand is loaded from a real password file. The stored operand has
++     * the digest shape that database uses: every byte is stored sign-extended as {@code (char) byte}, so it holds
++     * high characters such as {@code \uFF80}. {@code verifyPassword} always builds a 16-character candidate, which
++     * cannot be driven with long inputs, so the inherited method is called on the database instance with the loaded
++     * stored operand: a fix applied only to the plain-text database must not leave the digest comparison leaking.
++     */
++    @Test
++    public void testBase64MD5DatabaseCompareCharArrayTimingIsIndependentOfCandidate() throws Exception
++    {
++        final byte[] storedBytes = new byte[SECRET_LENGTH];
++        new Random(0xD16E57L).nextBytes(storedBytes);
++        _md5Database.open(writePasswordFile(TIMING_USER + ":" + Base64.getEncoder().encodeToString(storedBytes)));
++
++        final char[] stored = _md5Database.lookupPassword(TIMING_USER);
++        assertEquals(SECRET_LENGTH, stored.length, "Precondition: stored digest-shaped operand length");
++        boolean hasHighCharacter = false;
++        for (int i = 0; i < stored.length && !hasHighCharacter; i++)
++        {
++            hasHighCharacter = stored[i] >= '\uFF80';
++        }
++        assertTrue(hasHighCharacter, "Precondition: the stored operand must hold sign-extended high bytes");
++
++        assertTimingIndependentOfCandidate("Base64MD5PasswordFilePrincipalDatabase.compareCharArray",
++                                           candidate -> _md5Database.compareCharArray(stored, candidate),
++                                           allCandidates(stored, (char) (byte) 0x9C));
++    }
++
++    /**
++     * {@code compareCharArray} is protected and non-final, so out-of-tree principal databases inherit it. A
++     * caller-defined subclass verifying passwords from a real password file through the inherited method must not
++     * leak either.
++     */
++    @Test
++    public void testInheritedCompareCharArrayTimingInSubclassIsIndependentOfCandidate() throws Exception
++    {
++        final ThirdPartyPrincipalDatabase database = new ThirdPartyPrincipalDatabase(_authenticationProvider);
++        final File passwordFile = writePasswordFile(TIMING_USER + ":" + new String(_secret));
++        database.open(passwordFile);
++        assertTrue(database.verifyPassword(TIMING_USER, _secret.clone()), "Stored secret must verify");
++
++        assertTimingIndependentOfCandidate("ThirdPartyPrincipalDatabase.verifyPassword (inherited compareCharArray)",
++                                           candidate -> database.verifyPassword(TIMING_USER, candidate),
++                                           allCandidates(_secret, 'x'));
++    }
++
++    // ******* Verdict tests (positive controls, must hold before and after the fix) ********** //
++
++    /**
++     * The verdict of the comparison stays exact over the full 16-bit width and the full length, identically on the
++     * plain-text database, the Base64 MD5 database and a caller-defined subclass, and the method keeps its
++     * protected, non-final {@code boolean compareCharArray(char[], char[])} signature.
++     */
++    @Test
++    public void testCompareCharArrayVerdictIsExact() throws Exception
++    {
++        final List<AbstractPasswordFilePrincipalDatabase<?>> databases =
++                List.of(_plainDatabase, _md5Database, new ThirdPartyPrincipalDatabase(_authenticationProvider));
++        for (final AbstractPasswordFilePrincipalDatabase<?> database : databases)
++        {
++            final String name = database.getClass().getSimpleName();
++            assertCompareVerdict(database, "secretABCDEF", "secretXXXXXX", false);
++            assertCompareVerdict(database, "secretABCDEF", "secretABCDEE", false);
++            assertCompareVerdict(database, "abc", "abcd", false);
++            assertCompareVerdict(database, "abcd", "abc", false);
++            assertCompareVerdict(database, "abc", "ab", false);
++            assertCompareVerdict(database, "abc", "abc\u0000", false);
++            assertCompareVerdict(database, "abc\u0000", "abc", false);
++            assertCompareVerdict(database, "a", "\u0161", false);
++            assertCompareVerdict(database, "\u0161", "a", false);
++            assertCompareVerdict(database, "\uFF80", "\u0080", false);
++            assertCompareVerdict(database, "ab?", "ab\uD800", false);
++            assertCompareVerdict(database, "abc", "Abc", false);
++            assertCompareVerdict(database, "abc", "", false);
++            assertCompareVerdict(database, "", "abc", false);
++
++            assertCompareVerdict(database, "secretABCDEF", "secretABCDEF", true);
++            assertCompareVerdict(database, "p\u00e4ssw\u00f6rd", "p\u00e4ssw\u00f6rd", true);
++            assertCompareVerdict(database, "\u043f\u0430\u0440\u043e\u043b\u044c",
++                                 "\u043f\u0430\u0440\u043e\u043b\u044c", true);
++            assertCompareVerdict(database, "p\uD83D\uDE00ss", "p\uD83D\uDE00ss", true);
++            assertCompareVerdict(database, "ab\uD800", "ab\uD800", true);
++            assertCompareVerdict(database, "\uFF80\u007F\uFFFF", "\uFF80\u007F\uFFFF", true);
++            assertCompareVerdict(database, "", "", true);
++
++            final char[] same = "secretABCDEF".toCharArray();
++            assertTrue(database.compareCharArray(same, same), name + ": identical-reference operands must match");
++
++            assertFalse(compareTreatingNullPointerAsRejection(database, null, "abc".toCharArray()),
++                        name + ": a null stored operand must never compare equal");
++            assertFalse(compareTreatingNullPointerAsRejection(database, "abc".toCharArray(), null),
++                        name + ": a null supplied operand must never compare equal");
++            assertFalse(compareTreatingNullPointerAsRejection(database, null, null),
++                        name + ": two null operands must never compare equal");
++        }
++
++        final Method method =
++                AbstractPasswordFilePrincipalDatabase.class.getDeclaredMethod("compareCharArray", char[].class,
++                                                                              char[].class);
++        assertTrue(Modifier.isProtected(method.getModifiers()), "compareCharArray must stay protected");
++        assertFalse(Modifier.isFinal(method.getModifiers()), "compareCharArray must stay non-final");
++        assertFalse(Modifier.isStatic(method.getModifiers()), "compareCharArray must stay an instance method");
++        assertEquals(boolean.class, method.getReturnType(), "compareCharArray must keep returning boolean");
++    }
++
++    /**
++     * Real verdict path of the plain-text database: near-miss passwords are rejected and non-ASCII / non-BMP
++     * passwords still verify when identical.
++     */
++    @Test
++    public void testPlainVerifyPasswordVerdictIsExact() throws Exception
++    {
++        _plainDatabase.open(writePasswordFile("# verdict test"));
++
++        assertPlainVerdict("secretABCDEF", "secretXXXXXX", false);
++        assertPlainVerdict("secretABCDEF", "secretABCDEE", false);
++        assertPlainVerdict("secretABCDEF", "secretABCDE", false);
++        assertPlainVerdict("secretABCDEF", "secretABCDEFG", false);
++        assertPlainVerdict("abc", "abc\u0000", false);
++        assertPlainVerdict("a", "\u0161", false);
++        assertPlainVerdict("\u0161", "a", false);
++        assertPlainVerdict("ab?", "ab\uD800", false);
++        assertPlainVerdict("secretABCDEF", "", false);
++
++        assertPlainVerdict("secretABCDEF", "secretABCDEF", true);
++        assertPlainVerdict("p\u00e4ssw\u00f6rd", "p\u00e4ssw\u00f6rd", true);
++        assertPlainVerdict("\u043f\u0430\u0440\u043e\u043b\u044c", "\u043f\u0430\u0440\u043e\u043b\u044c", true);
++        assertPlainVerdict("p\uD83D\uDE00ss", "p\uD83D\uDE00ss", true);
++        assertPlainVerdict("\u0161", "\u0161", true);
++    }
++
++    /**
++     * Real password-file round trip through the Base64 MD5 database with a password whose MD5 digest contains bytes
++     * &gt;= 0x80 (stored sign-extended as {@code (char) byte}).
++     */
++    @Test
++    public void testBase64MD5VerifyPasswordRoundTripWithHighByteDigest() throws Exception
++    {
++        final String password = "testPassword";
++        final byte[] digest = md5(password.getBytes(StandardCharsets.US_ASCII));
++        boolean hasHighByte = false;
++        for (final byte b : digest)
++        {
++            hasHighByte |= b < 0;
++        }
++        assertTrue(hasHighByte, "Precondition: the MD5 of the test password must contain a byte >= 0x80");
++
++        _md5Database.open(writePasswordFile("md5User:" + Base64.getEncoder().encodeToString(digest)));
++
++        assertTrue(_md5Database.verifyPassword("md5User", password.toCharArray()));
++        assertFalse(_md5Database.verifyPassword("md5User", "testPassworD".toCharArray()));
++        assertFalse(_md5Database.verifyPassword("md5User", "testPassword1".toCharArray()));
++        assertFalse(_md5Database.verifyPassword("md5User", "testPasswor".toCharArray()));
++        assertFalse(_md5Database.verifyPassword("md5User", new char[0]));
++
++        final Principal created = new UsernamePrincipal("createdMd5User", null);
++        assertTrue(_md5Database.createPrincipal(created, "p\u00e4ssw\u00f6rd".toCharArray()));
++        assertTrue(_md5Database.verifyPassword("createdMd5User", "p\u00e4ssw\u00f6rd".toCharArray()));
++        assertFalse(_md5Database.verifyPassword("createdMd5User", "p\u00e4ssw\u00f6rD".toCharArray()));
++    }
++
++    // ******* Helpers ********** //
++
++    /** A password check whose running time is measured. */
++    @FunctionalInterface
++    private interface PasswordCheck
++    {
++        boolean check(char[] candidate) throws AccountNotFoundException;
++    }
++
++    /** A named class of candidate passwords together with the verdict it must produce. */
++    private static final class Candidate
++    {
++        private final String _label;
++        private final char[] _value;
++        private final boolean _expectedVerdict;
++
++        private Candidate(final String label, final char[] value, final boolean expectedVerdict)
++        {
++            _label = label;
++            _value = value;
++            _expectedVerdict = expectedVerdict;
++        }
++    }
++
++    private static List<Candidate> positionCandidates(final char[] stored)
++    {
++        final int length = stored.length;
++        final List<Candidate> candidates = new ArrayList<>();
++        candidates.add(new Candidate("wrong at element 0", differingAt(stored, 0), false));
++        candidates.add(new Candidate("wrong at element N/2", differingAt(stored, length / 2), false));
++        candidates.add(new Candidate("wrong only at element N-1", differingAt(stored, length - 1), false));
++        candidates.add(new Candidate("exact match", stored.clone(), true));
++        return candidates;
++    }
++
++    private static List<Candidate> lengthCandidates(final char[] stored, final char extra)
++    {
++        final int length = stored.length;
++        final char[] extension = Arrays.copyOf(stored, length + 1);
++        extension[length] = extra;
++        final List<Candidate> candidates = new ArrayList<>();
++        candidates.add(new Candidate("wrong only at element N-1", differingAt(stored, length - 1), false));
++        candidates.add(new Candidate("empty candidate", new char[0], false));
++        candidates.add(new Candidate("length 1 (first character of the secret)", new char[]{stored[0]}, false));
++        candidates.add(new Candidate("strict prefix of length N-1", Arrays.copyOf(stored, length - 1), false));
++        candidates.add(new Candidate("strict extension of length N+1", extension, false));
++        return candidates;
++    }
++
++    private static List<Candidate> allCandidates(final char[] stored, final char extra)
++    {
++        final List<Candidate> candidates = new ArrayList<>(positionCandidates(stored));
++        final List<Candidate> lengthCandidates = lengthCandidates(stored, extra);
++        candidates.addAll(lengthCandidates.subList(1, lengthCandidates.size()));
++        return candidates;
++    }
++
++    private static char[] differingAt(final char[] stored, final int index)
++    {
++        final char[] candidate = stored.clone();
++        candidate[index] = (char) (candidate[index] ^ 1);
++        return candidate;
++    }
++
++    private void assertTimingIndependentOfCandidate(final String route,
++                                                    final PasswordCheck check,
++                                                    final List<Candidate> candidates) throws AccountNotFoundException
++    {
++        final int count = candidates.size();
++        for (int round = 0; round < WARM_UP_ROUNDS; round++)
++        {
++            for (final Candidate candidate : candidates)
++            {
++                assertVerdict(route, candidate, check.check(candidate._value));
++            }
++        }
++
++        final long[][] samples = new long[count][MEASURED_ROUNDS];
++        for (int round = 0; round < MEASURED_ROUNDS; round++)
++        {
++            for (int k = 0; k < count; k++)
++            {
++                final int index = (k + round) % count;
++                final Candidate candidate = candidates.get(index);
++                final long start = System.nanoTime();
++                final boolean verdict = check.check(candidate._value);
++                samples[index][round] = System.nanoTime() - start;
++                assertVerdict(route, candidate, verdict);
++            }
++        }
++
++        final long[] medians = new long[count];
++        int slowest = 0;
++        for (int i = 0; i < count; i++)
++        {
++            final long[] sorted = samples[i].clone();
++            Arrays.sort(sorted);
++            medians[i] = sorted[sorted.length / 2];
++            if (medians[i] > medians[slowest])
++            {
++                slowest = i;
++            }
++        }
++
++        final StringBuilder report = new StringBuilder();
++        final List<String> leaking = new ArrayList<>();
++        for (int i = 0; i < count; i++)
++        {
++            report.append(String.format("%n  %-45s median %,12d ns", candidates.get(i)._label, medians[i]));
++            if (medians[i] * MAX_TIMING_RATIO < medians[slowest])
++            {
++                leaking.add(String.format("'%s' (%,d ns vs %,d ns)",
++                                          candidates.get(i)._label, medians[i], medians[slowest]));
++            }
++        }
++        timingLogger().info("Timing of {} against a {}-character stored operand:{}", route, SECRET_LENGTH, report);
++
++        if (!leaking.isEmpty())
++        {
++            fail(String.format("CWE-208 timing oracle in %s: candidate classes compared more than %dx faster than "
++                               + "the slowest class '%s': %s. Medians:%s",
++                               route, MAX_TIMING_RATIO, candidates.get(slowest)._label, leaking, report));
++        }
++    }
++
++    private void assertVerdict(final String route, final Candidate candidate, final boolean verdict)
++    {
++        _sink += verdict ? 1 : 0;
++        assertEquals(candidate._expectedVerdict, verdict,
++                     "Unexpected verdict from " + route + " for candidate '" + candidate._label + "'");
++    }
++
++    private static void assertCompareVerdict(final AbstractPasswordFilePrincipalDatabase<?> database,
++                                             final String stored,
++                                             final String supplied,
++                                             final boolean expected)
++    {
++        assertEquals(expected, database.compareCharArray(stored.toCharArray(), supplied.toCharArray()),
++                     database.getClass().getSimpleName() + ": unexpected compareCharArray verdict (lengths "
++                     + stored.length() + " / " + supplied.length() + ")");
++    }
++
++    private static boolean compareTreatingNullPointerAsRejection(final AbstractPasswordFilePrincipalDatabase<?> database,
++                                                                 final char[] stored,
++                                                                 final char[] supplied)
++    {
++        try
++        {
++            return database.compareCharArray(stored, supplied);
++        }
++        catch (NullPointerException e)
++        {
++            // rejecting a null operand by throwing is fail-closed: it is never a positive verdict
++            return false;
++        }
++    }
++
++    private void assertPlainVerdict(final String stored, final String supplied, final boolean expected)
++            throws AccountNotFoundException
++    {
++        final String user = "verdictUser" + (_verdictUsers++);
++        assertTrue(_plainDatabase.createPrincipal(new UsernamePrincipal(user, null), stored.toCharArray()),
++                   "Could not create user for stored password");
++        assertEquals(expected, _plainDatabase.verifyPassword(user, supplied.toCharArray()),
++                     "Unexpected verdict for supplied password against stored password (lengths "
++                     + supplied.length() + " / " + stored.length() + ")");
++    }
++
++    private File writePasswordFile(final String content) throws IOException
++    {
++        final File file = File.createTempFile(getTestName(), "tmp");
++        file.deleteOnExit();
++        _passwordFiles.add(file);
++        try (final BufferedWriter writer = new BufferedWriter(new FileWriter(file, StandardCharsets.US_ASCII)))
++        {
++            writer.write(content);
++            writer.newLine();
++        }
++        return file;
++    }
++
++    private static byte[] md5(final byte[] data)
++    {
++        try
++        {
++            return MessageDigest.getInstance("MD5").digest(data);
++        }
++        catch (NoSuchAlgorithmException e)
++        {
++            throw new AssertionError("MD5 must be available", e);
++        }
++    }
++
++    private static Logger timingLogger()
++    {
++        return LoggerFactory.getLogger(PasswordFilePrincipalDatabaseTimingTest.class);
++    }
++
++    /**
++     * Caller-defined (out-of-tree style) principal database that verifies passwords through the inherited
++     * {@link AbstractPasswordFilePrincipalDatabase#compareCharArray(char[], char[])}.
++     */
++    private static final class ThirdPartyPrincipalDatabase extends AbstractPasswordFilePrincipalDatabase<PlainUser>
++    {
++        private ThirdPartyPrincipalDatabase(final PasswordCredentialManagingAuthenticationProvider<?> provider)
++        {
++            super(provider);
++        }
++
++        @Override
++        public boolean verifyPassword(final String principal, final char[] password) throws AccountNotFoundException
++        {
++            final char[] stored = lookupPassword(principal);
++            if (stored == null)
++            {
++                throw new AccountNotFoundException(principal);
++            }
++            return compareCharArray(stored, password);
++        }
++
++        @Override
++        protected PlainUser createUserFromFileData(final String[] result)
++        {
++            return new PlainUser(result, getAuthenticationProvider());
++        }
++
++        @Override
++        protected PlainUser createUserFromPassword(final Principal principal, final char[] passwd)
++        {
++            return new PlainUser(principal.getName(), passwd, getAuthenticationProvider());
++        }
++
++        @Override
++        protected Logger getLogger()
++        {
++            return LoggerFactory.getLogger(ThirdPartyPrincipalDatabase.class);
++        }
++
++        @Override
++        public List<String> getMechanisms()
++        {
++            return List.of();
++        }
++
++        @Override
++        public SaslNegotiator createSaslNegotiator(final String mechanism, final SaslSettings saslSettings)
++        {
++            return null;
++        }
++    }
++}
+-- 
+2.55.0
+

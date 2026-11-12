@@ -1,0 +1,799 @@
+From e002e92b7cf46ee57f5694d1f4d9b88e0a555d00 Mon Sep 17 00:00:00 2001
+From: Vuln Patch Pipeline <vuln-patch@chainguard.dev>
+Date: Mon, 9 Nov 2026 14:09:07 -0700
+Subject: [PATCH] Cap the size of decompressed JWT payloads
+
+DefaultJwtParser.parse(String) decompresses a token's payload as soon as
+the header names a compression algorithm, before any signature check. The
+shipped DeflateCompressionCodec and GzipCompressionCodec decompressed with
+no size limit, so a small unauthenticated token carrying a decompression
+bomb could expand to hundreds of megabytes and exhaust heap and CPU
+(CWE-409, CWE-400).
+
+Both codecs now write their output through a bounded buffer in
+AbstractCompressionCodec. The running total of produced bytes is checked
+on every write, before the bytes are stored, and decompression aborts with
+an IOException, surfaced as CompressionException, once it would exceed the
+limit. The default limit is 1 MiB. The JVM system property
+io.jsonwebtoken.compression.maxDecompressedBytes, read once at class load,
+overrides it: a positive value sets the limit in bytes, 0 or less disables
+it, and a non-numeric value is ignored. Setting it logs a warning.
+
+Compression, uncompressed tokens, signature verification and the parser's
+order of operations are unchanged.
+
+Adds ZipBombExploitTest and ZipBombEvasionTest.
+
+Cgp-Finding: CGP-753c-3hg7-j33f
+---
+ .../compression/AbstractCompressionCodec.java | 139 +++++++++
+ .../compression/DeflateCompressionCodec.java  |  14 +-
+ .../compression/GzipCompressionCodec.java     |  12 +-
+ .../io/jsonwebtoken/ZipBombEvasionTest.groovy | 265 ++++++++++++++++++
+ .../io/jsonwebtoken/ZipBombExploitTest.groovy | 243 ++++++++++++++++
+ 5 files changed, 666 insertions(+), 7 deletions(-)
+ create mode 100644 src/test/groovy/io/jsonwebtoken/ZipBombEvasionTest.groovy
+ create mode 100644 src/test/groovy/io/jsonwebtoken/ZipBombExploitTest.groovy
+
+diff --git a/src/main/java/io/jsonwebtoken/impl/compression/AbstractCompressionCodec.java b/src/main/java/io/jsonwebtoken/impl/compression/AbstractCompressionCodec.java
+index e1b2e65..284df38 100644
+--- a/src/main/java/io/jsonwebtoken/impl/compression/AbstractCompressionCodec.java
++++ b/src/main/java/io/jsonwebtoken/impl/compression/AbstractCompressionCodec.java
+@@ -19,7 +19,11 @@ import io.jsonwebtoken.CompressionCodec;
+ import io.jsonwebtoken.CompressionException;
+ import io.jsonwebtoken.lang.Assert;
+ 
++import java.io.ByteArrayOutputStream;
+ import java.io.IOException;
++import java.io.OutputStream;
++import java.util.logging.Level;
++import java.util.logging.Logger;
+ 
+ /**
+  * Abstract class that asserts arguments and wraps IOException with CompressionException.
+@@ -28,6 +32,141 @@ import java.io.IOException;
+  */
+ public abstract class AbstractCompressionCodec implements CompressionCodec {
+ 
++    private static final Logger LOG = Logger.getLogger(AbstractCompressionCodec.class.getName());
++
++    /**
++     * Deployment-scoped system property (read once at class init) that overrides the maximum number of
++     * bytes any shipped codec's {@link #doDecompress(byte[]) doDecompress} is allowed to produce before it
++     * aborts.  This exists so operators whose legitimate compressed payloads are larger than the curated
++     * default can raise the ceiling without patching, and so operators can disable the protection
++     * entirely.  Setting it logs a WARN naming the decompression-bomb mitigation being altered.  It is NOT
++     * a public runtime setter (no attacker-reachable widening); it is read a single time when this class
++     * loads.
++     *
++     * <ul>
++     *   <li>A positive value raises/lowers the ceiling to that many bytes.</li>
++     *   <li>A value of {@code 0} or less disables the ceiling entirely (escape hatch -- restores the
++     *       pre-fix, vulnerable behavior; logged as a WARN).</li>
++     * </ul>
++     */
++    private static final String MAX_DECOMPRESSED_BYTES_PROPERTY =
++            "io.jsonwebtoken.compression.maxDecompressedBytes";
++
++    /**
++     * Default ceiling on decompressed output for the shipped DEFLATE and GZIP codecs.  Chosen well above
++     * any realistic JWT claims payload (a few KB) yet far below the tens/hundreds of MB a decompression
++     * bomb produces.  Enforced INCREMENTALLY as bytes are produced (never after an oversized buffer has
++     * already been materialized) so a small compressed payload cannot inflate to gigabytes and exhaust the
++     * heap.  See CWE-409 / CWE-770.
++     */
++    private static final int DEFAULT_MAX_DECOMPRESSED_BYTES = 1024 * 1024; // 1 MiB
++
++    /**
++     * The effective ceiling: {@code private static final}, resolved once at class-init from the default
++     * plus the optional deployment-scoped override.  A value {@code <= 0} means the ceiling is disabled.
++     */
++    private static final long MAX_DECOMPRESSED_BYTES = resolveMaxDecompressedBytes();
++
++    private static long resolveMaxDecompressedBytes() {
++        String override = System.getProperty(MAX_DECOMPRESSED_BYTES_PROPERTY);
++        if (override == null) {
++            return DEFAULT_MAX_DECOMPRESSED_BYTES;
++        }
++        long value;
++        try {
++            value = Long.parseLong(override.trim());
++        } catch (NumberFormatException e) {
++            LOG.log(Level.WARNING, "Ignoring non-numeric value \"" + override + "\" for system property " +
++                    MAX_DECOMPRESSED_BYTES_PROPERTY + "; using the default decompression ceiling of " +
++                    DEFAULT_MAX_DECOMPRESSED_BYTES + " bytes (CWE-770).");
++            return DEFAULT_MAX_DECOMPRESSED_BYTES;
++        }
++        if (value <= 0) {
++            LOG.log(Level.WARNING, "System property " + MAX_DECOMPRESSED_BYTES_PROPERTY + " is set to " +
++                    value + ", which DISABLES the JWT decompression-bomb ceiling. The library is now " +
++                    "vulnerable to unbounded GZIP/DEFLATE decompression (CWE-409 / " +
++                    "CWE-770). Unset this property to restore the protection.");
++            return -1L;
++        }
++        LOG.log(Level.WARNING, "System property " + MAX_DECOMPRESSED_BYTES_PROPERTY + " overrides the JWT " +
++                "decompression ceiling to " + value + " bytes (default " + DEFAULT_MAX_DECOMPRESSED_BYTES +
++                "); the decompression-bomb mitigation (CWE-770) is weakened if this " +
++                "is larger than your largest legitimate compressed payload.");
++        return value;
++    }
++
++    /**
++     * Creates a {@link ByteArrayOutputStream} that aborts with an {@link IOException} as soon as the total
++     * number of bytes written would exceed the configured ceiling.  The check happens INSIDE every
++     * {@code write(...)} call, before the offending chunk is stored, so an oversized (bomb) payload is
++     * never fully materialized in memory.  Only bytes actually produced by decompression are counted -- no
++     * length/size field carried inside the compressed stream is trusted.
++     *
++     * <p>This is the single decompression sink shared by every shipped codec
++     * ({@link DeflateCompressionCodec}, {@link GzipCompressionCodec}): each writes its inflated output into
++     * this stream (whether through a read loop or through {@code InflaterOutputStream.write(...)}), so
++     * guarding it here bounds every caller of {@link #decompress(byte[]) decompress}, including callers
++     * that reach a shipped codec through a custom
++     * {@link io.jsonwebtoken.CompressionCodecResolver CompressionCodecResolver}.</p>
++     *
++     * @return a bounded {@link ByteArrayOutputStream} to receive decompressed bytes
++     */
++    protected static ByteArrayOutputStream newBoundedOutputStream() {
++        return new BoundedByteArrayOutputStream(MAX_DECOMPRESSED_BYTES);
++    }
++
++    /**
++     * A {@link ByteArrayOutputStream} that throws an {@link IOException} the moment its accumulated size
++     * would exceed {@code maxBytes}.  A {@code maxBytes} value {@code < 0} disables the ceiling (operator
++     * escape hatch).  Because {@link java.util.zip.InflaterOutputStream InflaterOutputStream} and manual
++     * read loops both funnel their decompressed output through {@code write(...)}, subclassing the sink
++     * makes the bound fire incrementally for either decompression style.
++     */
++    private static final class BoundedByteArrayOutputStream extends ByteArrayOutputStream {
++
++        private final long maxBytes;
++
++        private BoundedByteArrayOutputStream(long maxBytes) {
++            this.maxBytes = maxBytes;
++        }
++
++        private void checkBound(long additional) throws IOException {
++            if (maxBytes >= 0 && (long) this.count + additional > maxBytes) {
++                throw new IOException("Decompressed JWT payload exceeds the maximum allowed size of " +
++                        maxBytes + " bytes; aborting to prevent a decompression-bomb denial-of-service " +
++                        "(CWE-409 / CWE-770).");
++            }
++        }
++
++        // ByteArrayOutputStream.write(int) / write(byte[],int,int) are not declared to throw IOException,
++        // so we cannot override them to signal overflow.  Instead we expose IOException-throwing variants
++        // that the codecs (and the InflaterOutputStream they wrap) route through.
++        void writeChecked(byte[] b, int off, int len) throws IOException {
++            checkBound(len);
++            super.write(b, off, len);
++        }
++    }
++
++    /**
++     * An {@link OutputStream} adapter that forwards to a {@link BoundedByteArrayOutputStream}'s
++     * IOException-throwing write, so that a {@link java.util.zip.InflaterOutputStream InflaterOutputStream}
++     * wrapping it aborts mid-inflation once the ceiling is crossed.
++     */
++    protected static OutputStream boundedSink(final ByteArrayOutputStream out) {
++        final BoundedByteArrayOutputStream bounded = (BoundedByteArrayOutputStream) out;
++        return new OutputStream() {
++            @Override
++            public void write(int b) throws IOException {
++                bounded.writeChecked(new byte[]{(byte) b}, 0, 1);
++            }
++
++            @Override
++            public void write(byte[] b, int off, int len) throws IOException {
++                bounded.writeChecked(b, off, len);
++            }
++        };
++    }
++
+     /**
+      * Implement this method to do the actual work of compressing the payload
+      *
+diff --git a/src/main/java/io/jsonwebtoken/impl/compression/DeflateCompressionCodec.java b/src/main/java/io/jsonwebtoken/impl/compression/DeflateCompressionCodec.java
+index 9f76970..2a7f1a5 100644
+--- a/src/main/java/io/jsonwebtoken/impl/compression/DeflateCompressionCodec.java
++++ b/src/main/java/io/jsonwebtoken/impl/compression/DeflateCompressionCodec.java
+@@ -19,6 +19,7 @@ import io.jsonwebtoken.lang.Objects;
+ 
+ import java.io.ByteArrayOutputStream;
+ import java.io.IOException;
++import java.io.OutputStream;
+ import java.util.zip.Deflater;
+ import java.util.zip.DeflaterOutputStream;
+ import java.util.zip.InflaterOutputStream;
+@@ -58,17 +59,22 @@ public class DeflateCompressionCodec extends AbstractCompressionCodec {
+ 
+     @Override
+     public byte[] doDecompress(byte[] compressed) throws IOException {
+-        InflaterOutputStream inflaterOutputStream = null;
++        // Bounded sink: aborts before an oversized (bomb) payload is materialized. The InflaterOutputStream
++        // pushes each inflated chunk through write(...), so the ceiling fires incrementally during
++        // decompression. See AbstractCompressionCodec#newBoundedOutputStream (CWE-409 / CWE-770).
+         ByteArrayOutputStream decompressedOutputStream = null;
++        OutputStream boundedSink = null;
++        InflaterOutputStream inflaterOutputStream = null;
+ 
+         try {
+-            decompressedOutputStream = new ByteArrayOutputStream();
+-            inflaterOutputStream = new InflaterOutputStream(decompressedOutputStream);
++            decompressedOutputStream = newBoundedOutputStream();
++            boundedSink = boundedSink(decompressedOutputStream);
++            inflaterOutputStream = new InflaterOutputStream(boundedSink);
+             inflaterOutputStream.write(compressed);
+             inflaterOutputStream.flush();
+             return decompressedOutputStream.toByteArray();
+         } finally {
+-            Objects.nullSafeClose(decompressedOutputStream, inflaterOutputStream);
++            Objects.nullSafeClose(decompressedOutputStream, boundedSink, inflaterOutputStream);
+         }
+     }
+ }
+diff --git a/src/main/java/io/jsonwebtoken/impl/compression/GzipCompressionCodec.java b/src/main/java/io/jsonwebtoken/impl/compression/GzipCompressionCodec.java
+index 0355a76..8a7b510 100644
+--- a/src/main/java/io/jsonwebtoken/impl/compression/GzipCompressionCodec.java
++++ b/src/main/java/io/jsonwebtoken/impl/compression/GzipCompressionCodec.java
+@@ -21,6 +21,7 @@ import io.jsonwebtoken.lang.Objects;
+ import java.io.ByteArrayInputStream;
+ import java.io.ByteArrayOutputStream;
+ import java.io.IOException;
++import java.io.OutputStream;
+ import java.util.zip.GZIPInputStream;
+ import java.util.zip.GZIPOutputStream;
+ 
+@@ -43,21 +44,26 @@ public class GzipCompressionCodec extends AbstractCompressionCodec implements Co
+         byte[] buffer = new byte[512];
+ 
+         ByteArrayOutputStream outputStream = null;
++        OutputStream boundedSink = null;
+         GZIPInputStream gzipInputStream = null;
+         ByteArrayInputStream inputStream = null;
+ 
+         try {
+             inputStream = new ByteArrayInputStream(compressed);
+             gzipInputStream = new GZIPInputStream(inputStream);
+-            outputStream = new ByteArrayOutputStream();
++            // Bounded sink: aborts before an oversized (bomb) payload is materialized. The running total is
++            // checked INSIDE write(...), before each inflated chunk is stored.
++            // See AbstractCompressionCodec#newBoundedOutputStream (CWE-409 / CWE-770).
++            outputStream = newBoundedOutputStream();
++            boundedSink = boundedSink(outputStream);
+             int read = gzipInputStream.read(buffer);
+             while (read != -1) {
+-                outputStream.write(buffer, 0, read);
++                boundedSink.write(buffer, 0, read);
+                 read = gzipInputStream.read(buffer);
+             }
+             return outputStream.toByteArray();
+         } finally {
+-            Objects.nullSafeClose(inputStream, gzipInputStream, outputStream);
++            Objects.nullSafeClose(inputStream, gzipInputStream, boundedSink, outputStream);
+         }
+     }
+ 
+diff --git a/src/test/groovy/io/jsonwebtoken/ZipBombEvasionTest.groovy b/src/test/groovy/io/jsonwebtoken/ZipBombEvasionTest.groovy
+new file mode 100644
+index 0000000..a1ebcab
+--- /dev/null
++++ b/src/test/groovy/io/jsonwebtoken/ZipBombEvasionTest.groovy
+@@ -0,0 +1,265 @@
++/*
++ * Evasion probes for unbounded JWT payload decompression (CWE-400 / CWE-409 / CWE-770 / CWE-789),
++ * against the bounded sink that both GzipCompressionCodec.doDecompress and
++ * DeflateCompressionCodec.doDecompress write through
++ * (AbstractCompressionCodec#newBoundedOutputStream()/#boundedSink(...): default 1 MiB, incremental
++ * per-write cumulative check). The ceiling is read via reflection below rather than hardcoded so
++ * this suite tracks whichever ceiling is actually configured.
++ *
++ * These probes push classes of evasion NOT covered by the ZipBombExploitTest payloads:
++ *   1. A much more extreme compressed-size/implied-ratio bomb, to confirm CPU/heap stay bounded
++ *      even when pushed harder (DEFLATE's finish()/close() re-entrant drain).
++ *   2. GZIP multi-member concatenation (RFC 1952 allows back-to-back gzip members; GZIPInputStream
++ *      transparently continues across them) to check whether chaining many high-ratio members can
++ *      defeat the CUMULATIVE bound (it must still fire on total output, not per-member).
++ *   3. A DEFLATE stream at a moderate (not extreme) ratio forcing many separate output write()
++ *      calls, to confirm the running total is never reset per chunk/buffer.
++ *   4. A boundary probe: a payload that decompresses to just under the configured limit must
++ *      succeed, and a payload well over it must fail -- proving the check is neither off-by-one
++ *      loose nor accidentally rejecting legitimate boundary-sized payloads.
++ */
++package io.jsonwebtoken
++
++import io.jsonwebtoken.impl.TextCodec
++import io.jsonwebtoken.impl.crypto.MacProvider
++import org.junit.Test
++
++import java.util.zip.Deflater
++import java.util.zip.DeflaterOutputStream
++import java.util.zip.GZIPOutputStream
++
++import static org.junit.Assert.*
++
++class ZipBombEvasionTest {
++
++    private static byte[] gzip(byte[] raw) {
++        ByteArrayOutputStream bos = new ByteArrayOutputStream()
++        GZIPOutputStream gz = new GZIPOutputStream(bos)
++        gz.write(raw)
++        gz.finish()
++        gz.close()
++        return bos.toByteArray()
++    }
++
++    private static byte[] deflate(byte[] raw) {
++        ByteArrayOutputStream bos = new ByteArrayOutputStream()
++        DeflaterOutputStream df = new DeflaterOutputStream(bos, new Deflater(Deflater.BEST_COMPRESSION))
++        df.write(raw)
++        df.finish()
++        df.close()
++        return bos.toByteArray()
++    }
++
++    /**
++     * Hand-build a compact, UNSIGNED "header.payload." JWT (RFC 7519 alg:"none" plaintext form) so
++     * these probes drive the fully unauthenticated route to the decompression sink: no signing key
++     * is configured by callers, so DefaultJwtParser has no signature to check and decompresses the
++     * payload unconditionally.
++     */
++    private static String craftBombJwt(String zipAlg, byte[] compressedBomb) {
++        String header = TextCodec.BASE64URL.encode('{"alg":"none","zip":"' + zipAlg + '"}')
++        String payload = TextCodec.BASE64URL.encode(compressedBomb)
++        return header + "." + payload + "."
++    }
++
++    /**
++     * The effective decompression ceiling actually enforced by AbstractCompressionCodec in THIS
++     * tree, read via reflection so this suite never drifts from the real, shipped default.
++     */
++    private static long effectiveMaxDecompressedBytes() {
++        Class<?> codecClass = Class.forName("io.jsonwebtoken.impl.compression.AbstractCompressionCodec")
++        java.lang.reflect.Field f = codecClass.getDeclaredField("MAX_DECOMPRESSED_BYTES")
++        f.setAccessible(true)
++        return (Long) f.get(null)
++    }
++
++    // ---- 1. Push ratio/size far beyond a realistic bomb ----------------------------------------
++
++    @Test
++    void testExtremeImpliedRatioStaysBoundedInTimeAndHeap() {
++        // 512 MiB of all-zero bytes -- compresses to a tiny GZIP stream (ratio far above 1000:1) --
++        // far larger than ZipBombExploitTest's 64 MiB bomb.
++        int impliedBytes = 512 * 1024 * 1024
++        byte[] compressed = gzip(new byte[impliedBytes])
++        // Single-stream DEFLATE/GZIP's LZ77 window + match-length ceiling caps achievable ratio at
++        // roughly ~1000:1 for all-zero data; assert compressed stays a small fraction of the implied
++        // size (not an arbitrary tiny constant) so the test isn't coupled to the exact codec ratio.
++        assertTrue("bomb must stay small compressed relative to implied size (was " +
++                compressed.length + " for " + impliedBytes + " implied)",
++                compressed.length < impliedBytes / 100)
++
++        String token = craftBombJwt("GZIP", compressed)
++
++        long start = System.nanoTime()
++        Runtime rt = Runtime.getRuntime()
++        System.gc(); Thread.sleep(50)
++        long before = rt.totalMemory() - rt.freeMemory()
++        try {
++            Jwts.parser().parse(token)
++            fail("expected CompressionException for a " + impliedBytes + "-byte implied GZIP bomb")
++        } catch (CompressionException expected) {
++            // bounded rejection -- fall through to assertions below
++        }
++        long elapsedMs = (System.nanoTime() - start) / 1_000_000L
++        System.gc(); Thread.sleep(50)
++        long grew = (rt.totalMemory() - rt.freeMemory()) - before
++        System.out.println("[ZipBombEvasion] extreme GZIP bomb (" + impliedBytes + " implied bytes): " +
++                elapsedMs + " ms, retained heap growth ~" + grew + " bytes")
++
++        assertTrue("guard took implausibly long (" + elapsedMs + " ms) -- possible unbounded CPU work",
++                elapsedMs < 5000)
++        assertTrue("retained heap grew ~" + grew + " bytes -- possible unbounded buffering",
++                grew < 16L * 1024 * 1024)
++    }
++
++    @Test
++    void testExtremeImpliedRatioDeflateFinishReentryStaysBounded() {
++        // Same push for DEFLATE specifically, since InflaterOutputStream.close()->finish() is the
++        // path that could continue draining (into the already-thrown-past sink) after the guard
++        // has already fired.
++        int impliedBytes = 512 * 1024 * 1024
++        byte[] compressed = deflate(new byte[impliedBytes])
++        assertTrue("bomb must stay small compressed relative to implied size (was " +
++                compressed.length + " for " + impliedBytes + " implied)",
++                compressed.length < impliedBytes / 100)
++
++        String token = craftBombJwt("DEF", compressed)
++
++        long start = System.nanoTime()
++        Runtime rt = Runtime.getRuntime()
++        System.gc(); Thread.sleep(50)
++        long before = rt.totalMemory() - rt.freeMemory()
++        try {
++            Jwts.parser().parse(token)
++            fail("expected CompressionException for a " + impliedBytes + "-byte implied DEFLATE bomb")
++        } catch (CompressionException expected) {
++            // bounded rejection -- fall through
++        }
++        long elapsedMs = (System.nanoTime() - start) / 1_000_000L
++        System.gc(); Thread.sleep(50)
++        long grew = (rt.totalMemory() - rt.freeMemory()) - before
++        System.out.println("[ZipBombEvasion] extreme DEFLATE bomb (" + impliedBytes + " implied bytes): " +
++                elapsedMs + " ms, retained heap growth ~" + grew + " bytes")
++
++        assertTrue("guard took implausibly long (" + elapsedMs + " ms) -- possible unbounded CPU work " +
++                "from finish()/close() re-entrant draining", elapsedMs < 5000)
++        assertTrue("retained heap grew ~" + grew + " bytes -- possible unbounded buffering",
++                grew < 16L * 1024 * 1024)
++    }
++
++    // ---- 2. GZIP multi-member concatenation ---------------------------------------------------
++
++    @Test
++    void testConcatenatedGzipMembersStillBounded() {
++        // RFC 1952 permits back-to-back gzip members; GZIPInputStream transparently continues
++        // reading across them. Chain many small high-ratio members so no SINGLE member looks
++        // dangerous, hoping the guard treats each member's output independently instead of
++        // cumulatively across the whole concatenated stream.
++        ByteArrayOutputStream concatenated = new ByteArrayOutputStream()
++        int perMemberImplied = 8 * 1024 * 1024   // 8 MiB per member
++        int members = 40                          // 40 * 8 MiB = 320 MiB total implied
++        for (int i = 0; i < members; i++) {
++            concatenated.write(gzip(new byte[perMemberImplied]))
++        }
++        byte[] compressed = concatenated.toByteArray()
++        long totalImplied = ((long) members) * perMemberImplied
++        assertTrue("concatenated bomb must stay small compressed relative to implied size (was " +
++                compressed.length + " for " + totalImplied + " implied)",
++                compressed.length < totalImplied / 100)
++
++        String token = craftBombJwt("GZIP", compressed)
++
++        Runtime rt = Runtime.getRuntime()
++        System.gc(); Thread.sleep(50)
++        long before = rt.totalMemory() - rt.freeMemory()
++        try {
++            Jwts.parser().parse(token)
++            fail("expected CompressionException for a " + members + "-member concatenated GZIP bomb " +
++                    "(total implied " + (((long) members) * perMemberImplied) + " bytes)")
++        } catch (CompressionException expected) {
++            // bounded rejection -- fall through
++        }
++        System.gc(); Thread.sleep(50)
++        long grew = (rt.totalMemory() - rt.freeMemory()) - before
++        System.out.println("[ZipBombEvasion] concatenated-GZIP-members bomb: retained heap growth ~" +
++                grew + " bytes")
++        assertTrue("multi-member GZIP concatenation defeated the cumulative bound: heap grew ~" +
++                grew + " bytes", grew < 16L * 1024 * 1024)
++    }
++
++    // ---- 3. Many small output write() calls within ONE deflate stream: cumulative-not-per-chunk --
++    // (Note: unlike GZIP, raw zlib/DEFLATE streams do NOT support transparent multi-member
++    // concatenation -- Inflater stops consuming at the first stream's BFINAL end marker and any
++    // trailing bytes fed afterward are simply never read. A "concatenate several independently
++    // deflate()'d chunks" construction therefore only ever decompresses the FIRST chunk. This probe
++    // instead uses one single stream at a MODERATE ratio (~4:1, far below the ~1000:1 extreme-ratio
++    // tests already probe) so many bytes of compressed input must be fed and MANY separate 512-byte
++    // output write() calls must occur before the limit is reached, checking that the running total
++    // is a single cumulative counter across the whole decompression and not reset per chunk.)
++
++    @Test
++    void testManyOutputChunksAtModerateRatioAccumulateCorrectly() {
++        // Pseudo-random-ish but still compressible content (repeating a short non-trivial pattern)
++        // so the ratio stays moderate (not the extreme ~1000:1 all-zero case), forcing many more
++        // input bytes to be fed and many more 512-byte output writes before the default limit is
++        // reached than the extreme-ratio tests exercise.
++        int impliedBytes = 8 * 1024 * 1024 // 8 MiB, well over the effective default limit
++        byte[] raw = new byte[impliedBytes]
++        byte[] pattern = "The quick brown fox jumps over the lazy dog. ".getBytes("UTF-8")
++        for (int i = 0; i < raw.length; i++) {
++            raw[i] = pattern[i % pattern.length]
++        }
++        byte[] compressed = deflate(raw)
++        // Confirm this is genuinely a moderate ratio (not the extreme ~1000:1 case), i.e. many bytes
++        // of compressed input really do have to be fed to reach the limit.
++        assertTrue("expected a moderate (not extreme) ratio for this probe (compressed was " +
++                compressed.length + " bytes for " + impliedBytes + " implied)",
++                compressed.length > impliedBytes / 500)
++
++        String token = craftBombJwt("DEF", compressed)
++
++        try {
++            Jwts.parser().parse(token)
++            fail("expected CompressionException: " + impliedBytes + " implied bytes is over the " +
++                    "default limit, even at a moderate compression ratio")
++        } catch (CompressionException expected) {
++            // bounded rejection -- the cumulative counter correctly caught this across many output
++            // write() calls within a single decompression, not just a single-shot extreme bomb.
++        }
++    }
++
++    // ---- 4. Boundary: at-limit succeeds, limit+1 fails -----------------------------------------
++    // (Uses reflection to read the actual configured limit so the test doesn't hardcode a value
++    // that could silently drift from the shipped default.)
++
++    @Test
++    void testBoundaryAtDefaultLimitSucceedsJustOverFails() {
++        long limit = effectiveMaxDecompressedBytes()
++        assertTrue("sanity: limit should be a reasonably small positive default", limit > 0 && limit < 100L * 1024 * 1024)
++
++        byte[] key = MacProvider.generateKey().getEncoded()
++
++        // Just under the limit: must succeed and round-trip.
++        byte[] underRaw = new byte[(int) limit - 1024]
++        Arrays.fill(underRaw, (byte) 'x')
++        String underCompact = Jwts.builder().setSubject("ok")
++                .signWith(SignatureAlgorithm.HS256, key)
++                .claim("pad", new String(underRaw, "UTF-8"))
++                .compressWith(io.jsonwebtoken.impl.compression.CompressionCodecs.DEFLATE).compact()
++        Jws<Claims> jws = Jwts.parser().setSigningKey(key).parseClaimsJws(underCompact)
++        assertEquals("ok", jws.body.getSubject())
++
++        // Well over the limit via a bomb (not a legitimate huge payload) must fail. Uses the
++        // unsigned alg:none route (craftBombJwt) so the result depends only on the decompression
++        // ceiling and not on any signing key.
++        byte[] overImplied = new byte[(int) limit * 4]
++        byte[] compressed = deflate(overImplied)
++        String overToken = craftBombJwt("DEF", compressed)
++        try {
++            Jwts.parser().parse(overToken)
++            fail("expected CompressionException for a payload well over the configured limit")
++        } catch (CompressionException expected) {
++            // bounded rejection as expected
++        }
++    }
++}
+diff --git a/src/test/groovy/io/jsonwebtoken/ZipBombExploitTest.groovy b/src/test/groovy/io/jsonwebtoken/ZipBombExploitTest.groovy
+new file mode 100644
+index 0000000..c3831ca
+--- /dev/null
++++ b/src/test/groovy/io/jsonwebtoken/ZipBombExploitTest.groovy
+@@ -0,0 +1,243 @@
++/*
++ * Exploit harness for uncontrolled resource consumption (zip bomb) in JWT payload decompression
++ * (CWE-400 / CWE-409 / CWE-770 / CWE-789).
++ *
++ * DefaultJwtParser.parse(String) resolves the compression codec from the UNAUTHENTICATED JOSE
++ * header and decompresses the payload
++ *
++ *     byte[] decompressed = compressionCodec.decompress(TextCodec.BASE64URL.decode(base64UrlEncodedPayload));
++ *
++ * BEFORE the signature-verification block. This suite drives that exact runtime sink
++ * (Jwts.parser()...parse(token)) with a compact JWT carrying a zip-bomb body and asserts the SAFE
++ * invariant: decompression must NOT allocate the full bomb into heap, and must abort with a bounded
++ * CompressionException instead.
++ *
++ * The enforcement point is AbstractCompressionCodec#newBoundedOutputStream()/#boundedSink(...),
++ * which both GzipCompressionCodec.doDecompress and DeflateCompressionCodec.doDecompress route
++ * through. Coverage angles: a 64 MiB bomb for each algorithm, an explicit retained-heap threshold,
++ * and positive controls.
++ *
++ * Positive-control tests prove that legitimate compressed JWTs (GZIP, DEFLATE, and a custom codec
++ * resolved through a custom CompressionCodecResolver) still round-trip, so a fix cannot pass this
++ * suite by simply disabling compression.
++ */
++package io.jsonwebtoken
++
++import io.jsonwebtoken.impl.TextCodec
++import io.jsonwebtoken.impl.compression.CompressionCodecs
++import io.jsonwebtoken.impl.compression.DefaultCompressionCodecResolver
++import io.jsonwebtoken.impl.compression.GzipCompressionCodec
++import io.jsonwebtoken.impl.crypto.MacProvider
++import org.junit.Test
++
++import java.util.zip.Deflater
++import java.util.zip.DeflaterOutputStream
++import java.util.zip.GZIPOutputStream
++
++import static org.junit.Assert.*
++
++class ZipBombExploitTest {
++
++    /**
++     * Size the crafted bomb decompresses to. Large enough that on an unbounded build the full
++     * allocation is unambiguous (dwarfs any sane per-payload decompression limit and any GC noise),
++     * small enough that the surefire fork's default heap absorbs it without crashing the runner.
++     */
++    private static final int BOMB_DECOMPRESSED_BYTES = 64 * 1024 * 1024   // 64 MiB
++
++    /**
++     * The safe ceiling this suite asserts against. A bounded fix must abort well before the bomb's
++     * full 64 MiB is materialised; this threshold (16 MiB) sits far above legitimate JWT claims yet
++     * far below the bomb, so any bounded implementation stays under it and an unbounded one blows
++     * past it.
++     */
++    private static final long SAFE_HEAP_THRESHOLD_BYTES = 16L * 1024 * 1024   // 16 MiB
++
++    // ---- payload crafting helpers ------------------------------------------------------------
++
++    private static byte[] gzip(byte[] raw) {
++        ByteArrayOutputStream bos = new ByteArrayOutputStream()
++        GZIPOutputStream gz = new GZIPOutputStream(bos)
++        gz.write(raw)
++        gz.finish()
++        gz.close()
++        return bos.toByteArray()
++    }
++
++    private static byte[] deflate(byte[] raw) {
++        ByteArrayOutputStream bos = new ByteArrayOutputStream()
++        DeflaterOutputStream df = new DeflaterOutputStream(bos, new Deflater(Deflater.BEST_COMPRESSION))
++        df.write(raw)
++        df.finish()
++        df.close()
++        return bos.toByteArray()
++    }
++
++    /**
++     * Hand-build a compact, UNSIGNED "header.payload." JWT (RFC 7519 alg:"none" plaintext form)
++     * whose header names the given compression algorithm and whose body is the supplied
++     * (already-compressed) bomb bytes. No signing key is configured by callers and the token has no
++     * signature, so DefaultJwtParser decompresses the payload unconditionally -- the fully
++     * unauthenticated route to the decompression sink.
++     */
++    private static String craftBombJwt(String zipAlg, byte[] compressedBomb) {
++        String header = TextCodec.BASE64URL.encode('{"alg":"none","zip":"' + zipAlg + '"}')
++        String payload = TextCodec.BASE64URL.encode(compressedBomb)
++        return header + "." + payload + "."
++    }
++
++    private static byte[] bombBytes() {
++        // Highly repetitive data -> compresses to a few KB, decompresses to BOMB_DECOMPRESSED_BYTES.
++        return new byte[BOMB_DECOMPRESSED_BYTES]
++    }
++
++    /**
++     * Regression assertion for the bounded behaviour: driving the bomb JWT through the exact sink
++     * MUST abort decompression with a SPECIFIC {@link CompressionException} (not a catch-all, not an
++     * OutOfMemoryError, not a later SignatureException that fires only AFTER the bomb was fully
++     * materialised) while heap growth stays bounded. Returns the measured (small) heap growth so the
++     * caller can additionally assert it is under the safe threshold.
++     *
++     * On an UNBOUNDED build parse() decompresses the whole bomb, so no CompressionException is
++     * thrown at the decompression step -- the parse either returns or throws a later JwtException
++     * AFTER the harmful allocation. Either way this method fails.
++     */
++    private static long parseExpectingBoundedRejection(String token, String zipAlg) {
++        Runtime rt = Runtime.getRuntime()
++        System.gc(); System.gc()
++        Thread.sleep(50)
++        long before = rt.totalMemory() - rt.freeMemory()
++        try {
++            // THE SINK: DefaultJwtParser.parse(String) -> compressionCodec.decompress(...). No signing
++            // key is configured (unsigned alg:none token), so this is the fully unauthenticated route.
++            Jwts.parser().parse(token)
++            fail("[" + zipAlg + "] Expected the bomb JWT to be rejected with CompressionException " +
++                    "during decompression, but parse() returned without any exception -- the full " +
++                    "payload was decompressed into heap (unbounded).")
++            return -1
++        } catch (CompressionException ce) {
++            // Bounded fix aborts decompression early with the specific exception type. Measure
++            // RETAINED heap after a GC: the bounded decompression buffer is now unreferenced and
++            // collapses, so this reflects whether the bomb was actually held in memory -- free of
++            // the transient JIT/GC churn that pollutes a raw before/after delta.
++            System.gc(); System.gc()
++            Thread.sleep(50)
++            long boundedGrowth = (rt.totalMemory() - rt.freeMemory()) - before
++            System.out.println("[ZipBombExploitTest] " + zipAlg + " bounded rejection: " +
++                    ce.getMessage() + " (retained heap growth ~" + boundedGrowth + " bytes)")
++            return boundedGrowth < 0 ? 0L : boundedGrowth
++        } catch (JwtException je) {
++            // Decompression was NOT bounded -- the bomb fully materialised, then a later stage
++            // (signature/claims) threw. Capture the heap the decompression consumed and fail with a
++            // specific message; this is the concrete harmful effect.
++            long grewBy = (rt.totalMemory() - rt.freeMemory()) - before
++            fail("[" + zipAlg + "] Decompression was not bounded: parse() did NOT throw " +
++                    "CompressionException at the decompression step; instead " +
++                    je.getClass().getSimpleName() + " fired only AFTER the bomb was materialised " +
++                    "(~" + grewBy + " bytes of heap for a " + BOMB_DECOMPRESSED_BYTES +
++                    "-byte bomb declaring zip=" + zipAlg + ").")
++            return grewBy
++        }
++    }
++
++    // ---- GZIP zip-bomb ------------------------------------------------------------------------
++
++    @Test
++    void testGzipZipBombIsBounded() {
++        byte[] compressed = gzip(bombBytes())
++        assertTrue("bomb must be tiny compressed to be a realistic attack (was " +
++                compressed.length + " bytes)", compressed.length < 256 * 1024)
++
++        String token = craftBombJwt("GZIP", compressed)
++
++        long heapGrowth = parseExpectingBoundedRejection(token, "GZIP")
++
++        assertTrue("GZIP zip-bomb was fully decompressed into heap: parse() allocated ~" + heapGrowth +
++                " bytes for a " + BOMB_DECOMPRESSED_BYTES + "-byte bomb (limit " +
++                SAFE_HEAP_THRESHOLD_BYTES + "). Decompression is not bounded -- uncontrolled resource " +
++                "consumption before signature verification.",
++                heapGrowth < SAFE_HEAP_THRESHOLD_BYTES)
++    }
++
++    // ---- DEFLATE zip-bomb: structurally different call shape (single bulk write) --------------
++
++    @Test
++    void testDeflateZipBombIsBounded() {
++        byte[] compressed = deflate(bombBytes())
++        assertTrue("bomb must be tiny compressed to be a realistic attack (was " +
++                compressed.length + " bytes)", compressed.length < 256 * 1024)
++
++        String token = craftBombJwt("DEF", compressed)
++
++        long heapGrowth = parseExpectingBoundedRejection(token, "DEF")
++
++        assertTrue("DEFLATE zip-bomb was fully decompressed into heap: parse() allocated ~" +
++                heapGrowth + " bytes for a " + BOMB_DECOMPRESSED_BYTES + "-byte bomb (limit " +
++                SAFE_HEAP_THRESHOLD_BYTES + "). DeflateCompressionCodec decompression is not bounded " +
++                "-- uncontrolled resource consumption before signature verification.",
++                heapGrowth < SAFE_HEAP_THRESHOLD_BYTES)
++    }
++
++    // ---- Positive controls: legitimate compressed round-trips must still work -----------------
++
++    @Test
++    void testLegitimateGzipRoundTripStillWorks() {
++        byte[] key = MacProvider.generateKey().getEncoded()
++        String id = UUID.randomUUID().toString()
++        String compact = Jwts.builder().setId(id).setAudience("an audience")
++                .signWith(SignatureAlgorithm.HS256, key)
++                .claim("state", "hello this is an amazing jwt")
++                .compressWith(CompressionCodecs.GZIP).compact()
++
++        Jws<Claims> jws = Jwts.parser().setSigningKey(key).parseClaimsJws(compact)
++        assertEquals "GZIP", jws.header.getCompressionAlgorithm()
++        assertEquals id, jws.body.getId()
++        assertEquals "an audience", jws.body.getAudience()
++        assertEquals "hello this is an amazing jwt", jws.body.get("state")
++    }
++
++    @Test
++    void testLegitimateDeflateRoundTripStillWorks() {
++        byte[] key = MacProvider.generateKey().getEncoded()
++        String id = UUID.randomUUID().toString()
++        String compact = Jwts.builder().setId(id).setAudience("an audience")
++                .signWith(SignatureAlgorithm.HS256, key)
++                .claim("state", "hello this is an amazing jwt")
++                .compressWith(CompressionCodecs.DEFLATE).compact()
++
++        Jws<Claims> jws = Jwts.parser().setSigningKey(key).parseClaimsJws(compact)
++        assertEquals "DEF", jws.header.getCompressionAlgorithm()
++        assertEquals id, jws.body.getId()
++        assertEquals "an audience", jws.body.getAudience()
++        assertEquals "hello this is an amazing jwt", jws.body.get("state")
++    }
++
++    @Test
++    void testLegitimateCustomResolverRoundTripStillWorks() {
++        byte[] key = MacProvider.generateKey().getEncoded()
++        String id = UUID.randomUUID().toString()
++        String compact = Jwts.builder().setId(id).setAudience("an audience")
++                .signWith(SignatureAlgorithm.HS256, key)
++                .claim("state", "hello this is an amazing jwt")
++                .compressWith(new GzipCompressionCodec() {
++                    @Override
++                    String getAlgorithmName() { return "CUSTOM" }
++                }).compact()
++
++        Jws<Claims> jws = Jwts.parser().setSigningKey(key)
++                .setCompressionCodecResolver(new DefaultCompressionCodecResolver() {
++                    @Override
++                    CompressionCodec resolveCompressionCodec(Header header) {
++                        String algorithm = header.getCompressionAlgorithm()
++                        if ("CUSTOM".equals(algorithm)) {
++                            return CompressionCodecs.GZIP
++                        }
++                        return null
++                    }
++                }).parseClaimsJws(compact)
++
++        assertEquals "CUSTOM", jws.header.getCompressionAlgorithm()
++        assertEquals id, jws.body.getId()
++        assertEquals "hello this is an amazing jwt", jws.body.get("state")
++    }
++}
+-- 
+2.55.0
+

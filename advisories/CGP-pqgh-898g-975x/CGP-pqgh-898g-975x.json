@@ -1,0 +1,48 @@
+{
+  "id": "CGP-pqgh-898g-975x",
+  "schema_version": "1.6.0",
+  "summary": "XmlSchemaValidator explicitly sets ACCESS_EXTERNAL_DTD and ACCESS_EXTERNAL_SCHEMA to 'all', enabling XXE and SSRF via both schema documents and validated XML instances",
+  "details": "### Root Cause\n\n`XmlSchemaValidator.buildSchemaFactory()` (lines 59–71 of `mockserver-core/src/main/java/org/mockserver/validator/xmlschema/XmlSchemaValidator.java`) explicitly overrides the secure JAXP defaults:\n\n```java\nprivate SchemaFactory buildSchemaFactory() throws SAXNotRecognizedException, SAXNotSupportedException {\n    SchemaFactory schemaFactory = SchemaFactory.newInstance(XMLConstants.W3C_XML_SCHEMA_NS_URI);\n    schemaFactory.setProperty(XMLConstants.ACCESS_EXTERNAL_DTD, \"all\");\n    schemaFactory.setProperty(XMLConstants.ACCESS_EXTERNAL_SCHEMA, \"all\");\n    return schemaFactory;\n}\n```\n\nSetting these properties to `\"all\"` re-enables all external access protocols that JAXP 1.5 disabled by default. The `XmlSchemaValidator` constructor uses this factory to compile the schema supplied in the `PUT /mockserver/expectation` body. The `isValid` method then validates inbound request bodies against the compiled schema:\n\n```java\nschema.newValidator().validate(new StreamSource(new ByteArrayInputStream(xml.getBytes(UTF_8))));\n```\n\nBoth the schema document and the validated XML instance can trigger external resource fetches. Additionally, when the schema string ends with `.xsd`, the constructor opens it via `FileReader.openReaderToFileFromClassPathOrPath(schema)`, allowing a constrained read of `.xsd` files from the classpath or filesystem.\n\n### Affected Locations\n\n- `org.mockserver.validator.xmlschema.XmlSchemaValidator.buildSchemaFactory()` — lines 59–71: `ACCESS_EXTERNAL_DTD` and `ACCESS_EXTERNAL_SCHEMA` are set to `\"all\"`, enabling external entity and schema resolution for both the schema document and validated XML instances.\n\n### Attack Vectors\n\n**Vector 1 — XXE/SSRF via attacker-controlled schema document**\nAn unauthenticated attacker sends `PUT /mockserver/expectation` with an `xmlSchema` body matcher containing an XSD that references an external entity or schema location:\n```xml\n<?xml version=\"1.0\"?>\n<!DOCTYPE foo [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]>\n<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">&xxe;</xs:schema>\n```\nThe `SchemaFactory` resolves the external reference when compiling the schema, reading local files or making outbound HTTP requests from the MockServer host.\n\n**Vector 2 — XXE/SSRF via validated XML instance body**\nOnce an XML schema expectation is registered, any inbound request whose body is validated against it can carry an XXE payload. The `schema.newValidator().validate(...)` call resolves external entities in the instance document.\n\n**Vector 3 — Constrained path traversal via .xsd suffix**\nIf the schema string ends with `.xsd`, the constructor opens it via `FileReader.openReaderToFileFromClassPathOrPath(schema)`. An attacker can supply a path such as `../../sensitive.xsd` to read `.xsd` files outside the intended classpath location.\n\n**Precondition:** The attacker must be able to register an XML schema expectation via `PUT /mockserver/expectation`, which is unauthenticated by default.\n\n### Impact\n\nAn attacker can read arbitrary files accessible to the MockServer process, perform SSRF to internal network services or cloud metadata endpoints, and (via the `.xsd` path variant) read `.xsd` files from the filesystem. Confidentiality of the host system is compromised; availability may be impacted by resource exhaustion from external fetches.\n\n### Trace\n\n1. Attacker sends `PUT /mockserver/expectation` with `xmlSchema` body matcher containing attacker-controlled XSD\n2. `HttpRequestMatcher.withBody(XML_SCHEMA)` creates a new `XmlSchemaMatcher`\n3. `XmlSchemaMatcher` constructs `new XmlSchemaValidator(logger, schema)`\n4. `XmlSchemaValidator` constructor calls `buildSchemaFactory()` — sets `ACCESS_EXTERNAL_DTD=\"all\"` and `ACCESS_EXTERNAL_SCHEMA=\"all\"`\n5. `schemaFactory.newSchema(new StreamSource(new StringReader(schema)))` compiles the schema, resolving external references\n6. Later, `XmlSchemaMatcher.matches` calls `schema.newValidator().validate(StreamSource(attackerRequestBody))`\n7. External entities in the instance document are resolved — file read or SSRF occurs",
+  "severity": [
+    {
+      "type": "CVSS_V3",
+      "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:L/E:U/RL:X/RC:R"
+    }
+  ],
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Maven",
+        "name": "org.mock-server:mockserver-core",
+        "purl": "pkg:maven/org.mock-server/mockserver-core"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "3.11"
+            },
+            {
+              "fixed": "6.0.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "cwe_ids": [
+          "CWE-611"
+        ],
+        "sink_locator": [
+          {
+            "class": "org.mockserver.validator.xmlschema.XmlSchemaValidator",
+            "method": "buildSchemaFactory()",
+            "file_line": "mockserver-core/src/main/java/org/mockserver/validator/xmlschema/XmlSchemaValidator.java:59-71"
+          }
+        ]
+      }
+    }
+  ],
+  "published": "2026-11-12T16:00:00Z",
+  "modified": "2026-11-12T16:00:00Z"
+}

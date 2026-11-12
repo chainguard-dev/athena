@@ -1,0 +1,197 @@
+From 464ef73b5081a9429f3f7996f493da223285b42c Mon Sep 17 00:00:00 2001
+From: Vuln Patch Pipeline <vuln-patch@chainguard.dev>
+Date: Mon, 9 Nov 2026 17:05:32 -0700
+Subject: [PATCH] Bound the ECDSA countPadding read to the scanned component
+
+ECDSAAlgorithm.countPadding(byte[], int, int) counts the leading zero
+bytes of one JOSE signature component and then reads the byte after the
+zeros to decide whether a DER sign byte is needed. When the whole
+component [fromIndex, toIndex) is 0x00, the loop stops at toIndex and
+that read lands one byte past the component (CWE-125). For the s
+component, toIndex is the signature length, so an all-zero s (for
+example 64 zero bytes for ES256) throws ArrayIndexOutOfBoundsException.
+verify() does not catch it, so it escapes JWTVerifier.verify() instead
+of JWTVerificationException and a crafted token crashes verification.
+For the r component the stray byte is the first byte of s.
+
+countPadding now returns the full padding count when the scan reaches
+toIndex, before the read. An all-zero component has no sign byte to
+keep, so it encodes as a zero-length DER INTEGER, which the JCA
+provider rejects; verify() reports that as SignatureVerificationException.
+Components with any non-zero byte are encoded as before, and verify()'s
+exception handling is unchanged.
+
+Adds ECDSAAlgorithmCountPaddingTest: all-zero ES256/ES384/ES512
+signatures through JWTVerifier fail with JWTVerificationException, and
+JOSEToDER encodes all-zero r, all-zero s and all-zero r||s without
+reading outside a component, while a component whose only non-zero
+byte is its last still encodes as one byte.
+
+Cgp-Finding: CGP-grwg-42x8-w9x7
+---
+ .../auth0/jwt/algorithms/ECDSAAlgorithm.java  |   7 +
+ .../ECDSAAlgorithmCountPaddingTest.java       | 134 ++++++++++++++++++
+ 2 files changed, 141 insertions(+)
+ create mode 100644 lib/src/test/java/com/auth0/jwt/algorithms/ECDSAAlgorithmCountPaddingTest.java
+
+diff --git a/lib/src/main/java/com/auth0/jwt/algorithms/ECDSAAlgorithm.java b/lib/src/main/java/com/auth0/jwt/algorithms/ECDSAAlgorithm.java
+index c2d08a1..b5fdeff 100644
+--- a/lib/src/main/java/com/auth0/jwt/algorithms/ECDSAAlgorithm.java
++++ b/lib/src/main/java/com/auth0/jwt/algorithms/ECDSAAlgorithm.java
+@@ -210,6 +210,13 @@ class ECDSAAlgorithm extends Algorithm {
+         while (fromIndex + padding < toIndex && bytes[fromIndex + padding] == 0) {
+             padding++;
+         }
++        // When the whole [fromIndex, toIndex) range is 0x00 the loop exits with
++        // fromIndex + padding == toIndex, so the sign-byte read below would touch bytes[toIndex]:
++        // one index past the range, and past the array end when toIndex == bytes.length. A component
++        // that is entirely zero has no leading sign byte to preserve, so return the full count.
++        if (fromIndex + padding >= toIndex) {
++            return padding;
++        }
+         return (bytes[fromIndex + padding] & 0xff) > 0x7f ? padding - 1 : padding;
+     }
+ 
+diff --git a/lib/src/test/java/com/auth0/jwt/algorithms/ECDSAAlgorithmCountPaddingTest.java b/lib/src/test/java/com/auth0/jwt/algorithms/ECDSAAlgorithmCountPaddingTest.java
+new file mode 100644
+index 0000000..fe9deac
+--- /dev/null
++++ b/lib/src/test/java/com/auth0/jwt/algorithms/ECDSAAlgorithmCountPaddingTest.java
+@@ -0,0 +1,134 @@
++package com.auth0.jwt.algorithms;
++
++import com.auth0.jwt.JWT;
++import com.auth0.jwt.exceptions.JWTVerificationException;
++import com.auth0.jwt.interfaces.ECDSAKeyProvider;
++import com.auth0.jwt.interfaces.JWTVerifier;
++import org.junit.Test;
++
++import java.security.interfaces.ECKey;
++import java.util.Base64;
++
++import static com.auth0.jwt.PemUtils.readPublicKeyFromFile;
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.fail;
++import static org.mockito.Mockito.mock;
++
++/**
++ * JOSE to DER conversion of ECDSA signatures whose r or s component is entirely zero bytes.
++ * Counting the leading zeros of such a component used to read one byte past the component, which
++ * for s is past the end of the signature array.
++ */
++public class ECDSAAlgorithmCountPaddingTest {
++
++    private static final String PUBLIC_KEY_FILE_256 = "src/test/resources/ec256-key-public.pem";
++    private static final String PUBLIC_KEY_FILE_384 = "src/test/resources/ec384-key-public.pem";
++    private static final String PUBLIC_KEY_FILE_512 = "src/test/resources/ec512-key-public.pem";
++
++    // {"alg":"ES256"}, {"alg":"ES384"}, {"alg":"ES512"} and {"iss":"auth0"}
++    private static final String HEADER_ES256 = "eyJhbGciOiJFUzI1NiJ9";
++    private static final String HEADER_ES384 = "eyJhbGciOiJFUzM4NCJ9";
++    private static final String HEADER_ES512 = "eyJhbGciOiJFUzUxMiJ9";
++    private static final String PAYLOAD = "eyJpc3MiOiJhdXRoMCJ9";
++
++    private static void assertAllZeroSignatureRejected(Algorithm algorithm, String header, int ecNumberSize) {
++        byte[] signature = new byte[2 * ecNumberSize];
++        String token = header + "." + PAYLOAD + "." + Base64.getUrlEncoder().withoutPadding().encodeToString(signature);
++        JWTVerifier verifier = JWT.require(algorithm).build();
++        try {
++            verifier.verify(token);
++            fail("An all-zero " + algorithm.getName() + " signature must not verify");
++        } catch (JWTVerificationException expected) {
++            // Rejected through the documented exception type.
++        } catch (ArrayIndexOutOfBoundsException e) {
++            fail("An all-zero " + algorithm.getName() + " signature escaped verify() as " + e);
++        }
++    }
++
++    private static ECDSAAlgorithm es256() {
++        return new ECDSAAlgorithm("ES256", "SHA256withECDSA", 32, mock(ECDSAKeyProvider.class));
++    }
++
++    @Test
++    public void shouldRejectAllZeroES256Signature() throws Exception {
++        Algorithm algorithm = Algorithm.ECDSA256((ECKey) readPublicKeyFromFile(PUBLIC_KEY_FILE_256, "EC"));
++        assertAllZeroSignatureRejected(algorithm, HEADER_ES256, 32);
++    }
++
++    @Test
++    public void shouldRejectAllZeroES384Signature() throws Exception {
++        Algorithm algorithm = Algorithm.ECDSA384((ECKey) readPublicKeyFromFile(PUBLIC_KEY_FILE_384, "EC"));
++        assertAllZeroSignatureRejected(algorithm, HEADER_ES384, 48);
++    }
++
++    @Test
++    public void shouldRejectAllZeroES512Signature() throws Exception {
++        Algorithm algorithm = Algorithm.ECDSA512((ECKey) readPublicKeyFromFile(PUBLIC_KEY_FILE_512, "EC"));
++        assertAllZeroSignatureRejected(algorithm, HEADER_ES512, 66);
++    }
++
++    @Test
++    public void shouldConvertAllZeroSComponentWithoutReadingPastArray() throws Exception {
++        byte[] jose = new byte[64];
++        jose[0] = 0x7f; // r: no padding, no sign byte; s: all zero
++
++        byte[] der = es256().JOSEToDER(jose);
++
++        // 30 24 | 02 20 <32 bytes of r> | 02 00
++        assertEquals(38, der.length);
++        assertEquals((byte) 0x30, der[0]);
++        assertEquals(36, der[1]);
++        assertEquals((byte) 0x02, der[2]);
++        assertEquals(32, der[3]);
++        assertEquals((byte) 0x7f, der[4]);
++        assertEquals((byte) 0x02, der[36]);
++        assertEquals(0, der[37]);
++    }
++
++    @Test
++    public void shouldConvertAllZeroRComponentWithoutReadingIntoS() throws Exception {
++        byte[] jose = new byte[64];
++        jose[32] = (byte) 0x80; // r: all zero; s: high bit set, so it needs a sign byte
++
++        byte[] der = es256().JOSEToDER(jose);
++
++        // 30 25 | 02 00 | 02 21 00 <32 bytes of s>
++        assertEquals(39, der.length);
++        assertEquals((byte) 0x30, der[0]);
++        assertEquals(37, der[1]);
++        assertEquals((byte) 0x02, der[2]);
++        assertEquals(0, der[3]);
++        assertEquals((byte) 0x02, der[4]);
++        assertEquals(33, der[5]);
++        assertEquals(0, der[6]);
++        assertEquals((byte) 0x80, der[7]);
++    }
++
++    @Test
++    public void shouldConvertAllZeroSignatureWithoutReadingPastArray() throws Exception {
++        byte[] der = es256().JOSEToDER(new byte[64]);
++
++        assertEquals(6, der.length);
++        assertEquals((byte) 0x30, der[0]);
++        assertEquals(4, der[1]);
++        assertEquals((byte) 0x02, der[2]);
++        assertEquals(0, der[3]);
++        assertEquals((byte) 0x02, der[4]);
++        assertEquals(0, der[5]);
++    }
++
++    @Test
++    public void shouldKeepLastNonZeroByteOfComponent() throws Exception {
++        byte[] jose = new byte[64];
++        jose[0] = 0x7f;
++        jose[63] = 0x01; // s: 31 zero bytes then 0x01
++
++        byte[] der = es256().JOSEToDER(jose);
++
++        // 30 25 | 02 20 <32 bytes of r> | 02 01 01
++        assertEquals(39, der.length);
++        assertEquals((byte) 0x02, der[36]);
++        assertEquals(1, der[37]);
++        assertEquals(1, der[38]);
++    }
++}
+-- 
+2.55.0
+

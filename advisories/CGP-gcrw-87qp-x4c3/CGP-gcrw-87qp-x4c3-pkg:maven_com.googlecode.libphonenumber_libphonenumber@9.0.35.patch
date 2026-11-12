@@ -1,0 +1,896 @@
+From f8835e6fa8edf8083dbeeba66e41e9aa30267541 Mon Sep 17 00:00:00 2001
+From: Vuln Patch Pipeline <vuln-patch@chainguard.dev>
+Date: Tue, 27 Oct 2026 15:12:55 +0000
+Subject: [PATCH] Bound isAlphaNumber and its regex helpers to 250 characters
+
+PhoneNumberUtil.isAlphaNumber(CharSequence) passed caller text of any
+length to isViablePhoneNumber and maybeStripExtension. These helpers
+run VALID_PHONE_NUMBER_PATTERN and EXTN_PATTERN, which backtrack
+polynomially on long non-matching input and recurse once per digit on
+long digit runs (CWE-1333). A long string could hold a thread for
+seconds or throw StackOverflowError. parse() already refuses input
+longer than MAX_INPUT_STRING_LENGTH (250), but isAlphaNumber did not.
+
+isViablePhoneNumber now returns false for text longer than 250
+characters. maybeStripExtension returns "" and leaves the buffer
+unchanged for text longer than 250 characters. Neither runs its
+pattern on such text. isAlphaNumber also returns false above 250
+before it copies the input or calls either helper. Input of 250
+characters or fewer behaves as before. parse() is unchanged.
+
+Adds AlphaNumberRedosTest.
+
+Cgp-Finding: CGP-gcrw-87qp-x4c3
+---
+ .../i18n/phonenumbers/PhoneNumberUtil.java    |  32 +-
+ .../phonenumbers/AlphaNumberRedosTest.java    | 784 ++++++++++++++++++
+ 2 files changed, 813 insertions(+), 3 deletions(-)
+ create mode 100644 java/libphonenumber/test/com/google/i18n/phonenumbers/AlphaNumberRedosTest.java
+
+diff --git a/java/libphonenumber/src/com/google/i18n/phonenumbers/PhoneNumberUtil.java b/java/libphonenumber/src/com/google/i18n/phonenumbers/PhoneNumberUtil.java
+index b6de4084..5964f02b 100644
+--- a/java/libphonenumber/src/com/google/i18n/phonenumbers/PhoneNumberUtil.java
++++ b/java/libphonenumber/src/com/google/i18n/phonenumbers/PhoneNumberUtil.java
+@@ -773,12 +773,17 @@ public class PhoneNumberUtil {
+    * This method does not require the number to be normalized in advance - but does assume that
+    * leading non-number symbols have been removed, such as by the method extractPossibleNumber.
+    *
++   * <p>Text longer than {@code MAX_INPUT_STRING_LENGTH} is never viable (it could not be parsed
++   * either) and is refused before the regular expression runs: VALID_PHONE_NUMBER_PATTERN
++   * backtracks polynomially, and recurses once per digit, on long input (CWE-1333).
++   *
+    * @param number  string to be checked for viability as a phone number
+    * @return  true if the number could be a phone number of some sort, otherwise false
+    */
+   // @VisibleForTesting
+   static boolean isViablePhoneNumber(CharSequence number) {
+-    if (number.length() < MIN_LENGTH_FOR_NSN) {
++    int length = number.length();
++    if (length < MIN_LENGTH_FOR_NSN || length > MAX_INPUT_STRING_LENGTH) {
+       return false;
+     }
+     Matcher m = VALID_PHONE_NUMBER_PATTERN.matcher(number);
+@@ -2560,15 +2565,29 @@ public class PhoneNumberUtil {
+    * it should be parsed and methods such as {@link #isPossibleNumberWithReason} and
+    * {@link #isValidNumber} should be used.
+    *
++   * <p>Input longer than {@code MAX_INPUT_STRING_LENGTH} (the same limit {@link #parse} enforces)
++   * is not a valid vanity number and is refused before any regular expression runs.
++   *
+    * @param number  the number that needs to be checked
+    * @return  true if the number is a valid vanity number
+    */
+   public boolean isAlphaNumber(CharSequence number) {
+-    if (!isViablePhoneNumber(number)) {
++    // Bound the input before any copy or regular-expression evaluation: the viability and
++    // extension patterns backtrack polynomially on long input (CWE-1333). The length is read once
++    // and the regexes then run on a copy of exactly that many characters, so a CharSequence whose
++    // length() changes between calls cannot hand the regex engine more than the cap.
++    int length = number.length();
++    if (length > MAX_INPUT_STRING_LENGTH) {
++      return false;
++    }
++    StringBuilder strippedNumber = new StringBuilder(length);
++    for (int i = 0; i < length; i++) {
++      strippedNumber.append(number.charAt(i));
++    }
++    if (!isViablePhoneNumber(strippedNumber)) {
+       // Number is too short, or doesn't match the basic phone number pattern.
+       return false;
+     }
+-    StringBuilder strippedNumber = new StringBuilder(number);
+     maybeStripExtension(strippedNumber);
+     return VALID_ALPHA_PHONE_PATTERN.matcher(strippedNumber).matches();
+   }
+@@ -3082,11 +3101,18 @@ public class PhoneNumberUtil {
+    * Strips any extension (as in, the part of the number dialled after the call is connected,
+    * usually indicated with extn, ext, x or similar) from the end of the number, and returns it.
+    *
++   * <p>Text longer than {@code MAX_INPUT_STRING_LENGTH} is left unchanged and no extension is
++   * returned, without running the regular expression: EXTN_PATTERN backtracks polynomially on long
++   * input (CWE-1333).
++   *
+    * @param number  the non-normalized telephone number that we wish to strip the extension from
+    * @return  the phone extension
+    */
+   // @VisibleForTesting
+   String maybeStripExtension(StringBuilder number) {
++    if (number.length() > MAX_INPUT_STRING_LENGTH) {
++      return "";
++    }
+     Matcher m = EXTN_PATTERN.matcher(number);
+     // If we find a potential extension, and the number preceding this is a viable number, we assume
+     // it is an extension.
+diff --git a/java/libphonenumber/test/com/google/i18n/phonenumbers/AlphaNumberRedosTest.java b/java/libphonenumber/test/com/google/i18n/phonenumbers/AlphaNumberRedosTest.java
+new file mode 100644
+index 00000000..effce575
+--- /dev/null
++++ b/java/libphonenumber/test/com/google/i18n/phonenumbers/AlphaNumberRedosTest.java
+@@ -0,0 +1,784 @@
++/*
++ * Copyright (C) 2025 The Libphonenumber Authors
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.google.i18n.phonenumbers;
++
++import com.google.i18n.phonenumbers.Phonenumber.PhoneNumber;
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.ObjectInputStream;
++import java.io.ObjectOutputStream;
++import java.lang.reflect.Field;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.concurrent.Callable;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.FutureTask;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
++
++/**
++ * Security exploit harness for CGP-gcrw-87qp-x4c3 (CWE-1333 / CWE-400 / CWE-789): regular
++ * expression denial of service through {@code PhoneNumberUtil.isAlphaNumber(CharSequence)} and the
++ * two helpers that run the vulnerable patterns.
++ *
++ * <p>{@code isAlphaNumber} hands caller-supplied text of ANY length to
++ * {@code isViablePhoneNumber} ({@code VALID_PHONE_NUMBER_PATTERN.matcher(number).matches()}) and
++ * then to {@code maybeStripExtension} ({@code EXTN_PATTERN.matcher(number).find()} followed by a
++ * second {@code isViablePhoneNumber} on the text before the extension). Both patterns backtrack
++ * polynomially (O(n^2)) on crafted non-matching input, and the {@code (?:[punct]*\d){3,}} group
++ * recurses once per digit, so a long digit run throws an uncontrolled {@link StackOverflowError}
++ * out of a boolean method. {@code parseHelper} bounds its input to {@code MAX_INPUT_STRING_LENGTH}
++ * (250) before any regex runs precisely to prevent this; the other routes skip that bound. A
++ * further route reaches the same {@code EXTN_PATTERN} sink without {@code isAlphaNumber}:
++ * {@code formatOutOfCountryKeepingAlphaChars(PhoneNumber, String)} passes the number's raw input
++ * (public setter, Java-serializable field) to {@code maybeStripExtension}.
++ *
++ * <p>The security invariant each attack test pins: no text longer than the library's own
++ * 250-character cap may be evaluated by those regexes, by any route; over-cap text is refused with
++ * the method's normal non-throwing shape ({@code false} / {@code false} / {@code ""} with the buffer
++ * unchanged), and no more than 250 characters of a caller-supplied {@link CharSequence} are read.
++ * Each payload runs on a dedicated worker thread under a preemptive time budget, so the run FAILS
++ * (never hangs) when the regex engine burns CPU; an escaping {@link StackOverflowError}, a
++ * read-counting {@link CharSequence} read past its budget, or an over-cap input that is evaluated
++ * (accepted, or stripped) are likewise recorded as the harmful effect and FAIL the test. On the
++ * UNPATCHED tree every attack test fails (RED); on a correctly patched tree every test passes, and
++ * the positive controls pass on BOTH trees.
++ */
++public class AlphaNumberRedosTest extends TestMetadataTestCase {
++
++  /** The cap {@code parseHelper} already enforces; mirrored here so the boundary is explicit. */
++  private static final int CAP = 250;
++
++  /**
++   * Wall-clock budget for one call. A correctly bounded call returns in microseconds; the CPU-time
++   * attack sizes below take several seconds on the unpatched tree.
++   */
++  private static final long TIME_BUDGET_MILLIS = 2000L;
++
++  /**
++   * Stack size for the worker threads of the CPU-time attacks: large enough that the quadratic
++   * backtracking (not a stack overflow) is what the unpatched tree exhibits for those shapes.
++   */
++  private static final long LARGE_STACK_BYTES = 256L * 1024 * 1024;
++
++  /** Stack size matching the usual JVM default thread stack (1 MiB on 64-bit Linux). */
++  private static final long DEFAULT_STACK_BYTES = 1024L * 1024;
++
++  /** The documented payload length from the advisory: 100,000 digits followed by ';'. */
++  private static final int DOCUMENTED_DIGITS = 100000;
++
++  /** Separator-run length: quadratic EXTN_PATTERN backtracking takes seconds on the unpatched tree. */
++  private static final int SEPARATOR_RUN = 12000;
++
++  /** Comma-run length: each backtracking step is cheaper than for spaces, so the run is longer. */
++  private static final int COMMA_RUN = 32000;
++
++  /** A real extension suffix that {@code maybeStripExtension} strips from in-cap text. */
++  private static final String EXTENSION = " ext. 1234";
++
++  /** Returns {@code n} copies of {@code c} (Java 8 has no String.repeat). */
++  private static String repeat(char c, int n) {
++    StringBuilder sb = new StringBuilder(n);
++    for (int i = 0; i < n; i++) {
++      sb.append(c);
++    }
++    return sb.toString();
++  }
++
++  /** Pads {@code s} with trailing spaces to exactly {@code length} characters. */
++  private static String padTo(String s, int length) {
++    return s + repeat(' ', length - s.length());
++  }
++
++  /** The advisory's documented payload, verbatim: 100,000 digits followed by ';'. */
++  private static String documentedPayload() {
++    return repeat('1', DOCUMENTED_DIGITS) + ";";
++  }
++
++  /** "123" followed by a long space run and the ambiguous extension label 'x' with no digits. */
++  private static String separatorRunThenX() {
++    return "123" + repeat(' ', SEPARATOR_RUN) + "x";
++  }
++
++  /** Thrown by {@link HostileText} when its read budget is exceeded or the harness cancels it. */
++  private static final class ReadBudgetExceeded extends RuntimeException {
++    ReadBudgetExceeded(String message) {
++      super(message);
++    }
++  }
++
++  /**
++   * A caller-defined (non-JDK) {@link CharSequence} that counts every character the library reads
++   * from it ({@code charAt}, {@code subSequence}, {@code toString}) and aborts with
++   * {@link ReadBudgetExceeded} once a read budget is exceeded or the harness cancels it, so work done
++   * on it is both measurable and stoppable.
++   */
++  private static class HostileText implements CharSequence {
++    private final String text;
++    private final long readBudget;
++    private volatile boolean cancelled;
++    private long reads;
++
++    HostileText(String text, long readBudget) {
++      this.text = text;
++      this.readBudget = readBudget;
++    }
++
++    /** The full length of the underlying text. */
++    int fullLength() {
++      return text.length();
++    }
++
++    /** The character at {@code index} of the underlying text, without counting. */
++    char source(int index) {
++      return text.charAt(index);
++    }
++
++    private void count(long n) {
++      if (cancelled) {
++        throw new ReadBudgetExceeded("cancelled after " + reads + " reads");
++      }
++      reads += n;
++      if (reads > readBudget) {
++        throw new ReadBudgetExceeded(reads + " characters read, exceeding the budget of "
++            + readBudget + ", from a " + fullLength() + "-char input");
++      }
++    }
++
++    @Override
++    public int length() {
++      return fullLength();
++    }
++
++    @Override
++    public char charAt(int index) {
++      count(1);
++      return source(index);
++    }
++
++    @Override
++    public CharSequence subSequence(int start, int end) {
++      count(end - start);
++      StringBuilder sb = new StringBuilder(end - start);
++      for (int i = start; i < end; i++) {
++        sb.append(source(i));
++      }
++      return sb.toString();
++    }
++
++    @Override
++    public String toString() {
++      return subSequence(0, fullLength()).toString();
++    }
++
++    /** Number of characters read so far. */
++    long reads() {
++      return reads;
++    }
++
++    /** Makes every further read throw, stopping work abandoned after a timeout. */
++    void cancel() {
++      cancelled = true;
++    }
++  }
++
++  /**
++   * A {@link HostileText} that reports a huge {@code length()} ({@link Integer#MAX_VALUE}) without
++   * holding any text: every character is the digit '1'.
++   */
++  private static final class EndlessDigits extends HostileText {
++    EndlessDigits(long readBudget) {
++      super("", readBudget);
++    }
++
++    @Override
++    int fullLength() {
++      return Integer.MAX_VALUE;
++    }
++
++    @Override
++    char source(int index) {
++      return '1';
++    }
++  }
++
++  /**
++   * A {@link HostileText} whose {@code length()} is short the first time it is asked and the full
++   * length of the underlying text on every later call (a check-then-use / TOCTOU CharSequence).
++   */
++  private static final class LengthLyingText extends HostileText {
++    private final int firstLength;
++    private int lengthCalls;
++
++    LengthLyingText(String text, int firstLength, long readBudget) {
++      super(text, readBudget);
++      this.firstLength = firstLength;
++    }
++
++    @Override
++    public int length() {
++      return lengthCalls++ == 0 ? firstLength : fullLength();
++    }
++  }
++
++  /** Prints one line of evidence to the test log. */
++  private static void log(String line) {
++    System.out.println("[AlphaNumberRedosTest] " + line);
++  }
++
++  /** Records (and logs) one observed harmful effect. */
++  private static void harm(List<String> harms, String message) {
++    log("HARMFUL " + message);
++    harms.add(message);
++  }
++
++  /** FAILS the test listing every harmful effect recorded; passes when none was. */
++  private static void assertNoHarm(List<String> harms) {
++    if (!harms.isEmpty()) {
++      fail(harms.size() + " harmful effect(s) observed:\n" + String.join("\n", harms));
++    }
++  }
++
++  /** Short printable form of a call's result. */
++  private static String preview(Object result) {
++    String preview = String.valueOf(result);
++    if (preview.length() > 60) {
++      preview = preview.substring(0, 60) + "...(" + preview.length() + " chars)";
++    }
++    return preview;
++  }
++
++  /**
++   * Runs {@code call} on a dedicated daemon worker thread with the given stack size and returns its
++   * result. Exceeding {@link #TIME_BUDGET_MILLIS} (regex CPU exhaustion), escaping a
++   * {@link StackOverflowError} (unbounded recursion on the input) or making a {@link HostileText}
++   * exceed its read budget (over-cap / super-linear reading) is recorded as a harmful effect and
++   * {@code null} is returned. Any other exception means the sink was not driven cleanly and is
++   * surfaced as an error.
++   */
++  private static <T> T drive(List<String> harms, String label, int inputLength, long stackBytes,
++      HostileText cancellable, Callable<T> call) throws InterruptedException {
++    FutureTask<T> task = new FutureTask<T>(call);
++    Thread worker = new Thread(null, task, "redos-" + label, stackBytes);
++    worker.setDaemon(true);
++    long start = System.nanoTime();
++    worker.start();
++    try {
++      T result = task.get(TIME_BUDGET_MILLIS, TimeUnit.MILLISECONDS);
++      log(label + ": returned " + preview(result) + " in "
++          + TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start) + " ms (input length "
++          + inputLength + ")");
++      return result;
++    } catch (TimeoutException timeout) {
++      if (cancellable != null) {
++        cancellable.cancel();
++      }
++      harm(harms, label + ": still running after " + TIME_BUDGET_MILLIS + " ms on a "
++          + inputLength + "-char input - the regex engine is backtracking over unbounded caller "
++          + "input (CWE-1333 ReDoS CPU exhaustion); expected an O(1) refusal of input longer than "
++          + "MAX_INPUT_STRING_LENGTH=" + CAP);
++      return null;
++    } catch (ExecutionException e) {
++      Throwable cause = e.getCause();
++      if (cause instanceof StackOverflowError) {
++        harm(harms, label + ": uncontrolled StackOverflowError escaped the library call on a "
++            + inputLength + "-char input at a " + (stackBytes >> 10) + " KiB thread stack - the "
++            + "regex recursed once per input character; expected a bounded refusal");
++        return null;
++      }
++      if (cause instanceof ReadBudgetExceeded) {
++        harm(harms, label + ": " + cause.getMessage() + " - over-cap caller input was fed to "
++            + "the regex engine / copied before any length cap was applied");
++        return null;
++      }
++      throw new AssertionError(label + ": unexpected exception driving the sink", cause);
++    }
++  }
++
++  /** Drives {@code isAlphaNumber} and records a harm unless the over-cap input is refused. */
++  private void assertAlphaNumberRefused(List<String> harms, String label, final CharSequence input,
++      int inputLength, long stackBytes) throws InterruptedException {
++    HostileText cancellable = input instanceof HostileText ? (HostileText) input : null;
++    Boolean result = drive(harms, label, inputLength, stackBytes, cancellable,
++        () -> phoneUtil.isAlphaNumber(input));
++    if (Boolean.TRUE.equals(result)) {
++      harm(harms, label + ": a " + inputLength + "-char input (> " + CAP + ") was evaluated by the "
++          + "regexes and ACCEPTED (true); it must be refused (false), as parse() refuses it");
++    }
++  }
++
++  /** Records a harm when a read-counting input was read beyond the cap. */
++  private static void assertReadsBounded(List<String> harms, String label, HostileText text,
++      int inputLength) {
++    if (text.reads() > CAP) {
++      harm(harms, label + ": " + text.reads() + " characters of a " + inputLength + "-char "
++          + "input were read; at most " + CAP + " may be read (the cap must be checked on "
++          + "length() before any copy or regex touches the characters)");
++    }
++  }
++
++  /**
++   * Drives {@code maybeStripExtension} on an over-cap buffer and records a harm unless it returns
++   * no extension and leaves the buffer exactly as it was.
++   */
++  private void assertStripExtensionRefused(List<String> harms, String label, String payload,
++      long stackBytes) throws InterruptedException {
++    final StringBuilder number = new StringBuilder(payload);
++    int before = harms.size();
++    String extension = drive(harms, label, payload.length(), stackBytes, null,
++        () -> phoneUtil.maybeStripExtension(number));
++    if (harms.size() != before) {
++      return;
++    }
++    if (!"".equals(extension) || !payload.equals(number.toString())) {
++      harm(harms, label + ": EXTN_PATTERN was evaluated on a " + payload.length() + "-char buffer"
++          + " (> " + CAP + "): returned extension \"" + extension + "\", buffer length "
++          + payload.length() + " -> " + number.length() + "; expected \"\" and the buffer unchanged");
++    }
++  }
++
++  /**
++   * Drives {@code formatOutOfCountryKeepingAlphaChars} and records a harm unless it returns a
++   * non-null result within the budget.
++   */
++  private void assertFormatKeepingAlphaCharsBounded(List<String> harms, String label,
++      final PhoneNumber number, final String regionCallingFrom, long stackBytes)
++      throws InterruptedException {
++    int before = harms.size();
++    String formatted = drive(harms, label, number.getRawInput().length(), stackBytes, null,
++        () -> phoneUtil.formatOutOfCountryKeepingAlphaChars(number, regionCallingFrom));
++    if (harms.size() == before && formatted == null) {
++      harm(harms, label + ": returned null; it must degrade to a non-null result");
++    }
++  }
++
++  // ---------------------------------------------------------------------------------------------
++  // Entry point: isAlphaNumber(CharSequence) -> isViablePhoneNumber / maybeStripExtension
++  // ---------------------------------------------------------------------------------------------
++
++  /**
++   * The documented payload verbatim (100,000 digits followed by ';'), delivered through a
++   * read-counting caller-defined CharSequence with a budget of 20 reads per character: on the
++   * unpatched tree the regex engine reads it super-linearly; a fixed tree refuses it after reading
++   * at most {@code CAP} characters (the cap is checked on {@code length()} before any copy or regex).
++   */
++  public void testIsAlphaNumberDocumentedHundredThousandDigitsPayload() throws Exception {
++    List<String> harms = new ArrayList<String>();
++    String payload = documentedPayload();
++    HostileText text = new HostileText(payload, 20L * payload.length());
++    String label = "isAlphaNumber(read-counting CharSequence: documented 100,000 digits + ';')";
++    assertAlphaNumberRefused(harms, label, text, payload.length(), LARGE_STACK_BYTES);
++    assertReadsBounded(harms, label, text, payload.length());
++    assertNoHarm(harms);
++  }
++
++  /**
++   * Long digit runs at the usual default thread stack, as String and StringBuilder, including the
++   * documented payload verbatim: the per-digit recursion of VALID_PHONE_NUMBER_PATTERN throws an
++   * uncontrolled StackOverflowError out of this boolean method on the unpatched tree.
++   */
++  public void testIsAlphaNumberStackOverflowShapesAtDefaultStack() throws Exception {
++    List<String> harms = new ArrayList<String>();
++    String digits = repeat('1', DOCUMENTED_DIGITS);
++    assertAlphaNumberRefused(harms, "isAlphaNumber(String: 100,000 digits)", digits,
++        digits.length(), DEFAULT_STACK_BYTES);
++    assertAlphaNumberRefused(harms, "isAlphaNumber(StringBuilder: 100,000 digits)",
++        new StringBuilder(digits), digits.length(), DEFAULT_STACK_BYTES);
++    String payload = documentedPayload();
++    assertAlphaNumberRefused(harms, "isAlphaNumber(String: documented 100,000 digits + ';')",
++        payload, payload.length(), DEFAULT_STACK_BYTES);
++    assertNoHarm(harms);
++  }
++
++  /**
++   * A valid vanity number padded with trailing spaces to {@code CAP + 1} characters, as String,
++   * StringBuilder and a caller-defined CharSequence: the unpatched tree evaluates it and returns
++   * true; it must be refused, exactly as parse() refuses it with TOO_LONG.
++   */
++  public void testIsAlphaNumberOverCapByOneRefused() throws Exception {
++    List<String> harms = new ArrayList<String>();
++    String overCap = padTo("1800 six-flags", CAP + 1);
++    assertEquals(CAP + 1, overCap.length());
++    assertAlphaNumberRefused(harms, "isAlphaNumber(String: vanity padded to 251)", overCap,
++        overCap.length(), DEFAULT_STACK_BYTES);
++    assertAlphaNumberRefused(harms, "isAlphaNumber(StringBuilder: vanity padded to 251)",
++        new StringBuilder(overCap), overCap.length(), DEFAULT_STACK_BYTES);
++    assertAlphaNumberRefused(harms, "isAlphaNumber(caller CharSequence: vanity padded to 251)",
++        new HostileText(overCap, Long.MAX_VALUE), overCap.length(), DEFAULT_STACK_BYTES);
++    assertNoHarm(harms);
++  }
++
++  /**
++   * "123" + 12,000 spaces + "x" (String): passes the first viability check, then EXTN_PATTERN
++   * backtracks quadratically over the space run in maybeStripExtension for several seconds on the
++   * unpatched tree.
++   */
++  public void testIsAlphaNumberSeparatorRunThenX() throws Exception {
++    List<String> harms = new ArrayList<String>();
++    String payload = separatorRunThenX();
++    assertAlphaNumberRefused(harms, "isAlphaNumber(String: \"123\"+12,000 spaces+\"x\")", payload,
++        payload.length(), LARGE_STACK_BYTES);
++    assertNoHarm(harms);
++  }
++
++  /**
++   * "123" + 32,000 commas + "a" (String): commas are admitted only by the optional extension tail
++   * of VALID_PHONE_NUMBER_PATTERN, so the quadratic backtracking happens in the first viability
++   * check, for several seconds on the unpatched tree.
++   */
++  public void testIsAlphaNumberCommaRunThenA() throws Exception {
++    List<String> harms = new ArrayList<String>();
++    String payload = "123" + repeat(',', COMMA_RUN) + "a";
++    assertAlphaNumberRefused(harms, "isAlphaNumber(String: \"123\"+32,000 commas+\"a\")", payload,
++        payload.length(), LARGE_STACK_BYTES);
++    assertNoHarm(harms);
++  }
++
++  /**
++   * The separator-run and comma-run shapes through a read-counting caller-defined CharSequence
++   * with a budget of {@code CAP} reads: a deterministic, machine-independent oracle that the
++   * over-cap text reaches the regex engine on the unpatched tree.
++   */
++  public void testIsAlphaNumberSeparatorAndCommaRunsReadBounded() throws Exception {
++    List<String> harms = new ArrayList<String>();
++    String[] payloads = {separatorRunThenX(), "123" + repeat(',', SEPARATOR_RUN) + "a"};
++    String[] labels = {"\"123\"+12,000 spaces+\"x\"", "\"123\"+12,000 commas+\"a\""};
++    for (int i = 0; i < payloads.length; i++) {
++      HostileText text = new HostileText(payloads[i], CAP);
++      String label = "isAlphaNumber(read-counting CharSequence: " + labels[i] + ")";
++      assertAlphaNumberRefused(harms, label, text, payloads[i].length(), LARGE_STACK_BYTES);
++      assertReadsBounded(harms, label, text, payloads[i].length());
++    }
++    assertNoHarm(harms);
++  }
++
++  /**
++   * A caller-defined CharSequence reporting a huge {@code length()} (Integer.MAX_VALUE digits)
++   * must be refused after O(1) reads: the unpatched tree starts matching (and would go on to copy)
++   * it.
++   */
++  public void testIsAlphaNumberHugeLengthCharSequenceRefusedWithoutReading() throws Exception {
++    List<String> harms = new ArrayList<String>();
++    EndlessDigits text = new EndlessDigits(CAP);
++    String label = "isAlphaNumber(CharSequence reporting length() = Integer.MAX_VALUE)";
++    assertAlphaNumberRefused(harms, label, text, Integer.MAX_VALUE, DEFAULT_STACK_BYTES);
++    assertReadsBounded(harms, label, text, Integer.MAX_VALUE);
++    assertNoHarm(harms);
++  }
++
++  /**
++   * A CharSequence whose {@code length()} reports 14 the first time and its true over-cap length
++   * afterwards: the length must be read once and the regexes must run on a bounded copy of at most
++   * that many characters, so no more than {@code CAP} characters may be read. The unpatched tree
++   * checks one length and then hands the full over-cap text to the regex engine.
++   */
++  public void testIsAlphaNumberLengthLyingCharSequenceReadsBounded() throws Exception {
++    List<String> harms = new ArrayList<String>();
++    String underlying = "1800 six-flags" + repeat(' ', SEPARATOR_RUN) + "x";
++    LengthLyingText text = new LengthLyingText(underlying, 14, CAP);
++    String label = "isAlphaNumber(CharSequence whose length() is 14, then "
++        + underlying.length() + ")";
++    drive(harms, label, underlying.length(), LARGE_STACK_BYTES, text,
++        () -> phoneUtil.isAlphaNumber(text));
++    assertReadsBounded(harms, label, text, underlying.length());
++    assertNoHarm(harms);
++  }
++
++  // ---------------------------------------------------------------------------------------------
++  // isViablePhoneNumber -> VALID_PHONE_NUMBER_PATTERN.matcher().matches()
++  // called directly (same package), independent of isAlphaNumber.
++  // ---------------------------------------------------------------------------------------------
++
++  /** Otherwise-viable text of {@code CAP + 1} characters must not be viable (parse() refuses it). */
++  public void testIsViablePhoneNumberRefusesOverCapByOne() throws Exception {
++    List<String> harms = new ArrayList<String>();
++    String[] payloads = {repeat('1', CAP + 1), padTo("1800 six-flags", CAP + 1)};
++    for (final String payload : payloads) {
++      assertEquals(CAP + 1, payload.length());
++      String label = "isViablePhoneNumber(251 chars: " + preview(payload.trim()) + ")";
++      Boolean viable = drive(harms, label, payload.length(), DEFAULT_STACK_BYTES, null,
++          () -> PhoneNumberUtil.isViablePhoneNumber(payload));
++      if (Boolean.TRUE.equals(viable)) {
++        harm(harms, label + ": VALID_PHONE_NUMBER_PATTERN evaluated a " + payload.length()
++            + "-char input (> " + CAP + ") and returned true; expected false");
++      }
++    }
++    assertNoHarm(harms);
++  }
++
++  /**
++   * The documented payload straight into isViablePhoneNumber: as a String at the usual default
++   * stack (StackOverflowError on the unpatched tree) and through a read-counting CharSequence with
++   * a budget of {@code CAP} reads.
++   */
++  public void testIsViablePhoneNumberDocumentedPayloadRefused() throws Exception {
++    List<String> harms = new ArrayList<String>();
++    final String payload = documentedPayload();
++    String label = "isViablePhoneNumber(String: documented 100,000 digits + ';')";
++    Boolean viable = drive(harms, label, payload.length(), DEFAULT_STACK_BYTES, null,
++        () -> PhoneNumberUtil.isViablePhoneNumber(payload));
++    if (Boolean.TRUE.equals(viable)) {
++      harm(harms, label + ": returned true; expected false");
++    }
++    final HostileText text = new HostileText(payload, CAP);
++    label = "isViablePhoneNumber(read-counting CharSequence: documented 100,000 digits + ';')";
++    viable = drive(harms, label, payload.length(), LARGE_STACK_BYTES, text,
++        () -> PhoneNumberUtil.isViablePhoneNumber(text));
++    if (Boolean.TRUE.equals(viable)) {
++      harm(harms, label + ": returned true; expected false");
++    }
++    assertReadsBounded(harms, label, text, payload.length());
++    assertNoHarm(harms);
++  }
++
++  // ---------------------------------------------------------------------------------------------
++  // maybeStripExtension -> EXTN_PATTERN.matcher().find() and the nested
++  // isViablePhoneNumber on the text before the extension, called directly (same package).
++  // ---------------------------------------------------------------------------------------------
++
++  /**
++   * A {@code CAP + 1}-character buffer ending in a real extension: the unpatched tree runs
++   * EXTN_PATTERN on it and strips "1234"; it must return "" and leave the buffer unchanged.
++   */
++  public void testMaybeStripExtensionRefusesOverCapByOne() throws Exception {
++    List<String> harms = new ArrayList<String>();
++    String overCap = padTo("1800 six-flags", CAP + 1 - EXTENSION.length()) + EXTENSION;
++    assertEquals(CAP + 1, overCap.length());
++    assertStripExtensionRefused(harms, "maybeStripExtension(251 chars ending \" ext. 1234\")",
++        overCap, DEFAULT_STACK_BYTES);
++    assertNoHarm(harms);
++  }
++
++  /**
++   * 100,000 digits followed by a real extension at the usual default stack: EXTN_PATTERN finds the
++   * extension, and the nested isViablePhoneNumber re-evaluation of the 100,000-digit prefix throws
++   * an uncontrolled StackOverflowError on the unpatched tree.
++   */
++  public void testMaybeStripExtensionNestedPrefixReevaluationRefused() throws Exception {
++    List<String> harms = new ArrayList<String>();
++    assertStripExtensionRefused(harms,
++        "maybeStripExtension(100,000 digits + \" ext. 1234\": nested prefix re-evaluation)",
++        repeat('1', DOCUMENTED_DIGITS) + EXTENSION, DEFAULT_STACK_BYTES);
++    assertNoHarm(harms);
++  }
++
++  /**
++   * "123" + 12,000 spaces + "x" straight into maybeStripExtension: EXTN_PATTERN backtracks
++   * quadratically over the space run for several seconds on the unpatched tree.
++   */
++  public void testMaybeStripExtensionSeparatorRunThenX() throws Exception {
++    List<String> harms = new ArrayList<String>();
++    assertStripExtensionRefused(harms, "maybeStripExtension(\"123\"+12,000 spaces+\"x\")",
++        separatorRunThenX(), LARGE_STACK_BYTES);
++    assertNoHarm(harms);
++  }
++
++  // ---------------------------------------------------------------------------------------------
++  // formatOutOfCountryKeepingAlphaChars -> maybeStripExtension(rawInput).
++  // The raw input never passed parse(), so parse()'s cap never applied to it.
++  // ---------------------------------------------------------------------------------------------
++
++  /** Raw input reaching the nested prefix re-evaluation (StackOverflowError shape). */
++  private static String digitsThenExtensionRawInput() {
++    return repeat('1', DOCUMENTED_DIGITS) + EXTENSION;
++  }
++
++  /** Raw input reaching EXTN_PATTERN's quadratic backtracking over a separator run. */
++  private static String separatorRunRawInput() {
++    return "020 8765 4321" + repeat(' ', SEPARATOR_RUN) + "q";
++  }
++
++  /** A GB number (no NANPA early return when formatted from US) carrying {@code rawInput}. */
++  private static PhoneNumber numberWithRawInputViaSetter(String rawInput) {
++    return new PhoneNumber().setCountryCode(44).setNationalNumber(2087654321L)
++        .setRawInput(rawInput);
++  }
++
++  /**
++   * The same number whose raw input arrives through a real Java serialization round trip, with
++   * the private fields written directly (no setter runs) - the delivery a crafted byte stream
++   * gives.
++   */
++  private static PhoneNumber numberWithRawInputViaDeserialization(String rawInput)
++      throws Exception {
++    PhoneNumber crafted = new PhoneNumber().setCountryCode(44).setNationalNumber(2087654321L);
++    setPrivateField(crafted, "rawInput_", rawInput);
++    setPrivateField(crafted, "hasRawInput", Boolean.TRUE);
++    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
++    ObjectOutputStream oos = new ObjectOutputStream(bytes);
++    try {
++      oos.writeObject(crafted);
++    } finally {
++      oos.close();
++    }
++    PhoneNumber deserialized;
++    ObjectInputStream ois = new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()));
++    try {
++      deserialized = (PhoneNumber) ois.readObject();
++    } finally {
++      ois.close();
++    }
++    assertEquals("deserialized object lost its raw input", rawInput, deserialized.getRawInput());
++    return deserialized;
++  }
++
++  /** Writes a private field of {@code target} reflectively (stands in for a crafted stream). */
++  private static void setPrivateField(Object target, String name, Object value) throws Exception {
++    Field f = target.getClass().getDeclaredField(name);
++    f.setAccessible(true);
++    f.set(target, value);
++  }
++
++  /** Over-cap raw input set through the public, unvalidated setRawInput(String). */
++  public void testFormatOutOfCountryKeepingAlphaCharsLongRawInputViaSetter() throws Exception {
++    List<String> harms = new ArrayList<String>();
++    assertFormatKeepingAlphaCharsBounded(harms,
++        "formatOutOfCountryKeepingAlphaChars(setter rawInput: 100,000 digits + \" ext. 1234\")",
++        numberWithRawInputViaSetter(digitsThenExtensionRawInput()), RegionCode.US,
++        DEFAULT_STACK_BYTES);
++    assertFormatKeepingAlphaCharsBounded(harms,
++        "formatOutOfCountryKeepingAlphaChars(setter rawInput: number+12,000 spaces+\"q\")",
++        numberWithRawInputViaSetter(separatorRunRawInput()), RegionCode.US, LARGE_STACK_BYTES);
++    assertNoHarm(harms);
++  }
++
++  /** Over-cap raw input delivered through Java deserialization (no setter, no parse()). */
++  public void testFormatOutOfCountryKeepingAlphaCharsLongRawInputViaDeserialization()
++      throws Exception {
++    List<String> harms = new ArrayList<String>();
++    assertFormatKeepingAlphaCharsBounded(harms,
++        "formatOutOfCountryKeepingAlphaChars(deserialized rawInput: 100,000 digits + ext)",
++        numberWithRawInputViaDeserialization(digitsThenExtensionRawInput()), RegionCode.US,
++        DEFAULT_STACK_BYTES);
++    assertFormatKeepingAlphaCharsBounded(harms,
++        "formatOutOfCountryKeepingAlphaChars(deserialized rawInput: number+12,000 spaces+\"q\")",
++        numberWithRawInputViaDeserialization(separatorRunRawInput()), RegionCode.US,
++        LARGE_STACK_BYTES);
++    assertNoHarm(harms);
++  }
++
++  // ---------------------------------------------------------------------------------------------
++  // Positive controls: pass on BOTH the unpatched and the patched tree (preservation, not the fix).
++  // ---------------------------------------------------------------------------------------------
++
++  /** A vanity number padded to EXACTLY the cap is still processed and accepted, by every type. */
++  public void testIsAlphaNumberVanityPaddedToExactlyCapStillAccepted() {
++    String atCap = padTo("1800 six-flags", CAP);
++    assertEquals(CAP, atCap.length());
++    assertTrue(phoneUtil.isAlphaNumber(atCap));
++    assertTrue(phoneUtil.isAlphaNumber(new StringBuilder(atCap)));
++    assertTrue(phoneUtil.isAlphaNumber(new HostileText(atCap, Long.MAX_VALUE)));
++    String atCapWithExtension = padTo("1800 six-flags", CAP - EXTENSION.length()) + EXTENSION;
++    assertEquals(CAP, atCapWithExtension.length());
++    assertTrue(phoneUtil.isAlphaNumber(atCapWithExtension));
++    assertTrue(phoneUtil.isAlphaNumber(new StringBuilder(atCapWithExtension)));
++    assertTrue(phoneUtil.isAlphaNumber(new HostileText(atCapWithExtension, Long.MAX_VALUE)));
++  }
++
++  /** At exactly the cap both helpers still process their input (250 accepted, not refused). */
++  public void testHelpersAtExactlyCapStillProcessed() {
++    assertTrue(PhoneNumberUtil.isViablePhoneNumber(repeat('1', CAP)));
++    assertTrue(PhoneNumberUtil.isViablePhoneNumber(padTo("1800 six-flags", CAP)));
++    String atCap = padTo("1800 six-flags", CAP - EXTENSION.length()) + EXTENSION;
++    assertEquals(CAP, atCap.length());
++    StringBuilder atCapNumber = new StringBuilder(atCap);
++    assertEquals("1234", phoneUtil.maybeStripExtension(atCapNumber));
++    assertEquals("1800 six-flags", atCapNumber.toString());
++  }
++
++  /**
++   * At exactly the cap the polynomial worst case stays small for every adversarial shape, through
++   * all three methods, at the usual default thread stack (no StackOverflowError, well within the
++   * budget): the 250-character cap alone is sufficient.
++   */
++  public void testAdversarialShapesAtExactlyCapAreFast() throws Exception {
++    List<String> harms = new ArrayList<String>();
++    final String[] shapes = {
++      repeat('1', CAP - 1) + ";",
++      "123" + repeat(' ', CAP - 4) + "q",
++      "123" + repeat(' ', CAP - 4) + "x",
++      "123" + repeat(',', CAP - 4) + "a",
++      repeat('1', CAP),
++      repeat('1', CAP - EXTENSION.length()) + EXTENSION,
++    };
++    for (final String shape : shapes) {
++      assertEquals(CAP, shape.length());
++      drive(harms, "isAlphaNumber(at-cap shape)", CAP, DEFAULT_STACK_BYTES, null,
++          () -> phoneUtil.isAlphaNumber(shape));
++      drive(harms, "isViablePhoneNumber(at-cap shape)", CAP, DEFAULT_STACK_BYTES, null,
++          () -> PhoneNumberUtil.isViablePhoneNumber(shape));
++      drive(harms, "maybeStripExtension(at-cap shape)", CAP, DEFAULT_STACK_BYTES, null,
++          () -> phoneUtil.maybeStripExtension(new StringBuilder(shape)));
++    }
++    assertNoHarm(harms);
++  }
++
++  /** The existing isAlphaNumber verdicts, also via StringBuilder and a caller-defined CharSequence. */
++  public void testExistingIsAlphaNumberVerdictsPreserved() {
++    String[] accepted = {
++      "1800 six-flags", "1800 six-flags ext. 1234", "+800 six-flags", "180 six-flags",
++    };
++    String[] rejected = {
++      "1800 123-1234", "1 six-flags", "18 six-flags", "1800 123-1234 extension: 1234",
++      "+800 1234-1234",
++    };
++    for (String s : accepted) {
++      assertTrue(s, phoneUtil.isAlphaNumber(s));
++      assertTrue(s, phoneUtil.isAlphaNumber(new StringBuilder(s)));
++      assertTrue(s, phoneUtil.isAlphaNumber(new HostileText(s, Long.MAX_VALUE)));
++    }
++    for (String s : rejected) {
++      assertFalse(s, phoneUtil.isAlphaNumber(s));
++      assertFalse(s, phoneUtil.isAlphaNumber(new StringBuilder(s)));
++      assertFalse(s, phoneUtil.isAlphaNumber(new HostileText(s, Long.MAX_VALUE)));
++    }
++  }
++
++  /** isAlphaNumber(null) keeps throwing NullPointerException (public contract unchanged). */
++  public void testIsAlphaNumberNullStillThrowsNullPointerException() {
++    try {
++      phoneUtil.isAlphaNumber(null);
++      fail("isAlphaNumber(null) must keep throwing NullPointerException");
++    } catch (NullPointerException expected) {
++      // Unchanged contract.
++    }
++  }
++
++  /** Parse-produced and in-cap alpha numbers format exactly as before. */
++  public void testParseProducedAlphaNumberFormatsUnchanged() throws Exception {
++    PhoneNumber withExtn = phoneUtil.parseAndKeepRawInput("800 SIX-flag ext. 1234", RegionCode.US);
++    assertEquals("0011 1 800 SIX-FLAG extn. 1234",
++        phoneUtil.formatOutOfCountryKeepingAlphaChars(withExtn, RegionCode.AU));
++    PhoneNumber alpha = new PhoneNumber().setCountryCode(1).setNationalNumber(8007493524L)
++        .setRawInput("1800 six-flag");
++    assertEquals("0011 1 800 SIX-FLAG",
++        phoneUtil.formatOutOfCountryKeepingAlphaChars(alpha, RegionCode.AU));
++  }
++
++  /** parse() still accepts a 250-character input and refuses a 251-character one with TOO_LONG. */
++  public void testParseCapUnchanged() throws Exception {
++    String atCap = padTo("650 253 0000", CAP);
++    assertEquals(6502530000L, phoneUtil.parse(atCap, RegionCode.US).getNationalNumber());
++    String overCap = padTo("1800 six-flags", CAP + 1);
++    try {
++      phoneUtil.parse(overCap, RegionCode.US);
++      fail("parse() must refuse a " + overCap.length() + "-char input");
++    } catch (NumberParseException e) {
++      assertEquals(NumberParseException.ErrorType.TOO_LONG, e.getErrorType());
++    }
++  }
++}
+-- 
+2.55.0
+

@@ -1,0 +1,1053 @@
+From 5b8568353e747dba42f67d318bc4fecae39042bd Mon Sep 17 00:00:00 2001
+From: Vuln Patch Pipeline <vuln-patch@chainguard.dev>
+Date: Mon, 9 Nov 2026 21:29:49 -0700
+Subject: [PATCH] Confine admin stub file deletes to the __files root
+
+DeleteStubFileTask, which serves DELETE /__admin/files/{filename},
+built a File from the files root and the raw filename and deleted it
+with no containment check (CWE-22). On Windows a backslash in the
+filename acts as a path separator, so a name that starts with "..\"
+deleted a file outside the __files root.
+
+The task now deletes through FileSource.deleteFile, which checks that
+the canonical path is under the root and throws NotAuthorisedException
+if it is not. AbstractFileSource.deleteFile also refuses a name that
+resolves to the root directory itself, such as "" or ".". The task
+reports a refused delete as its existing 500 "File not deleted"
+response, and returns 200 only when the target existed before the call
+and is gone after it. A delete on a read-only file source now fails,
+as other writes to it already did. A delete on a classpath file source
+leaves the file in place, since ClasspathFileSource.deleteFile does
+nothing.
+
+AbstractFileSource.assertFilePathIsUnderRoot compared canonical paths
+with a bare startsWith, so a sibling directory whose name starts with
+the root's name, such as __files-archive next to __files, passed the
+check. The check now accepts only the root itself or a path under the
+root followed by a separator. Reads, writes and deletes through
+AbstractFileSource use this check.
+
+Deletes of files and empty directories inside the root, and reads and
+writes inside the root, are unchanged.
+
+Adds DeleteStubFileTaskTest, DeleteStubFileTaskPathTraversalTest,
+DeleteStubFileTaskEdgeCaseTest, DeleteStubFileHttpTest.
+
+Cgp-Finding: CGP-48gv-xfgw-w4hc
+---
+ .../admin/tasks/DeleteStubFileTask.java       |  23 +-
+ .../wiremock/common/AbstractFileSource.java   |  16 +-
+ .../admin/DeleteStubFileHttpTest.java         | 110 ++++++
+ .../admin/DeleteStubFileTaskEdgeCaseTest.java | 227 +++++++++++
+ .../DeleteStubFileTaskPathTraversalTest.java  | 370 ++++++++++++++++++
+ .../admin/DeleteStubFileTaskTest.java         | 209 ++++++++++
+ 6 files changed, 949 insertions(+), 6 deletions(-)
+ create mode 100644 src/test/java/com/github/tomakehurst/wiremock/admin/DeleteStubFileHttpTest.java
+ create mode 100644 src/test/java/com/github/tomakehurst/wiremock/admin/DeleteStubFileTaskEdgeCaseTest.java
+ create mode 100644 src/test/java/com/github/tomakehurst/wiremock/admin/DeleteStubFileTaskPathTraversalTest.java
+ create mode 100644 src/test/java/com/github/tomakehurst/wiremock/admin/DeleteStubFileTaskTest.java
+
+diff --git a/src/main/java/com/github/tomakehurst/wiremock/admin/tasks/DeleteStubFileTask.java b/src/main/java/com/github/tomakehurst/wiremock/admin/tasks/DeleteStubFileTask.java
+index a98d0e4f..0d8d1f83 100644
+--- a/src/main/java/com/github/tomakehurst/wiremock/admin/tasks/DeleteStubFileTask.java
++++ b/src/main/java/com/github/tomakehurst/wiremock/admin/tasks/DeleteStubFileTask.java
+@@ -31,11 +31,24 @@ public class DeleteStubFileTask implements AdminTask {
+     @Override
+     public ResponseDefinition execute(Admin admin, Request request, PathParams pathParams) {
+         FileSource fileSource = admin.getOptions().filesRoot().child(FILES_ROOT);
+-        File filename = new File(fileSource.getPath(), pathParams.get("filename"));
+-        boolean deleted = filename.delete();
+-        if (deleted) {
+-            return ResponseDefinition.ok();
+-        } else {
++        String filenameParam = pathParams.get("filename");
++        try {
++            // Delete through FileSource.deleteFile, which enforces path containment via
++            // AbstractFileSource.assertFilePathIsUnderRoot (canonical-path check anchored to the
++            // __files root), so a traversal {filename} value cannot delete a file outside the root
++            // (CWE-22 / CWE-73). Deleting the raw File directly would skip that check.
++            File filename = new File(fileSource.getPath(), filenameParam);
++            boolean existedBefore = filename.exists();
++            fileSource.deleteFile(filenameParam);
++            boolean deleted = existedBefore && !filename.exists();
++            if (deleted) {
++                return ResponseDefinition.ok();
++            } else {
++                return new ResponseDefinition(HTTP_INTERNAL_ERROR, "File not deleted");
++            }
++        } catch (RuntimeException e) {
++            // A blocked traversal (NotAuthorisedException) or any resolution failure is reported as
++            // a failed delete rather than crashing the admin request; nothing outside root is removed.
+             return new ResponseDefinition(HTTP_INTERNAL_ERROR, "File not deleted");
+         }
+     }
+diff --git a/src/main/java/com/github/tomakehurst/wiremock/common/AbstractFileSource.java b/src/main/java/com/github/tomakehurst/wiremock/common/AbstractFileSource.java
+index ee9c2da8..d7c4a20e 100644
+--- a/src/main/java/com/github/tomakehurst/wiremock/common/AbstractFileSource.java
++++ b/src/main/java/com/github/tomakehurst/wiremock/common/AbstractFileSource.java
+@@ -111,7 +111,21 @@ public abstract class AbstractFileSource implements FileSource {
+ 
+     @Override
+     public void deleteFile(String name) {
+-        writableFileFor(name).delete();
++        File file = writableFileFor(name);
++
++        // assertFilePathIsUnderRoot() (invoked by writableFileFor()) treats a value that canonically
++        // resolves to exactly the root directory as contained, which is right for reads and writes.
++        // For a delete it would let a name such as "" or "." remove the root directory itself
++        // whenever it is empty, so that case is refused here.
++        try {
++            if (file.getCanonicalFile().equals(rootDirectory.getCanonicalFile())) {
++                throw new NotAuthorisedException("Deleting the file source root directory is not permitted");
++            }
++        } catch (IOException ioe) {
++            throw new NotAuthorisedException("File " + name + " cannot be accessed", ioe);
++        }
++
++        file.delete();
+     }
+ 
+     @Override
+diff --git a/src/test/java/com/github/tomakehurst/wiremock/admin/DeleteStubFileHttpTest.java b/src/test/java/com/github/tomakehurst/wiremock/admin/DeleteStubFileHttpTest.java
+new file mode 100644
+index 00000000..f64fa5d1
+--- /dev/null
++++ b/src/test/java/com/github/tomakehurst/wiremock/admin/DeleteStubFileHttpTest.java
+@@ -0,0 +1,110 @@
++/*
++ * Copyright (C) 2011 Thomas Akehurst
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.github.tomakehurst.wiremock.admin;
++
++import com.github.tomakehurst.wiremock.WireMockServer;
++import com.github.tomakehurst.wiremock.testsupport.WireMockResponse;
++import com.github.tomakehurst.wiremock.testsupport.WireMockTestClient;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++
++import java.io.File;
++import java.nio.file.Files;
++
++import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.wireMockConfig;
++import static org.hamcrest.MatcherAssert.assertThat;
++import static org.hamcrest.Matchers.is;
++import static org.junit.Assert.assertTrue;
++
++/**
++ * DELETE /__admin/files/{filename} traversal attempts sent through the real Jetty HTTP stack and
++ * admin router, rather than by calling DeleteStubFileTask.execute() directly. AdminUriTemplate splits
++ * the URL on "/" and requires an exact segment count, so a literal or percent-encoded traversal
++ * payload either does not route to DeleteStubFileTask at all, or routes to it and is refused by the
++ * containment check. Either way the file outside __files must survive.
++ */
++public class DeleteStubFileHttpTest {
++
++    @Rule
++    public TemporaryFolder temp = new TemporaryFolder();
++
++    private WireMockServer wm;
++    private WireMockTestClient client;
++
++    private File filesRootDir;   // <root>
++    private File filesDir;       // <root>/__files
++    private File secret;         // <root>/__files-archive/secret.txt
++
++    @Before
++    public void setUp() throws Exception {
++        filesRootDir = temp.newFolder("filesRoot");
++        filesDir = new File(filesRootDir, "__files");
++        assertTrue(filesDir.mkdirs());
++
++        File archiveSibling = new File(filesRootDir, "__files-archive");
++        assertTrue(archiveSibling.mkdirs());
++        secret = new File(archiveSibling, "secret.txt");
++        Files.write(secret.toPath(), "TOP-SECRET-HTTP".getBytes("UTF-8"));
++
++        wm = new WireMockServer(wireMockConfig().dynamicPort().withRootDirectory(filesRootDir.getAbsolutePath()));
++        wm.start();
++        client = new WireMockTestClient(wm.port());
++    }
++
++    @After
++    public void tearDown() {
++        wm.stop();
++    }
++
++    private String secretContents() throws Exception {
++        return new String(Files.readAllBytes(secret.toPath()), "UTF-8");
++    }
++
++    @Test
++    public void httpDeleteWithLiteralTraversalDoesNotDeleteSibling() throws Exception {
++        WireMockResponse response = client.delete("/__admin/files/../__files-archive/secret.txt");
++
++        assertThat("SECURITY: sibling file must still exist after an HTTP DELETE traversal attempt "
++                        + "(status " + response.statusCode() + ")",
++                secret.exists(), is(true));
++        assertThat(secretContents(), is("TOP-SECRET-HTTP"));
++    }
++
++    @Test
++    public void httpDeleteWithPercentEncodedTraversalDoesNotDeleteSibling() throws Exception {
++        WireMockResponse response = client.delete("/__admin/files/..%2F__files-archive%2Fsecret.txt");
++
++        assertThat("SECURITY: sibling file must still exist after an HTTP DELETE percent-encoded "
++                        + "traversal attempt (status " + response.statusCode() + ")",
++                secret.exists(), is(true));
++        assertThat(secretContents(), is("TOP-SECRET-HTTP"));
++    }
++
++    /** A genuine single-segment filename inside __files is still deleted over real HTTP. */
++    @Test
++    public void httpDeleteWithLegitimateFilenameStillDeletes() throws Exception {
++        File legit = new File(filesDir, "legit.json");
++        Files.write(legit.toPath(), "LEGIT-BODY".getBytes("UTF-8"));
++
++        WireMockResponse response = client.delete("/__admin/files/legit.json");
++
++        assertThat(response.statusCode(), is(200));
++        assertThat(legit.exists(), is(false));
++    }
++}
+diff --git a/src/test/java/com/github/tomakehurst/wiremock/admin/DeleteStubFileTaskEdgeCaseTest.java b/src/test/java/com/github/tomakehurst/wiremock/admin/DeleteStubFileTaskEdgeCaseTest.java
+new file mode 100644
+index 00000000..9a9669f0
+--- /dev/null
++++ b/src/test/java/com/github/tomakehurst/wiremock/admin/DeleteStubFileTaskEdgeCaseTest.java
+@@ -0,0 +1,227 @@
++/*
++ * Copyright (C) 2011 Thomas Akehurst
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.github.tomakehurst.wiremock.admin;
++
++import com.github.tomakehurst.wiremock.admin.model.PathParams;
++import com.github.tomakehurst.wiremock.admin.tasks.DeleteStubFileTask;
++import com.github.tomakehurst.wiremock.common.FileSource;
++import com.github.tomakehurst.wiremock.common.SingleRootFileSource;
++import com.github.tomakehurst.wiremock.core.Admin;
++import com.github.tomakehurst.wiremock.core.Options;
++import com.github.tomakehurst.wiremock.http.Request;
++import com.github.tomakehurst.wiremock.http.ResponseDefinition;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++
++import java.io.File;
++
++import static org.hamcrest.MatcherAssert.assertThat;
++import static org.hamcrest.Matchers.is;
++import static org.junit.Assert.assertTrue;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++/**
++ * Edge-case {filename} values for DeleteStubFileTask that are not covered by
++ * DeleteStubFileTaskPathTraversalTest: bare "." and ".." single-segment values reachable via the
++ * router's trailing-slash-collapse behaviour, an embedded-separator multi-segment traversal that
++ * combines a legitimate-looking subdirectory prefix with an escaping "..", a NUL-byte injection, and
++ * a genuinely absolute path. Each asserts that the target survives and the sink does not report
++ * success.
++ */
++public class DeleteStubFileTaskEdgeCaseTest {
++
++    @Rule
++    public TemporaryFolder temp = new TemporaryFolder();
++
++    private DeleteStubFileTask task;
++    private Admin admin;
++    private Request request;
++
++    private File filesRootDir;
++    private File filesDir;
++
++    @Before
++    public void setUp() throws Exception {
++        task = new DeleteStubFileTask();
++        request = mock(Request.class);
++
++        filesRootDir = temp.newFolder("filesRoot");
++        filesDir = new File(filesRootDir, "__files");
++        assertTrue(filesDir.mkdirs());
++
++        FileSource filesRoot = new SingleRootFileSource(filesRootDir);
++
++        Options options = mock(Options.class);
++        when(options.filesRoot()).thenReturn(filesRoot);
++        admin = mock(Admin.class);
++        when(admin.getOptions()).thenReturn(options);
++    }
++
++    private static void writeMarker(File f) throws Exception {
++        File parent = f.getParentFile();
++        if (parent != null && !parent.exists()) {
++            assertTrue(parent.mkdirs());
++        }
++        com.google.common.io.Files.write("marker".getBytes("UTF-8"), f);
++    }
++
++    /**
++     * A bare "." {filename}. Reachable via the real HTTP endpoint through the router's
++     * trailing-slash-collapse (DELETE /__admin/files/./ splits to the same part count as
++     * DELETE /__admin/files/{filename}, with the segment "."). "." canonically resolves to EXACTLY
++     * the __files root -- must be blocked the same way the empty-string case is (deleteFile()'s
++     * explicit root-equality guard), not merely by accident.
++     */
++    @Test
++    public void bareDotFilenameDoesNotDeleteFilesRootDirectoryItself() throws Exception {
++        assertTrue("precondition: __files root exists before attack", filesDir.exists());
++        assertThat("precondition: __files root is currently empty", filesDir.list().length, is(0));
++
++        ResponseDefinition response = task.execute(admin, request, PathParams.single("filename", "."));
++
++        assertThat("SECURITY: a bare '.' {filename} must NOT delete the __files root directory itself",
++                filesDir.exists(), is(true));
++        assertThat("SECURITY: the sink must not report success for destroying the root via '.'",
++                response.getStatus(), is(not200()));
++    }
++
++    /**
++     * A bare ".." {filename} (no slash) -- reachable via the router's trailing-slash
++     * collapse (DELETE /__admin/files/../ splits to the segment ".."). Canonically resolves to the
++     * PARENT of __files (filesRootDir itself), which does not equal and is not prefixed by rootPath,
++     * so it must be rejected by the same containment check as the "../victimDir" documented payload.
++     */
++    @Test
++    public void bareDotDotFilenameDoesNotDeleteParentDirectory() throws Exception {
++        assertTrue("precondition: parent (filesRootDir) exists before attack", filesRootDir.exists());
++
++        ResponseDefinition response = task.execute(admin, request, PathParams.single("filename", ".."));
++
++        assertThat("SECURITY: a bare '..' {filename} must NOT delete/affect the parent of __files",
++                filesRootDir.exists(), is(true));
++        assertThat("SECURITY: the sink must not report success for a bare '..' {filename}",
++                response.getStatus(), is(not200()));
++    }
++
++    /**
++     * An embedded-separator multi-segment value that combines a legitimate-looking
++     * subdirectory prefix with a traversal back out past the root ("subdir/../../important-file.txt").
++     * The containment check must accept legitimate nested relative paths while still rejecting a
++     * multi-segment value that nets out above root. A fix that only checks "does the FIRST segment
++     * start with .." (rather than canonicalising the whole joined path) would miss this.
++     */
++    @Test
++    public void embeddedSeparatorTraversalViaLegitimateLookingSubdirIsBlocked() throws Exception {
++        File subdir = new File(filesDir, "subdir");
++        assertTrue(subdir.mkdirs());
++        File victim = new File(filesRootDir, "important-file.txt");
++        writeMarker(victim);
++        assertTrue("precondition: out-of-root victim exists before attack", victim.exists());
++
++        ResponseDefinition response = task.execute(
++                admin, request, PathParams.single("filename", "subdir/../../important-file.txt"));
++
++        assertThat("SECURITY: 'subdir/../../important-file.txt' must NOT delete a file outside __files",
++                victim.exists(), is(true));
++        assertThat("SECURITY: the sink must not report success for the embedded-separator traversal",
++                response.getStatus(), is(not200()));
++    }
++
++    /**
++     * The same embedded-separator class, but netting out to the sibling-prefix-collision
++     * directory ("subdir/../../__filesEVIL/marker.txt") rather than a plain parent-relative file --
++     * combines two evasion classes (legitimate subdir prefix + sibling collision) in one payload.
++     */
++    @Test
++    public void embeddedSeparatorTraversalToSiblingPrefixCollisionIsBlocked() throws Exception {
++        File subdir = new File(filesDir, "subdir");
++        assertTrue(subdir.mkdirs());
++        File evilSibling = new File(filesRootDir, "__filesEVIL");
++        assertTrue(evilSibling.mkdirs());
++        File victim = new File(evilSibling, "marker.txt");
++        writeMarker(victim);
++        assertTrue("precondition: sibling-collision victim exists before attack", victim.exists());
++
++        ResponseDefinition response = task.execute(
++                admin, request, PathParams.single("filename", "subdir/../../__filesEVIL/marker.txt"));
++
++        assertThat("SECURITY: embedded-separator sibling-collision traversal must NOT delete the victim",
++                victim.exists(), is(true));
++        assertThat("SECURITY: the sink must not report success for the embedded sibling-collision traversal",
++                response.getStatus(), is(not200()));
++    }
++
++    /**
++     * A NUL byte embedded in an otherwise-traversing {filename}
++     * ("important-file.txt\0/../../important-file.txt"). Tests whether a native/NUL-truncation
++     * discrepancy between what Java's canonicalisation validates and what any lower layer would act
++     * on could let a truncated form slip past the check. Java's File/NIO layer is expected to reject
++     * embedded NULs (fail closed) rather than silently truncate.
++     */
++    @Test
++    public void nulByteEmbeddedInFilenameDoesNotBypassContainment() throws Exception {
++        File victim = new File(filesRootDir, "important-file.txt");
++        writeMarker(victim);
++        assertTrue("precondition: out-of-root victim exists before attack", victim.exists());
++
++        String payload = "safe\u0000/../../important-file.txt";
++        ResponseDefinition response;
++        try {
++            response = task.execute(admin, request, PathParams.single("filename", payload));
++        } catch (RuntimeException e) {
++            // DeleteStubFileTask.execute() catches RuntimeException, so an exception here means the
++            // payload crashed the task instead of being rejected.
++            throw new AssertionError("NUL-byte payload escaped DeleteStubFileTask's catch(RuntimeException): " + e, e);
++        }
++
++        assertThat("SECURITY: a NUL-byte-embedded traversal must NOT delete a file outside __files",
++                victim.exists(), is(true));
++        assertThat("SECURITY: the sink must not report success for the NUL-byte-embedded traversal",
++                response.getStatus(), is(not200()));
++    }
++
++    /**
++     * A genuinely absolute path on a Unix JVM, which takes the {@code File.isAbsolute()} branch of
++     * assertFilePathIsUnderRoot(). The Windows drive and UNC payloads in
++     * DeleteStubFileTaskPathTraversalTest are not absolute to java.io.File on Unix, so they do not
++     * reach that branch there. The victim is a real file in the temp folder, outside __files, and must
++     * survive.
++     */
++    @Test
++    public void genuineAbsoluteUnixPathIsBlockedByIsAbsoluteBranch() throws Exception {
++        File absoluteVictim = temp.newFile("absolute-victim.txt");
++        writeMarker(absoluteVictim);
++        assertTrue("precondition: absolute victim exists before attack", absoluteVictim.exists());
++        String absolutePath = absoluteVictim.getAbsolutePath();
++        assertTrue("precondition: payload is genuinely isAbsolute() on this JVM",
++                new File(absolutePath).isAbsolute());
++
++        ResponseDefinition response =
++                task.execute(admin, request, PathParams.single("filename", absolutePath));
++
++        assertThat("SECURITY: a genuinely absolute {filename} must NOT delete the target file",
++                absoluteVictim.exists(), is(true));
++        assertThat("SECURITY: the sink must not report success for a genuinely absolute {filename}",
++                response.getStatus(), is(not200()));
++    }
++
++    private static org.hamcrest.Matcher<Integer> not200() {
++        return org.hamcrest.Matchers.not(200);
++    }
++}
+diff --git a/src/test/java/com/github/tomakehurst/wiremock/admin/DeleteStubFileTaskPathTraversalTest.java b/src/test/java/com/github/tomakehurst/wiremock/admin/DeleteStubFileTaskPathTraversalTest.java
+new file mode 100644
+index 00000000..bdca8162
+--- /dev/null
++++ b/src/test/java/com/github/tomakehurst/wiremock/admin/DeleteStubFileTaskPathTraversalTest.java
+@@ -0,0 +1,370 @@
++/*
++ * Copyright (C) 2011 Thomas Akehurst
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.github.tomakehurst.wiremock.admin;
++
++import com.github.tomakehurst.wiremock.admin.model.PathParams;
++import com.github.tomakehurst.wiremock.admin.tasks.DeleteStubFileTask;
++import com.github.tomakehurst.wiremock.common.FileSource;
++import com.github.tomakehurst.wiremock.common.SingleRootFileSource;
++import com.github.tomakehurst.wiremock.core.Admin;
++import com.github.tomakehurst.wiremock.core.Options;
++import com.github.tomakehurst.wiremock.http.Request;
++import com.github.tomakehurst.wiremock.http.ResponseDefinition;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++
++import java.io.File;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++
++import static java.net.HttpURLConnection.HTTP_INTERNAL_ERROR;
++import static org.hamcrest.MatcherAssert.assertThat;
++import static org.hamcrest.Matchers.is;
++import static org.hamcrest.Matchers.not;
++import static org.junit.Assert.assertTrue;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++/**
++ * Path-traversal deletion tests for DELETE /__admin/files/{filename} (CWE-22 / CWE-73).
++ *
++ * <p>The sink is DeleteStubFileTask.execute(Admin,Request,PathParams): the raw {filename} segment is
++ * turned into a file under the __files root and deleted. It used to do
++ * {@code new File(fileSource.getPath(), filename).delete()} with no canonicalisation and no
++ * root-containment check, so a traversal, sibling-collision or symlink {filename} value deleted a
++ * file or directory outside the configured __files root. The delete now goes through
++ * FileSource.deleteFile() -&gt; AbstractFileSource.deleteFile() -&gt; assertFilePathIsUnderRoot(), an
++ * OS-native {@code getCanonicalPath()}-based containment check.
++ *
++ * <p>Every test drives the real sink through a mocked Admin/Options whose filesRoot() returns a real
++ * SingleRootFileSource rooted at a temp dir and asserts that the out-of-root target still exists
++ * after the call and that the sink returned the rejection response (never HTTP 200, never an uncaught
++ * exception). Beyond the plain traversal payloads it covers Windows backslash, drive-letter and UNC
++ * {filename} values, and a platform-independent check that the sink relies on OS-native canonical
++ * path resolution (a symlinked directory component that escapes the root under
++ * {@code getCanonicalPath()} but looks contained under a normalize()-only check).
++ */
++public class DeleteStubFileTaskPathTraversalTest {
++
++    @Rule
++    public TemporaryFolder temp = new TemporaryFolder();
++
++    private DeleteStubFileTask task;
++    private Admin admin;
++    private Request request;
++
++    private File filesRootDir;   // <root>            (what Options.filesRoot() points at)
++    private File filesDir;       // <root>/__files    (the SingleRootFileSource the sink resolves)
++
++    @Before
++    public void setUp() throws Exception {
++        task = new DeleteStubFileTask();
++        request = mock(Request.class);
++
++        // The configured files root, and the __files subdir the task's sink resolves to via
++        // filesRoot().child(FILES_ROOT). Both must exist on disk.
++        filesRootDir = temp.newFolder("filesRoot");
++        filesDir = new File(filesRootDir, "__files");
++        assertTrue(filesDir.mkdirs());
++
++        // A real FileSource pointed at the files root; Options.filesRoot() returns it, and the sink
++        // does filesRoot().child("__files") on it, yielding <root>/__files as the intended base.
++        FileSource filesRoot = new SingleRootFileSource(filesRootDir);
++
++        Options options = mock(Options.class);
++        when(options.filesRoot()).thenReturn(filesRoot);
++        admin = mock(Admin.class);
++        when(admin.getOptions()).thenReturn(options);
++    }
++
++    /**
++     * Drive the exact sink with {@code filenameParam} and assert the secure rejection response: a
++     * blocked deletion is reported as the existing "File not deleted" (HTTP 500) failure response,
++     * never success and never an uncaught crash. This is a specific bound (HTTP_INTERNAL_ERROR), not
++     * a catch-all; the primary security oracle is the out-of-root-survival assertion in each caller.
++     */
++    private void assertAttackRejected(String filenameParam) {
++        ResponseDefinition response =
++                task.execute(admin, request, PathParams.single("filename", filenameParam));
++        assertThat("SECURITY: a blocked delete must return the rejection response, not success",
++                response.getStatus(), is(HTTP_INTERNAL_ERROR));
++    }
++
++    // ---------------------------------------------------------------------------------------------
++    // Traversal payloads.
++    // ---------------------------------------------------------------------------------------------
++
++    /**
++     * "../important-file.txt": the victim lives directly under the files root, one level above
++     * __files, and is reached by a forward-slash traversal.
++     */
++    @Test
++    public void dotDotSlashFileIsNotDeletedOutsideFilesRoot() throws Exception {
++        File victim = new File(filesRootDir, "important-file.txt");
++        writeMarker(victim);
++        assertTrue("precondition: victim exists before attack", victim.exists());
++
++        assertAttackRejected("../important-file.txt");
++
++        assertThat("SECURITY: '../important-file.txt' must NOT delete a file outside __files",
++                victim.exists(), is(true));
++    }
++
++    /**
++     * "../victimDir": an empty directory outside __files, reachable as "__files/../victimDir".
++     * File.delete() removes an empty directory, so without containment it would be destroyed.
++     */
++    @Test
++    public void dotDotSlashDirectoryIsNotDeletedOutsideFilesRoot() throws Exception {
++        File victimDir = new File(filesRootDir, "victimDir");
++        assertTrue(victimDir.mkdir());
++        assertTrue("precondition: victim dir exists before attack", victimDir.exists());
++
++        assertAttackRejected("../victimDir");
++
++        assertThat("SECURITY: '../victimDir' must NOT delete a directory outside __files",
++                victimDir.exists(), is(true));
++    }
++
++    /**
++     * "../__filesEVIL/marker.txt": sibling-directory-name collision. The target's canonical path
++     * string-starts-with the __files canonical path, so a containment check whose startsWith lacks
++     * the File.separator suffix would let it through.
++     */
++    @Test
++    public void siblingDirectoryPrefixCollisionFileIsNotDeletedOutsideFilesRoot() throws Exception {
++        File evilSibling = new File(filesRootDir, "__filesEVIL");
++        assertTrue(evilSibling.mkdirs());
++        File victim = new File(evilSibling, "marker.txt");
++        writeMarker(victim);
++        assertTrue("precondition: sibling-collision victim exists before attack", victim.exists());
++
++        assertAttackRejected("../__filesEVIL/marker.txt");
++
++        assertThat("SECURITY: '../__filesEVIL/marker.txt' must NOT delete a file outside __files",
++                victim.exists(), is(true));
++    }
++
++    /**
++     * "" (empty string): new File(<...>/__files, "") canonically resolves to the
++     * __files root directory itself, and the raw File handed to .delete() is byte-identical to the
++     * root dir (no trailing "/." the OS would refuse), so an empty {filename} DELETES THE __files
++     * ROOT DIRECTORY ITSELF when it is currently empty (fresh instance / all files already removed) --
++     * strictly worse than a single-file escape.
++     */
++    @Test
++    public void emptyFilenameDoesNotDeleteFilesRootDirectoryItself() throws Exception {
++        assertTrue("precondition: __files root exists before attack", filesDir.exists());
++        assertTrue("precondition: __files root is a directory", filesDir.isDirectory());
++        assertThat("precondition: __files root is currently empty (fresh instance / all files removed)",
++                filesDir.list().length, is(0));
++
++        ResponseDefinition response =
++                task.execute(admin, request, PathParams.single("filename", ""));
++
++        assertThat("SECURITY: an empty {filename} must NOT delete the __files root directory itself",
++                filesDir.exists(), is(true));
++        assertThat("SECURITY: the sink must not report success for destroying the root",
++                response.getStatus(), is(not(200)));
++    }
++
++    /**
++     * "..\..\..\Windows\win.ini": the Windows backslash traversal.
++     *
++     * <p>On a Windows JVM java.io.File treats '\' as a separator and this escapes __files; on the
++     * Linux test host '\' is an ordinary filename character, so this value CANNOT by itself reach a
++     * file outside __files here (it names a single in-root file whose name contains backslashes). We
++     * therefore drive the exact payload through the sink and assert the two things that DO hold
++     * platform-independently: no pre-existing out-of-root file with the corresponding Windows target
++     * name is removed, and the sink never reports success for it. The genuinely platform-INDEPENDENT
++     * proof that the sink relies on OS-native canonicalisation (which is what defends this payload on
++     * Windows) is {@link #osNativeCanonicalisationSymlinkEscapeIsBlocked()} below.
++     */
++    @Test
++    public void windowsBackslashTraversalPayloadDeletesNothingOutsideFilesRoot() throws Exception {
++        // A would-be victim one level above __files, named as the last segment of the Windows payload.
++        File victim = new File(filesRootDir, "win.ini");
++        writeMarker(victim);
++        assertTrue("precondition: out-of-root victim exists before attack", victim.exists());
++
++        ResponseDefinition response =
++                task.execute(admin, request, PathParams.single("filename", "..\\..\\..\\Windows\\win.ini"));
++
++        assertThat("SECURITY: the Windows backslash payload must not delete a file outside __files",
++                victim.exists(), is(true));
++        assertThat("SECURITY: the sink must not report success for the Windows backslash payload",
++                response.getStatus(), is(not(200)));
++    }
++
++    // ---------------------------------------------------------------------------------------------
++    // Absolute Windows-drive / UNC {filename}.
++    // ---------------------------------------------------------------------------------------------
++
++    /**
++     * An absolute Windows drive path as {filename}.
++     * On a Windows JVM "C:\Windows\win.ini" is absolute and, via the containment check's
++     * absolute-branch canonicalisation, must be rejected as outside root. Platform-independently on
++     * a Linux host it names an in-root path segment; we assert no out-of-root file is removed and the
++     * sink does not report success.
++     */
++    @Test
++    public void windowsDriveAbsolutePayloadDeletesNothingOutsideFilesRoot() throws Exception {
++        File victim = new File(filesRootDir, "win.ini");
++        writeMarker(victim);
++        assertTrue("precondition: out-of-root victim exists before attack", victim.exists());
++
++        ResponseDefinition response =
++                task.execute(admin, request, PathParams.single("filename", "C:\\Windows\\win.ini"));
++
++        assertThat("SECURITY: a Windows drive-absolute {filename} must not delete a file outside __files",
++                victim.exists(), is(true));
++        assertThat("SECURITY: the sink must not report success for a Windows drive-absolute {filename}",
++                response.getStatus(), is(not(200)));
++    }
++
++    /**
++     * A Windows UNC share path as {filename}. On a
++     * Windows JVM "\\host\share\file" targets a remote share outside any local root and must be
++     * rejected. Platform-independently on a Linux host it names an in-root path segment; we assert no
++     * out-of-root file is removed and the sink does not report success.
++     */
++    @Test
++    public void windowsUncPayloadDeletesNothingOutsideFilesRoot() throws Exception {
++        File victim = new File(filesRootDir, "file");
++        writeMarker(victim);
++        assertTrue("precondition: out-of-root victim exists before attack", victim.exists());
++
++        ResponseDefinition response =
++                task.execute(admin, request, PathParams.single("filename", "\\\\host\\share\\file"));
++
++        assertThat("SECURITY: a Windows UNC {filename} must not delete a file outside __files",
++                victim.exists(), is(true));
++        assertThat("SECURITY: the sink must not report success for a Windows UNC {filename}",
++                response.getStatus(), is(not(200)));
++    }
++
++    // ---------------------------------------------------------------------------------------------
++    // Platform-independent check of OS-native canonicalisation.
++    // ---------------------------------------------------------------------------------------------
++
++    /**
++     * Platform-independent check: the sink must defend via genuine OS-native
++     * canonical-path resolution, the same mechanism that resolves Windows backslashes on a Windows
++     * JVM -- NOT a forward-slash-only or normalize()-only string check.
++     *
++     * <p>Construction: a directory OUTSIDE __files containing a real victim file, and a SYMLINK named
++     * "escape" INSIDE __files that points at that outside directory. The {filename} value
++     * "escape/victim.txt" therefore:
++     * <ul>
++     *   <li>under {@code getCanonicalPath()} / {@code toRealPath()} (OS-native) resolves to the real
++     *       file OUTSIDE __files -&gt; a correct containment check REJECTS it;</li>
++     *   <li>under {@code Path.normalize()} or a manual "does it contain ../" style string check
++     *       resolves to a path that still string-starts-with __files -&gt; such a weak check ACCEPTS
++     *       it (bypass).</li>
++     * </ul>
++     * Without containment the sink follows the symlinked directory and deletes the real outside
++     * file; a check that used normalize() or forward-slash-only string matching would do the same.
++     * Fails loudly if the host cannot create symlinks rather than silently passing.
++     */
++    @Test
++    public void osNativeCanonicalisationSymlinkEscapeIsBlocked() throws Exception {
++        // A real victim file in a directory that lives OUTSIDE __files.
++        File outsideDir = new File(filesRootDir, "outsideDir");
++        assertTrue(outsideDir.mkdirs());
++        File victim = new File(outsideDir, "victim.txt");
++        writeMarker(victim);
++        assertTrue("precondition: out-of-root victim exists before attack", victim.exists());
++
++        // A symlink INSIDE __files pointing at the outside directory. If the platform cannot create
++        // symlinks, fail loudly rather than silently passing (org.junit.Assume would hide the gap).
++        Path link = new File(filesDir, "escape").toPath();
++        Path target = outsideDir.toPath();
++        try {
++            Files.createSymbolicLink(link, target);
++        } catch (UnsupportedOperationException | java.io.IOException e) {
++            throw new IllegalStateException(
++                    "OS-native canonicalisation proof requires symlink support on the test host", e);
++        }
++        assertTrue("precondition: symlink inside __files was created", Files.isSymbolicLink(link));
++
++        // Sanity: a normalize()-only view WOULD consider this contained -- the exact weak check this
++        // test exists to defeat. (Not the security oracle, just documents the discriminator.)
++        assertTrue("discriminator: normalize()-only view treats the symlink path as in-root",
++                Paths.get(filesDir.getPath(), "escape", "victim.txt").normalize()
++                        .startsWith(Paths.get(filesDir.getPath())));
++
++        assertAttackRejected("escape/victim.txt");
++
++        assertThat("SECURITY: an OS-native symlink escape must NOT delete a file outside __files",
++                victim.exists(), is(true));
++    }
++
++    // ---------------------------------------------------------------------------------------------
++    // Legitimate deletes keep working.
++    // ---------------------------------------------------------------------------------------------
++
++    /**
++     * A legitimate single-segment in-root filename must still be deleted and return
++     * the success (HTTP 200) response. Catches an over-tight containment fix.
++     */
++    @Test
++    public void legitimateTopLevelInRootFileIsStillDeleted() throws Exception {
++        File legit = new File(filesDir, "response-body.json");
++        writeMarker(legit);
++        assertTrue("precondition: legit in-root file exists before delete", legit.exists());
++
++        ResponseDefinition response =
++                task.execute(admin, request, PathParams.single("filename", "response-body.json"));
++
++        assertThat("PRESERVATION: a legitimate top-level in-root file must still be deleted",
++                legit.exists(), is(false));
++        assertThat("PRESERVATION: a legitimate delete must still return the success response (HTTP 200)",
++                response.getStatus(), is(200));
++    }
++
++    /**
++     * A legitimate filename inside a legitimately-created SUBDIRECTORY of __files
++     * (a multi-segment relative path under root) must still be deletable and return HTTP 200. A fix
++     * that rejects any {filename} containing a separator would be over-broad and fail this.
++     */
++    @Test
++    public void legitimateNestedSubdirectoryInRootFileIsStillDeleted() throws Exception {
++        File subdir = new File(filesDir, "subdir");
++        assertTrue(subdir.mkdirs());
++        File legit = new File(subdir, "response.json");
++        writeMarker(legit);
++        assertTrue("precondition: legit nested in-root file exists before delete", legit.exists());
++
++        ResponseDefinition response =
++                task.execute(admin, request, PathParams.single("filename", "subdir/response.json"));
++
++        assertThat("PRESERVATION: a legitimate nested-subdirectory in-root file must still be deleted",
++                legit.exists(), is(false));
++        assertThat("PRESERVATION: a legitimate nested delete must still return the success response (HTTP 200)",
++                response.getStatus(), is(200));
++    }
++
++    private static void writeMarker(File f) throws Exception {
++        File parent = f.getParentFile();
++        if (parent != null && !parent.exists()) {
++            assertTrue(parent.mkdirs());
++        }
++        com.google.common.io.Files.write("marker".getBytes("UTF-8"), f);
++    }
++}
+diff --git a/src/test/java/com/github/tomakehurst/wiremock/admin/DeleteStubFileTaskTest.java b/src/test/java/com/github/tomakehurst/wiremock/admin/DeleteStubFileTaskTest.java
+new file mode 100644
+index 00000000..98372c1d
+--- /dev/null
++++ b/src/test/java/com/github/tomakehurst/wiremock/admin/DeleteStubFileTaskTest.java
+@@ -0,0 +1,209 @@
++/*
++ * Copyright (C) 2011 Thomas Akehurst
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.github.tomakehurst.wiremock.admin;
++
++import com.github.tomakehurst.wiremock.admin.model.PathParams;
++import com.github.tomakehurst.wiremock.admin.tasks.DeleteStubFileTask;
++import com.github.tomakehurst.wiremock.common.FileSource;
++import com.github.tomakehurst.wiremock.common.SingleRootFileSource;
++import com.github.tomakehurst.wiremock.core.Admin;
++import com.github.tomakehurst.wiremock.core.Options;
++import com.github.tomakehurst.wiremock.http.Request;
++import com.github.tomakehurst.wiremock.http.ResponseDefinition;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++
++import java.io.File;
++
++import static java.net.HttpURLConnection.HTTP_INTERNAL_ERROR;
++import static org.hamcrest.MatcherAssert.assertThat;
++import static org.hamcrest.Matchers.is;
++import static org.junit.Assert.assertTrue;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++/**
++ * Regression tests for path traversal in DeleteStubFileTask (CWE-22 / CWE-73):
++ * DeleteStubFileTask.execute() built a File straight from the {filename} path parameter and called
++ * .delete() with no path-containment check, so a traversal or sibling-collision value deleted files
++ * outside the __files root.
++ *
++ * The delete now goes through FileSource.deleteFile(), which enforces path containment via
++ * AbstractFileSource.assertFilePathIsUnderRoot (a canonical-path check anchored to the __files root).
++ * A blocked attempt returns the existing "File not deleted" (HTTP 500) failure response and deletes
++ * nothing outside the root.
++ *
++ * These tests drive the real sink (DeleteStubFileTask.execute(Admin,Request,PathParams)) through a
++ * mocked Admin/Options whose filesRoot() returns a real SingleRootFileSource rooted at a temp dir.
++ * Each attack test asserts that the file outside __files still exists after the call and that the
++ * sink returned the rejection response (never success, never an uncaught exception).
++ */
++public class DeleteStubFileTaskTest {
++
++    @Rule
++    public TemporaryFolder temp = new TemporaryFolder();
++
++    private DeleteStubFileTask task;
++    private Admin admin;
++    private Request request;
++
++    private File filesRootDir;   // <root>            (what Options.filesRoot() points at)
++    private File filesDir;       // <root>/__files    (the SingleRootFileSource the sink resolves)
++
++    @Before
++    public void setUp() throws Exception {
++        task = new DeleteStubFileTask();
++        request = mock(Request.class);
++
++        // The configured files root, and the __files subdir the task's sink resolves to via
++        // filesRoot().child(FILES_ROOT). Both must exist on disk.
++        filesRootDir = temp.newFolder("filesRoot");
++        filesDir = new File(filesRootDir, "__files");
++        assertTrue(filesDir.mkdirs());
++
++        // A real FileSource pointed at the files root; Options.filesRoot() returns it, and the sink
++        // does filesRoot().child("__files") on it, yielding <root>/__files as the intended base.
++        FileSource filesRoot = new SingleRootFileSource(filesRootDir);
++
++        Options options = mock(Options.class);
++        when(options.filesRoot()).thenReturn(filesRoot);
++        admin = mock(Admin.class);
++        when(admin.getOptions()).thenReturn(options);
++    }
++
++    /**
++     * Drive the sink and assert the rejection response for a blocked attempt: a blocked traversal is
++     * reported as the existing "File not deleted" (HTTP 500) failure response, not success and not an
++     * uncaught exception. The primary check is still the file-survival assertion in each test below.
++     */
++    private void assertAttackRejected(String filenameParam) {
++        ResponseDefinition response =
++                task.execute(admin, request, PathParams.single("filename", filenameParam));
++        assertThat("SECURITY: a blocked traversal must return the rejection response, not success",
++                response.getStatus(), is(HTTP_INTERNAL_ERROR));
++    }
++
++    /**
++     * A value reaching the sink containing a literal "../" separator (for example the decoded form of
++     * "..%2Fimportant-file.txt"). The victim lives directly under the files root, one level above
++     * __files.
++     */
++    @Test
++    public void traversalWithSeparatorDoesNotDeleteFileOutsideFilesRoot() throws Exception {
++        File victim = new File(filesRootDir, "important-file.txt");
++        writeMarker(victim);
++        assertTrue("precondition: victim exists before attack", victim.exists());
++
++        // Decoded form of "..%2Fimportant-file.txt".
++        assertAttackRejected("../important-file.txt");
++
++        assertThat("SECURITY: a ../ traversal value must NOT delete a file outside __files",
++                victim.exists(), is(true));
++    }
++
++    /**
++     * A single "../" traversal to a directory. new File(<...>/__files, "../victimDir") resolves to an
++     * empty directory next to __files; File.delete() removes an empty directory, so without the
++     * containment check the directory outside __files would be deleted.
++     */
++    @Test
++    public void bareDotDotSegmentDoesNotDeleteDirectoryOutsideFilesRoot() throws Exception {
++        // An empty directory that sits OUTSIDE __files, reachable as "__files/../victimDir".
++        File victimDir = new File(filesRootDir, "victimDir");
++        assertTrue(victimDir.mkdir());
++        assertTrue("precondition: victim dir exists before attack", victimDir.exists());
++
++        // "../victimDir" is a bare single per-segment traversal (no encoding, no platform quirk).
++        assertAttackRejected("../victimDir");
++
++        assertThat("SECURITY: a traversal value must NOT delete a directory outside __files",
++                victimDir.exists(), is(true));
++    }
++
++    /*
++     * A purely absolute {filename} is not exercised here: the task builds its probe File with
++     * new File(String parent, String child), which appends an absolute child as a relative segment,
++     * so such a value names a path inside __files. Absolute values that escape are covered by
++     * DeleteStubFileTaskEdgeCaseTest.
++     */
++
++    /**
++     * Sibling-directory-name collision: a target under a sibling directory whose name has the __files
++     * root's canonical path as a bare string prefix (e.g. "<root>/__filesEVIL/..."), reached from
++     * __files as "../__filesEVIL/marker.txt". Routing through the containment check only helps if
++     * that check anchors its prefix match on a path separator.
++     */
++    @Test
++    public void siblingDirectoryPrefixCollisionDoesNotDeleteFileOutsideFilesRoot() throws Exception {
++        // <root>/__filesEVIL/marker.txt : canonical path string-starts-with <root>/__files
++        File evilSibling = new File(filesRootDir, "__filesEVIL");
++        assertTrue(evilSibling.mkdirs());
++        File victim = new File(evilSibling, "marker.txt");
++        writeMarker(victim);
++        assertTrue("precondition: sibling-collision victim exists before attack", victim.exists());
++
++        assertAttackRejected("../__filesEVIL/marker.txt");
++
++        assertThat("SECURITY: a sibling-dir-name-prefix value must NOT delete a file outside __files",
++                victim.exists(), is(true));
++    }
++
++    /**
++     * A legitimate single-segment in-root filename must still be deleted and return the success
++     * (HTTP 200) response.
++     */
++    @Test
++    public void legitimateInRootFileIsStillDeleted() throws Exception {
++        File legit = new File(filesDir, "response-body.json");
++        writeMarker(legit);
++        assertTrue("precondition: legit in-root file exists before delete", legit.exists());
++
++        ResponseDefinition response =
++                task.execute(admin, request, PathParams.single("filename", "response-body.json"));
++
++        assertThat("PRESERVATION: a legitimate in-root file must still be deleted",
++                legit.exists(), is(false));
++        assertThat("PRESERVATION: a legitimate delete must still return the success response (HTTP 200)",
++                response.getStatus(), is(200));
++    }
++
++    /**
++     * A legitimate, in-root filename that does NOT exist on disk must still
++     * produce the existing "File not deleted" (HTTP 500) failure response -- a legitimate miss must not
++     * crash and must not be conflated (differently) with a security rejection.
++     */
++    @Test
++    public void legitimateInRootMissStillReturnsFailureResponse() throws Exception {
++        File absent = new File(filesDir, "does-not-exist.json");
++        assertThat("precondition: file is absent", absent.exists(), is(false));
++
++        ResponseDefinition response =
++                task.execute(admin, request, PathParams.single("filename", "does-not-exist.json"));
++
++        assertThat("PRESERVATION: a legitimate in-root miss must return the failure response (HTTP 500)",
++                response.getStatus(), is(HTTP_INTERNAL_ERROR));
++    }
++
++    private static void writeMarker(File f) throws Exception {
++        File parent = f.getParentFile();
++        if (parent != null && !parent.exists()) {
++            assertTrue(parent.mkdirs());
++        }
++        com.google.common.io.Files.write("marker".getBytes("UTF-8"), f);
++    }
++}
+-- 
+2.55.0
+
