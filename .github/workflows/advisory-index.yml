@@ -1,0 +1,42 @@
+name: Advisory index
+
+# Regenerates the advisory index and the rendered pages under docs/advisories/
+# from the advisory JSON files whenever advisories change on main, and commits
+# the result back to the repository.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "advisories/**"
+      - "scripts/generate_advisory_list.py"
+      - ".github/workflows/advisory-index.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-index:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Generate advisory index and pages
+        run: python3 scripts/generate_advisory_list.py
+
+      - name: Commit regenerated files
+        run: |
+          if git diff --quiet -- ADVISORIES.md docs/advisories; then
+            echo "Advisory index and pages already up to date."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add ADVISORIES.md docs/advisories
+          git commit -m "chore: regenerate advisory index and pages"
+          git push

@@ -7,6 +7,8 @@ This repository contains the initial set of advisories being disclosed publicly.
 - **`CGP-<id>.json`**: the advisory in [OSV format](https://ossf.github.io/osv-schema/), with the vulnerability details.
 - **`CGP-<id>-<purl>.patch`**: a `git format-patch` fix for an associated vulnerable version of the package, applicable to the upstream source at that version.
 
+See [`ADVISORIES.md`](ADVISORIES.md) for an index of all advisories with their affected package and version range. Regenerate it with `python3 scripts/generate_advisory_list.py` after adding or changing an advisory.
+
 ## Layout
 
 ```
