@@ -5,17 +5,29 @@ Run the script to regenerate after adding or changing advisories.
 
 | Advisory | Ecosystem | Package | Introduced | Fixed |
 |----------|-----------|---------|------------|-------|
+| [CGP-grwg-42x8-w9x7](docs/advisories/CGP-grwg-42x8-w9x7.md) | Maven | `com.auth0:java-jwt` | 3.0.1 | 3.19.2 |
 | [CGP-jr7c-c8cq-hxh9](docs/advisories/CGP-jr7c-c8cq-hxh9.md) | Maven | `com.auth0:java-jwt` | 4.0.0-beta.0 | 4.2.0 |
 | [CGP-57cr-9rvh-qh62](docs/advisories/CGP-57cr-9rvh-qh62.md) | Maven | `com.blogspot.mydailyjava:weak-lock-free` | 0.1 | 0.15 |
+| [CGP-29c2-rpxq-q9xm](docs/advisories/CGP-29c2-rpxq-q9xm.md) | Maven | `com.github.tomakehurst:wiremock-standalone` | 2.16.0 | 3.0.0-beta-1 |
+| [CGP-48gv-xfgw-w4hc](docs/advisories/CGP-48gv-xfgw-w4hc.md) | Maven | `com.github.tomakehurst:wiremock-standalone` | 2.14.0 | 3.0.0-beta-1 |
+| [CGP-gcrw-87qp-x4c3](docs/advisories/CGP-gcrw-87qp-x4c3.md) | Maven | `com.googlecode.libphonenumber:libphonenumber` | 3.1 | 9.0.36 |
 | [CGP-6cj7-7q33-776f](docs/advisories/CGP-6cj7-7q33-776f.md) | Maven | `com.itextpdf:layout` | 7.0.0 | 7.1.16 |
 | [CGP-q285-qppx-f8fx](docs/advisories/CGP-q285-qppx-f8fx.md) | Maven | `com.jayway.restassured:rest-assured` | 2.3.3 | 5.3.0 |
+| [CGP-76vm-gg49-hx7p](docs/advisories/CGP-76vm-gg49-hx7p.md) | Maven | `com.sun.xml.messaging.saaj:saaj-impl` | 1.3.23 | 3.0.0 |
 | [CGP-3p49-8jjq-wc72](docs/advisories/CGP-3p49-8jjq-wc72.md) | Maven | `commons-validator:commons-validator` | 1.1.0 | 1.8.0 |
 | [CGP-72c7-jxrr-483r](docs/advisories/CGP-72c7-jxrr-483r.md) | Maven | `commons-validator:commons-validator` | 1.1.0 | 1.3.1 |
 | [CGP-28hq-8p94-f94j](docs/advisories/CGP-28hq-8p94-f94j.md) | Maven | `io.jsonwebtoken:jjwt` | 0.1 | 0.6.0 |
+| [CGP-753c-3hg7-j33f](docs/advisories/CGP-753c-3hg7-j33f.md) | Maven | `io.jsonwebtoken:jjwt` | 0.6.0 | 0.12.0 |
 | [CGP-xpq5-jm7p-884r](docs/advisories/CGP-xpq5-jm7p-884r.md) | Maven | `io.jsonwebtoken:jjwt` | 0.1 | 0.12.0 |
+| [CGP-qfvj-qrwj-6c8w](docs/advisories/CGP-qfvj-qrwj-6c8w.md) | Maven | `io.jsonwebtoken:jjwt-impl` | 0 | 0.12.0 |
 | [CGP-6w36-9cv4-9cr9](docs/advisories/CGP-6w36-9cv4-9cr9.md) | Maven | `jakarta.validation:jakarta.validation-api` | 2.0.1 | 4.0.0-M1 |
 | [CGP-gm3f-w8vf-c6p8](docs/advisories/CGP-gm3f-w8vf-c6p8.md) | Maven | `jakarta.validation:jakarta.validation-api` | 2.0.1 | 4.0.0-M1 |
 | [CGP-4p5c-894r-qqmc](docs/advisories/CGP-4p5c-894r-qqmc.md) | Maven | `org.apache.commons:commons-collections4` | 4.0 | 4.6.0 |
 | [CGP-4qc2-x2g2-q32h](docs/advisories/CGP-4qc2-x2g2-q32h.md) | Maven | `org.apache.commons:commons-lang3` | 3.0 | 3.15.0 |
 | [CGP-qjm4-c96g-8hhw](docs/advisories/CGP-qjm4-c96g-8hhw.md) | Maven | `org.apache.cxf:cxf-rt-rs-security-oauth2-saml` | 2.7.4 | 4.2.3 |
+| [CGP-3x2p-3qw2-2ghh](docs/advisories/CGP-3x2p-3qw2-2ghh.md) | Maven | `org.apache.kerby:kerb-server` | 1.0.0 | 2.1.0 |
+| [CGP-69ph-rh6g-rg3p](docs/advisories/CGP-69ph-rh6g-rg3p.md) | Maven | `org.apache.qpid:qpid-broker-core` | 0 | 10.0.0 |
+| [CGP-8339-r3p5-6gh4](docs/advisories/CGP-8339-r3p5-6gh4.md) | Maven | `org.javassist:javassist` | 0 | 3.32.0-GA |
+| [CGP-9x7f-cpwh-f59q](docs/advisories/CGP-9x7f-cpwh-f59q.md) | Maven | `org.javassist:javassist` | 0 | 3.32.0-GA |
+| [CGP-pqgh-898g-975x](docs/advisories/CGP-pqgh-898g-975x.md) | Maven | `org.mock-server:mockserver-core` | 3.11 | 6.0.0 |
 | [CGP-ww9v-8jj3-4xr6](docs/advisories/CGP-ww9v-8jj3-4xr6.md) | Maven | `org.mock-server:mockserver-netty` | 5.4.1 | 6.0.0 |
