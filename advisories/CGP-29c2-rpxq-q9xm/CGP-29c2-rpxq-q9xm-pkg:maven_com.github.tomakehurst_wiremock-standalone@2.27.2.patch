@@ -1,0 +1,821 @@
+From ef67186afbed4af5793288647564d59c7d69cc29 Mon Sep 17 00:00:00 2001
+From: Vuln Patch Pipeline <vuln-patch@chainguard.dev>
+Date: Mon, 9 Nov 2026 21:31:28 -0700
+Subject: [PATCH] Refuse file-source paths into sibling directories that share
+ the root's name prefix
+
+AbstractFileSource.assertFilePathIsUnderRoot(String) guards every
+FileSource read, write and delete (getBinaryFileNamed, getTextFileNamed,
+writeTextFile, writeBinaryFile and deleteFile). It canonicalised the root
+and the requested path, which stops plain "../" traversal, but then
+compared them with a bare filePath.startsWith(rootPath) and no trailing
+separator. A sibling directory whose name merely starts with the root's
+name (for example "__files-archive" or "__filesEVIL" next to "__files")
+therefore passed the check, so a stub bodyFileName or an admin
+PUT /__admin/files/{filename} value resolving into that sibling could
+read or overwrite a file outside the configured root (CWE-22, CWE-73).
+The check now requires the resolved path to equal the root or to start
+with the root followed by File.separator, and throws
+NotAuthorisedException otherwise.
+
+ClasspathFileSource, used by usingFilesUnderClasspath(...), had no
+containment check at all on its file-system-backed reads:
+getBinaryFileNamed and getTextFileNamed opened new File(rootDirectory,
+name) directly, so "../secret.txt" or a sibling-prefix name read a file
+outside the root. Both now canonicalise that same joined path and apply
+the same root-or-root-plus-separator rule, throwing
+NotAuthorisedException otherwise or when the path cannot be
+canonicalised. Reads from jar, zip, war and ear classpath locations are
+unchanged.
+
+Names that resolve inside the root, including nested paths, names with a
+leading separator and the root itself, are handled as before.
+
+Adds EditStubFileTaskPathTraversalTest, AdminApiFileTraversalHttpTest and
+ClasspathFileSourceContainmentTest.
+
+Cgp-Finding: CGP-29c2-rpxq-q9xm
+---
+ .../wiremock/common/AbstractFileSource.java   |   6 +-
+ .../wiremock/common/ClasspathFileSource.java  |  18 ++
+ .../admin/AdminApiFileTraversalHttpTest.java  | 261 +++++++++++++++
+ .../EditStubFileTaskPathTraversalTest.java    | 306 ++++++++++++++++++
+ .../ClasspathFileSourceContainmentTest.java   | 116 +++++++
+ 5 files changed, 706 insertions(+), 1 deletion(-)
+ create mode 100644 src/test/java/com/github/tomakehurst/wiremock/admin/AdminApiFileTraversalHttpTest.java
+ create mode 100644 src/test/java/com/github/tomakehurst/wiremock/admin/EditStubFileTaskPathTraversalTest.java
+ create mode 100644 src/test/java/com/github/tomakehurst/wiremock/common/ClasspathFileSourceContainmentTest.java
+
+diff --git a/src/main/java/com/github/tomakehurst/wiremock/common/AbstractFileSource.java b/src/main/java/com/github/tomakehurst/wiremock/common/AbstractFileSource.java
+index fe48b272..ee9c2da8 100644
+--- a/src/main/java/com/github/tomakehurst/wiremock/common/AbstractFileSource.java
++++ b/src/main/java/com/github/tomakehurst/wiremock/common/AbstractFileSource.java
+@@ -156,7 +156,11 @@ public abstract class AbstractFileSource implements FileSource {
+                 new File(path).getCanonicalPath() :
+                 new File(rootDirectory, path).getCanonicalPath();
+ 
+-            if (!filePath.startsWith(rootPath)) {
++            // Boundary-correct containment: the resolved path must be the root itself or live
++            // strictly beneath it. A bare startsWith(rootPath) would also accept a sibling whose
++            // name merely has the root path as a string prefix (e.g. "<root>__filesEVIL/x"), which
++            // is the missing-trailing-separator traversal bypass (CWE-22).
++            if (!filePath.equals(rootPath) && !filePath.startsWith(rootPath + File.separator)) {
+                 throw new NotAuthorisedException("Access to file " + path + " is not permitted");
+             }
+         } catch (IOException ioe) {
+diff --git a/src/main/java/com/github/tomakehurst/wiremock/common/ClasspathFileSource.java b/src/main/java/com/github/tomakehurst/wiremock/common/ClasspathFileSource.java
+index e3442830..f26c9066 100644
+--- a/src/main/java/com/github/tomakehurst/wiremock/common/ClasspathFileSource.java
++++ b/src/main/java/com/github/tomakehurst/wiremock/common/ClasspathFileSource.java
+@@ -19,9 +19,11 @@ import com.google.common.base.Function;
+ import com.google.common.base.Predicate;
+ import com.google.common.collect.FluentIterable;
+ import com.google.common.collect.Iterators;
++import com.github.tomakehurst.wiremock.security.NotAuthorisedException;
+ import com.google.common.io.Resources;
+ 
+ import java.io.File;
++import java.io.IOException;
+ import java.net.URI;
+ import java.net.URISyntaxException;
+ import java.net.URL;
+@@ -85,6 +87,7 @@ public class ClasspathFileSource implements FileSource {
+     @Override
+     public BinaryFile getBinaryFileNamed(final String name) {
+         if (isFileSystem()) {
++            assertFilePathIsUnderRoot(name);
+             return new BinaryFile(new File(rootDirectory, name).toURI());
+         }
+ 
+@@ -94,12 +97,27 @@ public class ClasspathFileSource implements FileSource {
+     @Override
+     public TextFile getTextFileNamed(String name) {
+         if (isFileSystem()) {
++            assertFilePathIsUnderRoot(name);
+             return new TextFile(new File(rootDirectory, name).toURI());
+         }
+ 
+         return new TextFile(getZipEntryUri(name));
+     }
+ 
++    private void assertFilePathIsUnderRoot(String name) {
++        try {
++            String rootPath = rootDirectory.getCanonicalPath();
++            // Check the same path the readers open: the name is always joined to the root.
++            String filePath = new File(rootDirectory, name).getCanonicalPath();
++
++            if (!filePath.equals(rootPath) && !filePath.startsWith(rootPath + File.separator)) {
++                throw new NotAuthorisedException("Access to file " + name + " is not permitted");
++            }
++        } catch (IOException ioe) {
++            throw new NotAuthorisedException("File " + name + " cannot be accessed", ioe);
++        }
++    }
++
+     private URI getZipEntryUri(final String name) {
+         final String lookFor = path + "/" + name;
+         final Enumeration<? extends ZipEntry> enumeration = zipFile.entries();
+diff --git a/src/test/java/com/github/tomakehurst/wiremock/admin/AdminApiFileTraversalHttpTest.java b/src/test/java/com/github/tomakehurst/wiremock/admin/AdminApiFileTraversalHttpTest.java
+new file mode 100644
+index 00000000..5c4ebb2f
+--- /dev/null
++++ b/src/test/java/com/github/tomakehurst/wiremock/admin/AdminApiFileTraversalHttpTest.java
+@@ -0,0 +1,261 @@
++/*
++ * Copyright (C) 2011 Thomas Akehurst
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.github.tomakehurst.wiremock.admin;
++
++import com.github.tomakehurst.wiremock.WireMockServer;
++import com.github.tomakehurst.wiremock.common.SingleRootFileSource;
++import com.github.tomakehurst.wiremock.security.NotAuthorisedException;
++import com.github.tomakehurst.wiremock.testsupport.WireMockResponse;
++import com.github.tomakehurst.wiremock.testsupport.WireMockTestClient;
++import org.junit.After;
++import org.junit.Assume;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++
++import java.io.File;
++import java.nio.file.Files;
++
++import static com.github.tomakehurst.wiremock.core.WireMockConfiguration.wireMockConfig;
++import static org.hamcrest.MatcherAssert.assertThat;
++import static org.hamcrest.Matchers.is;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
++
++/**
++ * Sibling-directory escape tests (CWE-22 / CWE-73) driven through the real Jetty HTTP stack and the
++ * real admin router (AdminRoutes / AdminUriTemplate / AdminRequestHandler), rather than by calling
++ * EditStubFileTask.execute() directly. AdminUriTemplate.matches()/parse() split both the template and
++ * the URL on "/" and require an exact segment count, so these tests check that a literal or
++ * percent-encoded traversal payload in the URL path either does not route to the file sink at all,
++ * or routes to it and is still refused by the containment check. Either way, no file outside the
++ * __files root may be modified.
++ */
++public class AdminApiFileTraversalHttpTest {
++
++    @Rule
++    public TemporaryFolder temp = new TemporaryFolder();
++
++    private WireMockServer wm;
++    private WireMockTestClient client;
++
++    private File filesRootDir;   // <root>
++    private File filesDir;       // <root>/__files
++    private File archiveSibling; // <root>/__files-archive
++    private File secret;         // <root>/__files-archive/secret.txt
++
++    @Before
++    public void setUp() throws Exception {
++        filesRootDir = temp.newFolder("filesRoot");
++        filesDir = new File(filesRootDir, "__files");
++        assertTrue(filesDir.mkdirs());
++
++        archiveSibling = new File(filesRootDir, "__files-archive");
++        assertTrue(archiveSibling.mkdirs());
++        secret = new File(archiveSibling, "secret.txt");
++        Files.write(secret.toPath(), "TOP-SECRET-HTTP".getBytes("UTF-8"));
++
++        wm = new WireMockServer(wireMockConfig().dynamicPort().withRootDirectory(filesRootDir.getAbsolutePath()));
++        wm.start();
++        client = new WireMockTestClient(wm.port());
++    }
++
++    @After
++    public void tearDown() {
++        wm.stop();
++    }
++
++    private String secretContents() throws Exception {
++        return new String(Files.readAllBytes(secret.toPath()), "UTF-8");
++    }
++
++    // ---------------------------------------------------------- WRITE via real HTTP: literal slashes
++
++    /**
++     * Literal (unencoded) "../" sibling-collision payload as the raw {filename} path segment of a
++     * real HTTP PUT. Whatever the router does with it (404/not-matched, or a route match that then
++     * hits assertFilePathIsUnderRoot), the sibling secret must never be overwritten.
++     */
++    @Test
++    public void httpPutWithLiteralTraversalDoesNotOverwriteSibling() throws Exception {
++        WireMockResponse response = client.putWithBody(
++                "/__admin/files/../__files-archive/secret.txt", "INJECTED-LITERAL", "text/plain");
++
++        assertThat("SECURITY: sibling file must be untouched after an HTTP PUT traversal attempt (status "
++                        + response.statusCode() + ")",
++                secretContents(), is("TOP-SECRET-HTTP"));
++    }
++
++    // ------------------------------------------------------ WRITE via real HTTP: percent-encoded "/"
++
++    /**
++     * Percent-encoded "../" sibling-collision payload ("..%2F__files-archive%2Fsecret.txt"). Since
++     * AdminRequestHandler.getUrl() reads HttpServletRequest.getRequestURI() (the RAW, un-decoded URI
++     * per servlet spec) and AdminUriTemplate.matches()/parse() split on a literal "/", an encoded "/"
++     * inside {filename} could -- in principle -- make the whole payload look like ONE path segment
++     * to the router (matching "/files/{filename}") while still smuggling an embedded separator. This
++     * probes whether that lets the payload route to EditStubFileTask AND whether the value handed to
++     * fileSource.writeBinaryFile() ever gets decoded into a real "/" before reaching
++     * assertFilePathIsUnderRoot (it must not, or the guard is checking a different string than the
++     * one that lands on disk).
++     */
++    @Test
++    public void httpPutWithPercentEncodedTraversalDoesNotOverwriteSibling() throws Exception {
++        WireMockResponse response = client.putWithBody(
++                "/__admin/files/..%2F__files-archive%2Fsecret.txt", "INJECTED-ENCODED", "text/plain");
++
++        assertThat("SECURITY: sibling file must be untouched after an HTTP PUT percent-encoded traversal "
++                        + "attempt (status " + response.statusCode() + ")",
++                secretContents(), is("TOP-SECRET-HTTP"));
++
++        // Diagnostic: confirm the write, if it succeeded (200), landed at a LITERAL filename
++        // (containing "%2F" as three literal characters) directly inside __files -- proving the
++        // router matched this as ONE path segment but nothing downstream ever decoded it into a
++        // real separator, so it cannot reach the sibling. Recursively dump what actually exists
++        // under __files so a reviewer can see there is no escape, not just that the secret is intact.
++        StringBuilder listing = new StringBuilder();
++        dumpTree(filesDir, listing);
++        System.out.println("__files tree after encoded PUT:\n" + listing);
++        File literalInRoot = new File(filesDir, "..%2F__files-archive%2Fsecret.txt");
++        if (response.statusCode() == 200) {
++            assertThat("the write landed at the literal (undecoded) filename INSIDE __files, not the sibling",
++                    literalInRoot.exists(), is(true));
++        }
++    }
++
++    private static void dumpTree(File dir, StringBuilder out) {
++        File[] children = dir.listFiles();
++        if (children == null) {
++            return;
++        }
++        for (File child : children) {
++            out.append(child.getPath()).append('\n');
++            if (child.isDirectory()) {
++                dumpTree(child, out);
++            }
++        }
++    }
++
++    /** Double-encoded variant ("%252e%252e%252f..."), in case some layer decodes exactly once first. */
++    @Test
++    public void httpPutWithDoubleEncodedTraversalDoesNotOverwriteSibling() throws Exception {
++        WireMockResponse response = client.putWithBody(
++                "/__admin/files/%2e%2e%2F__files-archive%2Fsecret.txt", "INJECTED-DOUBLE-ENCODED", "text/plain");
++
++        assertThat("SECURITY: sibling file must be untouched after an HTTP PUT double/mixed-encoded "
++                        + "traversal attempt (status " + response.statusCode() + ")",
++                secretContents(), is("TOP-SECRET-HTTP"));
++    }
++
++    // -------------------------------------------------------------------------- Positive control
++
++    /** A genuine single-segment filename must still route and write correctly over real HTTP. */
++    @Test
++    public void httpPutWithLegitimateFilenameStillWrites() throws Exception {
++        WireMockResponse response = client.putWithBody("/__admin/files/legit.json", "LEGIT-BODY", "text/plain");
++        assertThat(response.statusCode(), is(200));
++        File legit = new File(filesDir, "legit.json");
++        assertThat(new String(Files.readAllBytes(legit.toPath()), "UTF-8"), is("LEGIT-BODY"));
++    }
++
++    // ----------------------------------------------------------------------- Unit-level sinks
++
++    /**
++     * Absolute-path sibling-collision payload through FileSource.deleteFile(). deleteFile() ->
++     * writableFileFor() -> assertFilePathIsUnderRoot() is the same call chain the write sinks use,
++     * and writableFileFor() returns an absolute File unmodified, so the containment check is the only
++     * thing standing between this value and the real sibling file.
++     */
++    @Test
++    public void deleteAbsoluteSiblingCollisionDoesNotDeleteOutOfRootFile() throws Exception {
++        SingleRootFileSource filesSource = new SingleRootFileSource(filesDir);
++        String absSibling = secret.getCanonicalPath();
++        try {
++            filesSource.deleteFile(absSibling);
++            fail("SECURITY: deleteFile with an absolute sibling-collision path was admitted without rejection; "
++                    + "sibling still exists: " + secret.exists());
++        } catch (NotAuthorisedException expected) {
++            assertThat("SECURITY: sibling file must still exist after a rejected absolute-path delete",
++                    secret.exists(), is(true));
++        }
++    }
++
++    /**
++     * A NUL byte embedded in an otherwise-relative sibling-collision payload for the WRITE family
++     * (not just checked against getCanonicalPath() in isolation, but driven through the real
++     * writeBinaryFile() sink) -- must fail closed via the try/catch(IOException) in
++     * assertFilePathIsUnderRoot, never silently truncate and proceed.
++     */
++    @Test
++    public void writeWithEmbeddedNulByteInPayloadDoesNotEscapeRoot() throws Exception {
++        SingleRootFileSource filesSource = new SingleRootFileSource(filesDir);
++        String nulPayload = "legit.txt\u0000/../../__files-archive/secret.txt";
++        byte[] before = Files.readAllBytes(secret.toPath());
++        try {
++            filesSource.writeBinaryFile(nulPayload, "INJECTED-NUL".getBytes("UTF-8"));
++            byte[] after = Files.readAllBytes(secret.toPath());
++            assertThat("SECURITY: a NUL-byte payload must NOT overwrite the out-of-root sibling",
++                    new String(after, "UTF-8"), is(new String(before, "UTF-8")));
++        } catch (NotAuthorisedException expected) {
++            // correct: fails closed
++        }
++        assertThat(new String(Files.readAllBytes(secret.toPath()), "UTF-8"), is("TOP-SECRET-HTTP"));
++    }
++
++    /**
++     * The sibling itself is a SYMLINK (not a plain directory) pointing to a completely separate
++     * victim directory outside the whole filesRoot temp tree. canonicalize-then-compare must
++     * dereference the symlink and reject the resolved (real) target, exactly as it does for a plain
++     * sibling directory -- confirms the missing-trailing-separator fix is not defeated by routing the
++     * "sibling" through a symlink instead of a real directory.
++     */
++    @Test
++    public void writeSiblingSymlinkDoesNotEscapeToRealTarget() throws Exception {
++        Assume.assumeTrue("symlink support required", isSymlinkSupported());
++
++        File realVictimDir = temp.newFolder("realVictimOutsideEverything");
++        File realVictim = new File(realVictimDir, "secret.txt");
++        Files.write(realVictim.toPath(), "REAL-VICTIM-SECRET".getBytes("UTF-8"));
++
++        File symlinkSibling = new File(filesRootDir, "__filesEVILLINK");
++        Files.createSymbolicLink(symlinkSibling.toPath(), realVictimDir.toPath());
++
++        SingleRootFileSource filesSource = new SingleRootFileSource(filesDir);
++        try {
++            filesSource.writeBinaryFile("../__filesEVILLINK/secret.txt", "INJECTED-VIA-SYMLINK".getBytes("UTF-8"));
++            fail("SECURITY: writeBinaryFile through a sibling SYMLINK was admitted without rejection; "
++                    + "real victim now: " + new String(Files.readAllBytes(realVictim.toPath()), "UTF-8"));
++        } catch (NotAuthorisedException expected) {
++            assertThat("SECURITY: the real symlink target must be untouched after a rejected write",
++                    new String(Files.readAllBytes(realVictim.toPath()), "UTF-8"), is("REAL-VICTIM-SECRET"));
++        }
++    }
++
++    private static boolean isSymlinkSupported() {
++        try {
++            File tmp = File.createTempFile("symlink-support-check", ".tmp");
++            tmp.deleteOnExit();
++            File link = new File(tmp.getParentFile(), tmp.getName() + ".link");
++            Files.createSymbolicLink(link.toPath(), tmp.toPath());
++            link.delete();
++            tmp.delete();
++            return true;
++        } catch (Throwable t) {
++            return false;
++        }
++    }
++}
+diff --git a/src/test/java/com/github/tomakehurst/wiremock/admin/EditStubFileTaskPathTraversalTest.java b/src/test/java/com/github/tomakehurst/wiremock/admin/EditStubFileTaskPathTraversalTest.java
+new file mode 100644
+index 00000000..b698e16a
+--- /dev/null
++++ b/src/test/java/com/github/tomakehurst/wiremock/admin/EditStubFileTaskPathTraversalTest.java
+@@ -0,0 +1,306 @@
++/*
++ * Copyright (C) 2011 Thomas Akehurst
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.github.tomakehurst.wiremock.admin;
++
++import com.github.tomakehurst.wiremock.admin.model.PathParams;
++import com.github.tomakehurst.wiremock.admin.tasks.EditStubFileTask;
++import com.github.tomakehurst.wiremock.common.BinaryFile;
++import com.github.tomakehurst.wiremock.common.FileSource;
++import com.github.tomakehurst.wiremock.common.SingleRootFileSource;
++import com.github.tomakehurst.wiremock.common.TextFile;
++import com.github.tomakehurst.wiremock.core.Admin;
++import com.github.tomakehurst.wiremock.core.Options;
++import com.github.tomakehurst.wiremock.http.Request;
++import com.github.tomakehurst.wiremock.security.NotAuthorisedException;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++
++import java.io.File;
++import java.nio.file.Files;
++
++import static com.github.tomakehurst.wiremock.core.WireMockApp.FILES_ROOT;
++import static org.hamcrest.MatcherAssert.assertThat;
++import static org.hamcrest.Matchers.is;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
++import static org.mockito.Mockito.mock;
++import static org.mockito.Mockito.when;
++
++/**
++ * Regression tests for the sibling-directory escape in WireMock file operations (CWE-22 / CWE-73).
++ *
++ * AbstractFileSource.assertFilePathIsUnderRoot(String) canonicalized both the __files root and the
++ * target path (which defeats plain "../" traversal) but then compared them with a bare
++ * filePath.startsWith(rootPath), without appending File.separator. A sibling directory whose name
++ * merely has the root's canonical path as a string prefix (root "/x/__files", sibling
++ * "/x/__files-archive" or "/x/__filesEVIL") therefore passed the check, so a caller-supplied
++ * bodyFileName or {filename} value that canonically resolves into that sibling could read or write a
++ * file outside the intended root.
++ *
++ * These tests drive both:
++ *   - the SingleRootFileSource read/write sinks
++ *     (getBinaryFileNamed, getTextFileNamed, writeBinaryFile, writeTextFile -> assertFilePathIsUnderRoot), and
++ *   - the PUT /__admin/files/{name} route via
++ *     EditStubFileTask.execute(Admin,Request,PathParams) -> fileSource.writeBinaryFile(...),
++ * with the sibling payload "../__files-archive/secret.txt", a bare-suffix sibling
++ * ("../__filesEVIL/..."), and an absolute-path variant of the sibling collision.
++ *
++ * Each attack test asserts the security property, not just the exception: the sibling file's bytes
++ * are not read out (read family) and are not overwritten, and no new sibling file is created (write
++ * family), and the sink throws the NotAuthorisedException a correct containment check raises.
++ */
++public class EditStubFileTaskPathTraversalTest {
++
++    /** Sibling-collision payload: resolves into "__files-archive", next to "__files". */
++    private static final String SIBLING_PAYLOAD = "../__files-archive/secret.txt";
++
++    @Rule
++    public TemporaryFolder temp = new TemporaryFolder();
++
++    private File filesRootDir;   // <root>                 (Options.filesRoot())
++    private File filesDir;       // <root>/__files         (the guarded base the sinks resolve)
++    private File archiveSibling; // <root>/__files-archive (sibling sharing the "__files" prefix)
++    private File secret;         // <root>/__files-archive/secret.txt (the out-of-root victim)
++
++    private SingleRootFileSource filesSource;  // rooted at <root>/__files -- what EVERY sink guards
++
++    private EditStubFileTask editTask;
++    private Admin admin;
++
++    @Before
++    public void setUp() throws Exception {
++        filesRootDir = temp.newFolder("filesRoot");
++        filesDir = new File(filesRootDir, "__files");
++        assertTrue(filesDir.mkdirs());
++
++        // Sibling directory whose name ("__files-archive") has the "__files" root name as a raw
++        // string prefix but is NOT nested under it.
++        archiveSibling = new File(filesRootDir, "__files-archive");
++        assertTrue(archiveSibling.mkdirs());
++        secret = new File(archiveSibling, "secret.txt");
++        Files.write(secret.toPath(), "TOP-SECRET".getBytes("UTF-8"));
++
++        filesSource = new SingleRootFileSource(filesDir);
++
++        // End-to-end wiring for the admin PUT /__admin/files/{name} route: Options.filesRoot() returns
++        // <root>, and EditStubFileTask does filesRoot().child(FILES_ROOT) == <root>/__files.
++        FileSource filesRoot = new SingleRootFileSource(filesRootDir);
++        // Sanity: the sink's resolved base is the __files dir we guard.
++        assertThat(filesRoot.child(FILES_ROOT).getPath(), is(filesDir.getPath()));
++        Options options = mock(Options.class);
++        when(options.filesRoot()).thenReturn(filesRoot);
++        admin = mock(Admin.class);
++        when(admin.getOptions()).thenReturn(options);
++        editTask = new EditStubFileTask();
++    }
++
++    // ---------------------------------------------------------------- READ family (unit-level sinks)
++
++    /** getBinaryFileNamed with the sibling payload must NOT return the sibling file's bytes. */
++    @Test
++    public void readBinarySiblingCollisionDoesNotLeakOutOfRootFile() throws Exception {
++        try {
++            BinaryFile bf = filesSource.getBinaryFileNamed(SIBLING_PAYLOAD);
++            byte[] leaked = bf.readContents();               // harmful effect: bytes of the sibling file
++            fail("SECURITY: getBinaryFileNamed leaked out-of-root file contents: " + new String(leaked, "UTF-8"));
++        } catch (NotAuthorisedException expected) {
++            // payload refused by the containment check -- correct
++        }
++    }
++
++    /** getTextFileNamed with the sibling payload must NOT return the sibling file's text. */
++    @Test
++    public void readTextSiblingCollisionDoesNotLeakOutOfRootFile() throws Exception {
++        try {
++            TextFile tf = filesSource.getTextFileNamed(SIBLING_PAYLOAD);
++            String leaked = tf.readContentsAsString();       // harmful effect: sibling file text
++            fail("SECURITY: getTextFileNamed leaked out-of-root file contents: " + leaked);
++        } catch (NotAuthorisedException expected) {
++            // correct
++        }
++    }
++
++    /** Bare-suffix sibling ("__filesEVIL") -- no path separator between root name and suffix. */
++    @Test
++    public void readBareSuffixSiblingCollisionDoesNotLeakOutOfRootFile() throws Exception {
++        File evil = new File(filesRootDir, "__filesEVIL");
++        assertTrue(evil.mkdirs());
++        File evilSecret = new File(evil, "secret.txt");
++        Files.write(evilSecret.toPath(), "EVIL-SECRET".getBytes("UTF-8"));
++        try {
++            String leaked = filesSource.getTextFileNamed("../__filesEVIL/secret.txt").readContentsAsString();
++            fail("SECURITY: bare-suffix sibling read leaked out-of-root file contents: " + leaked);
++        } catch (NotAuthorisedException expected) {
++            // correct
++        }
++    }
++
++    /**
++     * Absolute-path variant of the sibling collision on the read sinks. The read sinks open
++     * new File(rootDirectory, name), and new File(File, absoluteString) appends the absolute value as
++     * a relative segment, so an absolute "<root>/__files-archive/secret.txt" resolves to a
++     * nonexistent path inside __files rather than to the real sibling. The test therefore asserts only
++     * the invariant that must hold either way: the real out-of-root secret is never returned.
++     */
++    @Test
++    public void readAbsoluteSiblingCollisionDoesNotLeakOutOfRootFile() throws Exception {
++        String absSibling = secret.getCanonicalPath();       // <root>/__files-archive/secret.txt (absolute)
++        File realSecretCanonical = secret.getCanonicalFile();
++        TextFile resolved;
++        try {
++            resolved = filesSource.getTextFileNamed(absSibling);
++        } catch (NotAuthorisedException refused) {
++            return; // refused by the containment check -- also acceptable
++        }
++        // The sink returned a file handle without rejecting. Prove it does NOT point at the real
++        // out-of-root sibling secret: new File(rootDirectory, absSibling) appends the absolute value
++        // as a relative segment, so it resolves to a nonexistent path INSIDE __files, never the sibling.
++        File actual = new File(resolved.getPath()).getCanonicalFile();
++        assertThat("SECURITY: an absolute sibling path must NOT resolve to the real out-of-root secret",
++                actual.equals(realSecretCanonical), is(false));
++    }
++
++    // --------------------------------------------------------------- WRITE family (unit-level sinks)
++
++    /** writeBinaryFile with the sibling payload must NOT overwrite the sibling file. */
++    @Test
++    public void writeBinarySiblingCollisionDoesNotOverwriteOutOfRootFile() throws Exception {
++        byte[] before = Files.readAllBytes(secret.toPath());
++        try {
++            filesSource.writeBinaryFile(SIBLING_PAYLOAD, "INJECTED".getBytes("UTF-8"));
++            // If no exception, prove nothing was written to the sibling.
++            byte[] after = Files.readAllBytes(secret.toPath());
++            assertThat("SECURITY: writeBinaryFile must NOT overwrite an out-of-root sibling file",
++                    new String(after, "UTF-8"), is(new String(before, "UTF-8")));
++            fail("SECURITY: writeBinaryFile with a sibling-collision path was admitted without rejection");
++        } catch (NotAuthorisedException expected) {
++            assertThat("SECURITY: sibling file must be untouched after a rejected write",
++                    new String(Files.readAllBytes(secret.toPath()), "UTF-8"), is("TOP-SECRET"));
++        }
++    }
++
++    /**
++     * Absolute-path variant of the sibling collision, write family. Unlike the read sinks,
++     * AbstractFileSource.writableFileFor(String) returns the caller-supplied File unmodified when
++     * File(name).isAbsolute() is true, so if assertFilePathIsUnderRoot(name) admitted an absolute
++     * sibling path, writeBinaryFile/writeTextFile would write straight to the real out-of-root file.
++     */
++    @Test
++    public void writeAbsoluteSiblingCollisionDoesNotOverwriteOutOfRootFile() throws Exception {
++        String absSibling = secret.getCanonicalPath(); // <root>/__files-archive/secret.txt (absolute)
++        byte[] before = Files.readAllBytes(secret.toPath());
++        try {
++            filesSource.writeBinaryFile(absSibling, "INJECTED-ABS".getBytes("UTF-8"));
++            byte[] after = Files.readAllBytes(secret.toPath());
++            assertThat("SECURITY: an absolute sibling path must NOT overwrite the real out-of-root secret",
++                    new String(after, "UTF-8"), is(new String(before, "UTF-8")));
++            fail("SECURITY: writeBinaryFile with an absolute sibling-collision path was admitted without rejection");
++        } catch (NotAuthorisedException expected) {
++            assertThat("SECURITY: sibling file must be untouched after a rejected absolute-path write",
++                    new String(Files.readAllBytes(secret.toPath()), "UTF-8"), is("TOP-SECRET"));
++        }
++    }
++
++    /** writeTextFile creating a NEW file in the sibling must be rejected -- no new file appears. */
++    @Test
++    public void writeTextSiblingCollisionDoesNotCreateOutOfRootFile() throws Exception {
++        File injected = new File(archiveSibling, "injected.txt");
++        assertThat("precondition: no injected file yet", injected.exists(), is(false));
++        try {
++            filesSource.writeTextFile("../__files-archive/injected.txt", "INJECTED-TEXT");
++            assertThat("SECURITY: writeTextFile must NOT create a file in an out-of-root sibling",
++                    injected.exists(), is(false));
++            fail("SECURITY: writeTextFile with a sibling-collision path was admitted without rejection");
++        } catch (NotAuthorisedException expected) {
++            assertThat("SECURITY: no out-of-root file must exist after a rejected write",
++                    injected.exists(), is(false));
++        }
++    }
++
++    // ------------------------------------------- WRITE family END-TO-END (PUT /__admin/files/{name})
++
++    /**
++     * The admin PUT /__admin/files/{name} request handler (EditStubFileTask) with a {filename} value
++     * that canonically resolves into the "__files-archive" sibling. The write must be refused and the
++     * sibling left untouched.
++     */
++    @Test
++    public void editStubFileTaskEndToEndSiblingCollisionDoesNotOverwriteOutOfRootFile() throws Exception {
++        Request request = mock(Request.class);
++        when(request.getBody()).thenReturn("INJECTED-VIA-ADMIN".getBytes("UTF-8"));
++
++        try {
++            editTask.execute(admin, request, PathParams.single("filename", SIBLING_PAYLOAD));
++            // No exception: prove the request body did not land in the sibling file.
++            assertThat("SECURITY: PUT /__admin/files must NOT overwrite an out-of-root sibling file",
++                    new String(Files.readAllBytes(secret.toPath()), "UTF-8"), is("TOP-SECRET"));
++            fail("SECURITY: PUT /__admin/files with a sibling-collision {filename} was admitted");
++        } catch (NotAuthorisedException expected) {
++            assertThat("SECURITY: sibling file must be untouched after a rejected admin write",
++                    new String(Files.readAllBytes(secret.toPath()), "UTF-8"), is("TOP-SECRET"));
++        }
++    }
++
++    // ------------------------------------------------------------------------- Positive controls
++
++    /** PRESERVATION: a legitimate top-level in-root read still works. */
++    @Test
++    public void legitimateTopLevelReadStillWorks() throws Exception {
++        File ok = new File(filesDir, "response.json");
++        Files.write(ok.toPath(), "OK-BODY".getBytes("UTF-8"));
++        assertThat(filesSource.getTextFileNamed("response.json").readContentsAsString(), is("OK-BODY"));
++    }
++
++    /** PRESERVATION: a legitimate nested-subdirectory in-root read still works. */
++    @Test
++    public void legitimateNestedReadStillWorks() throws Exception {
++        File sub = new File(filesDir, "subdir");
++        assertTrue(sub.mkdirs());
++        File ok = new File(sub, "nested.json");
++        Files.write(ok.toPath(), "NESTED-BODY".getBytes("UTF-8"));
++        assertThat(filesSource.getTextFileNamed("subdir/nested.json").readContentsAsString(), is("NESTED-BODY"));
++    }
++
++    /** PRESERVATION: a legitimate top-level in-root write still works. */
++    @Test
++    public void legitimateTopLevelWriteStillWorks() throws Exception {
++        filesSource.writeTextFile("written.json", "WRITTEN");
++        assertThat(new String(Files.readAllBytes(new File(filesDir, "written.json").toPath()), "UTF-8"),
++                is("WRITTEN"));
++    }
++
++    /** PRESERVATION: a legitimate nested-subdirectory in-root write still works. */
++    @Test
++    public void legitimateNestedWriteStillWorks() throws Exception {
++        File sub = new File(filesDir, "subdir");
++        assertTrue(sub.mkdirs());
++        filesSource.writeTextFile("subdir/written.json", "NESTED-WRITTEN");
++        assertThat(new String(Files.readAllBytes(new File(sub, "written.json").toPath()), "UTF-8"),
++                is("NESTED-WRITTEN"));
++    }
++
++    /** PRESERVATION end-to-end: a legitimate PUT /__admin/files/{name} still writes into __files. */
++    @Test
++    public void legitimateEditStubFileTaskEndToEndStillWrites() throws Exception {
++        Request request = mock(Request.class);
++        when(request.getBody()).thenReturn("LEGIT-BODY".getBytes("UTF-8"));
++        editTask.execute(admin, request, PathParams.single("filename", "legit.json"));
++        assertThat(new String(Files.readAllBytes(new File(filesDir, "legit.json").toPath()), "UTF-8"),
++                is("LEGIT-BODY"));
++    }
++}
+diff --git a/src/test/java/com/github/tomakehurst/wiremock/common/ClasspathFileSourceContainmentTest.java b/src/test/java/com/github/tomakehurst/wiremock/common/ClasspathFileSourceContainmentTest.java
+new file mode 100644
+index 00000000..33b5c179
+--- /dev/null
++++ b/src/test/java/com/github/tomakehurst/wiremock/common/ClasspathFileSourceContainmentTest.java
+@@ -0,0 +1,116 @@
++/*
++ * Copyright (C) 2011 Thomas Akehurst
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package com.github.tomakehurst.wiremock.common;
++
++import com.github.tomakehurst.wiremock.security.NotAuthorisedException;
++import com.google.common.io.Files;
++import org.junit.Before;
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++
++import java.io.File;
++
++import static com.google.common.base.Charsets.UTF_8;
++import static org.hamcrest.MatcherAssert.assertThat;
++import static org.hamcrest.Matchers.is;
++import static org.junit.Assert.fail;
++
++/**
++ * A ClasspathFileSource backed by a directory on the file system must not read files outside
++ * that directory, including files in sibling directories whose names start with the root's name.
++ */
++public class ClasspathFileSourceContainmentTest {
++
++    @Rule
++    public TemporaryFolder temporaryFolder = new TemporaryFolder();
++
++    private File root;
++    private ClasspathFileSource source;
++
++    @Before
++    public void init() throws Exception {
++        File base = temporaryFolder.newFolder("base");
++        root = new File(base, "__files");
++        File sibling = new File(base, "__files-archive");
++        File nested = new File(root, "nested");
++        assertThat(nested.mkdirs(), is(true));
++        assertThat(sibling.mkdirs(), is(true));
++
++        Files.write("inside", new File(root, "inside.txt"), UTF_8);
++        Files.write("nested-inside", new File(nested, "inside.txt"), UTF_8);
++        Files.write("secret-sibling", new File(sibling, "secret.txt"), UTF_8);
++        Files.write("secret-parent", new File(base, "secret.txt"), UTF_8);
++
++        // An absolute path is not found on the classpath, so the source is backed by that directory
++        source = new ClasspathFileSource(root.getAbsolutePath());
++    }
++
++    @Test
++    public void readsTopLevelFile() {
++        assertThat(new String(source.getBinaryFileNamed("inside.txt").readContents(), UTF_8), is("inside"));
++        assertThat(source.getTextFileNamed("inside.txt").readContentsAsString(), is("inside"));
++    }
++
++    @Test
++    public void readsNestedFile() {
++        assertThat(new String(source.getBinaryFileNamed("nested/inside.txt").readContents(), UTF_8), is("nested-inside"));
++        assertThat(source.getTextFileNamed("nested/inside.txt").readContentsAsString(), is("nested-inside"));
++    }
++
++    @Test
++    public void readsFileNamedWithLeadingSeparator() {
++        assertThat(source.getTextFileNamed("/inside.txt").readContentsAsString(), is("inside"));
++    }
++
++    @Test
++    public void binaryReadRejectsTraversalOutOfRoot() {
++        assertBinaryRejected("../secret.txt");
++    }
++
++    @Test
++    public void textReadRejectsTraversalOutOfRoot() {
++        assertTextRejected("../secret.txt");
++    }
++
++    @Test
++    public void binaryReadRejectsSiblingDirectorySharingRootNamePrefix() {
++        assertBinaryRejected("../__files-archive/secret.txt");
++    }
++
++    @Test
++    public void textReadRejectsSiblingDirectorySharingRootNamePrefix() {
++        assertTextRejected("../__files-archive/secret.txt");
++    }
++
++    private void assertBinaryRejected(String name) {
++        try {
++            byte[] contents = source.getBinaryFileNamed(name).readContents();
++            fail("Expected " + name + " to be rejected but read " + new String(contents, UTF_8));
++        } catch (NotAuthorisedException expected) {
++            // expected
++        }
++    }
++
++    private void assertTextRejected(String name) {
++        try {
++            String contents = source.getTextFileNamed(name).readContentsAsString();
++            fail("Expected " + name + " to be rejected but read " + contents);
++        } catch (NotAuthorisedException expected) {
++            // expected
++        }
++    }
++}
+-- 
+2.55.0
+

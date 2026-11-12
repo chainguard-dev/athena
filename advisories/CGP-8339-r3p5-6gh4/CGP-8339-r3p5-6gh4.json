@@ -1,0 +1,48 @@
+{
+  "id": "CGP-8339-r3p5-6gh4",
+  "schema_version": "1.6.0",
+  "summary": "Webserver.doReply() allows reading arbitrary files via a double-slash HTTP request that bypasses the docroot containment check.",
+  "details": "### Root Cause\n\n`Webserver.doReply()` at line ~285 of `src/main/javassist/tools/web/Webserver.java` extracts the URL path:\n\n```java\nfilename = urlName = cmd.substring(5, cmd.indexOf(' ', 5));\n```\n\nFor a request `GET //etc/passwd HTTP/1.0`, `cmd.substring(5)` yields `/etc/passwd`. The `checkFilename` method checks for `..` sequences but does not reject paths starting with `/`. When `htmlfileBase` is null, `new File(\"/etc/passwd\")` is an absolute path and `file.canRead()` succeeds on most Unix systems, causing the file to be served to the client. The `getResourceAsStream` fallback further exposes classpath resources.\n\n### Affected Locations\n\n- `src/main/javassist/tools/web/Webserver.java`, line 285 — `doReply(InputStream,OutputStream,String)`: absolute-path bypass via double-slash request.\n\n### Attack Vectors\n\n- **Double-slash absolute path traversal**: An attacker sends `GET //etc/passwd HTTP/1.0` to the Webserver. The `GET /` prefix stripping leaves `/etc/passwd` as the filename, which is served directly.\n- **Classpath resource exposure via getResourceAsStream fallback**: If the file is not found on disk, the fallback `Class.getResourceAsStream(\"/\" + urlName)` may expose `.class` files or configuration resources from the classpath.\n\n### Impact\n\nArbitrary file read from the server filesystem (any file readable by the JVM process) for any application that starts `Webserver`. The server binds to all interfaces by default and requires no authentication.",
+  "severity": [
+    {
+      "type": "CVSS_V3",
+      "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N"
+    }
+  ],
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Maven",
+        "name": "org.javassist:javassist",
+        "purl": "pkg:maven/org.javassist/javassist"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.32.0-GA"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "cwe_ids": [
+          "CWE-36"
+        ],
+        "sink_locator": [
+          {
+            "class": "javassist.tools.web.Webserver",
+            "method": "doReply(InputStream,OutputStream,String)",
+            "file_line": "src/main/javassist/tools/web/Webserver.java:285"
+          }
+        ]
+      }
+    }
+  ],
+  "published": "2026-11-12T16:00:00Z",
+  "modified": "2026-11-12T16:00:00Z"
+}

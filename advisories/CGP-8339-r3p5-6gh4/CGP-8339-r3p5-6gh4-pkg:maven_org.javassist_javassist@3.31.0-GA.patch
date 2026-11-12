@@ -1,0 +1,689 @@
+From c4b591e5c8be1f831acdc1366ee5870feaa3f699 Mon Sep 17 00:00:00 2001
+From: Vuln Patch Pipeline <vuln-patch@chainguard.dev>
+Date: Tue, 18 Aug 2026 20:33:44 +0000
+Subject: [PATCH] Reject absolute request paths in Webserver.doReply
+
+Webserver.doReply() stripped the "GET /" prefix from the request line
+and passed the rest to checkFilename(). checkFilename() rejected ".."
+and some characters, but not a leading slash. A request such as
+"GET //etc/passwd" therefore named an absolute path. When htmlfileBase
+was null, the server read that file and returned it, so a client could
+read any file the JVM could read (CWE-36).
+
+doReply() now throws BadHttpRequest when the request path is absolute,
+before htmlfileBase is applied. It also resolves the target file and
+the document root (htmlfileBase, or the working directory when it is
+null) to canonical paths. It throws BadHttpRequest unless the file is
+inside the root, so a symlink in the root that points outside it is
+also refused. Relative requests inside the root, the classpath
+fallback for .class files and the doReply() signature are unchanged.
+
+Adds WebserverTraversalTest.
+
+Cgp-Finding: CGP-8339-r3p5-6gh4
+---
+ src/main/javassist/tools/web/Webserver.java   |  60 +++
+ .../tools/web/WebserverClassPoolPathTest.java | 197 ++++++++++
+ .../tools/web/WebserverTraversalTest.java     | 361 ++++++++++++++++++
+ 3 files changed, 618 insertions(+)
+ create mode 100644 src/test/javassist/tools/web/WebserverClassPoolPathTest.java
+ create mode 100644 src/test/javassist/tools/web/WebserverTraversalTest.java
+
+diff --git a/src/main/javassist/tools/web/Webserver.java b/src/main/javassist/tools/web/Webserver.java
+index 99e15fa..684cb53 100644
+--- a/src/main/javassist/tools/web/Webserver.java
++++ b/src/main/javassist/tools/web/Webserver.java
+@@ -276,6 +276,15 @@ public class Webserver {
+             return;
+ 
+         checkFilename(filename, len);
++
++        // CWE-36: the request-line path must never resolve to a
++        // location outside the servable root.  checkFilename() is only a
++        // character deny-list and does NOT reject absolute paths, so reject the
++        // absolute-path SHAPE of the client-supplied path here, before it is
++        // used to build EITHER sink (the disk file below or the classpath
++        // resource fallback that consumes the raw urlName).
++        rejectAbsolutePath(urlName);
++
+         if (htmlfileBase != null)
+             filename = htmlfileBase + filename;
+ 
+@@ -283,6 +292,11 @@ public class Webserver {
+             filename = filename.replace('/', File.separatorChar);
+ 
+         File file = new File(filename);
++        // Primary control: canonical-path containment.  Resolve the base
++        // (htmlfileBase, or the current directory when null) and the target to
++        // their canonical forms (which resolve ".." AND follow symlinks) and
++        // require the target to stay strictly within the base.
++        checkContained(file);
+         if (file.canRead()) {
+             sendHeader(out, file.length(), fileType);
+             FileInputStream fin = new FileInputStream(file);
+@@ -338,6 +352,52 @@ public class Webserver {
+             throw new BadHttpRequest();
+     }
+ 
++    /**
++     * Rejects a client-supplied request path whose SHAPE is absolute, so it can
++     * never escape the servable root regardless of how many leading slashes
++     * produced it (e.g. a "GET //etc/passwd" request leaves "/etc/passwd") or
++     * of the platform's path syntax (Windows drive-letter / UNC forms).  This
++     * runs before the value feeds either the disk-file sink or the classpath
++     * resource fallback (which consumes the raw urlName).
++     */
++    private void rejectAbsolutePath(String path) throws BadHttpRequest {
++        if (path == null || path.length() == 0)
++            return;
++
++        if (path.charAt(0) == '/' || path.charAt(0) == '\\')
++            throw new BadHttpRequest();
++
++        // Windows drive-letter / UNC / device forms and any other absolute
++        // form the platform recognises.
++        if (new File(path).isAbsolute())
++            throw new BadHttpRequest();
++    }
++
++    /**
++     * Primary containment control (CWE-36): require the resolved target file to
++     * stay strictly inside the canonical servable root.  The root is the
++     * canonicalized {@link #htmlfileBase} when configured, otherwise the
++     * canonicalized current working directory.  getCanonicalPath() resolves
++     * ".." AND follows symlinks, so a symlink inside the root pointing outside
++     * it is still caught.  Any failure to canonicalize fails closed.
++     */
++    private void checkContained(File target) throws BadHttpRequest {
++        try {
++            File base = new File(htmlfileBase != null ? htmlfileBase : ".")
++                            .getCanonicalFile();
++            String basePath = base.getCanonicalPath();
++            String targetPath = target.getCanonicalPath();
++            if (targetPath.equals(basePath)
++                || targetPath.startsWith(basePath + File.separator))
++                return;
++        }
++        catch (IOException e) {
++            // fall through to reject
++        }
++
++        throw new BadHttpRequest();
++    }
++
+     private boolean letUsersSendClassfile(OutputStream out,
+                                           String filename, int length)
+         throws IOException, BadHttpRequest
+diff --git a/src/test/javassist/tools/web/WebserverClassPoolPathTest.java b/src/test/javassist/tools/web/WebserverClassPoolPathTest.java
+new file mode 100644
+index 0000000..812434a
+--- /dev/null
++++ b/src/test/javassist/tools/web/WebserverClassPoolPathTest.java
+@@ -0,0 +1,197 @@
++/*
++ * Tests that class requests served through the ClassPool path
++ * (letUsersSendClassfile) cannot read files outside the servable root (CWE-36).
++ *
++ * TARGET: javassist.tools.web.Webserver.letUsersSendClassfile(...) ->
++ * ClassPool.get(classname) -> ClassPath.openClassfile(classname), reached
++ * from doReply() BEFORE checkFilename()/rejectAbsolutePath()/checkContained()
++ * ever run (the branch returns from doReply() before those calls, whenever
++ * classPool != null and the requested path ends in ".class"). AppletServer
++ * ALWAYS has a non-null classPool (constructed via addTranslator in every
++ * public constructor), so this is a real, in-tree, unguarded call chain, not
++ * a hypothetical.
++ *
++ * HYPOTHESIS UNDER TEST: does this third, un-enumerated call chain let an
++ * absolute-path or ".."-relative request read a file outside the ClassPool's
++ * configured search root(s), the same way the two OSV-enumerated sinks used
++ * to allow reading outside htmlfileBase? If yes, this is an incomplete-fix
++ * bypass (same weakness, sibling sink). If the read/service call always
++ * stays confined -- because DirClassPath's own classname<->path conversion
++ * cannot reconstruct ".." (every '.' becomes File.separatorChar, including
++ * an actual ".." token's two dots) and because it is a plain string
++ * CONCATENATION (never the two-arg new File(parent,child) whose "child
++ * absolute path drops parent" trap this sink can't trigger) -- then it is
++ * not a working escape, only an unguarded-but-harmless call chain.
++ */
++package javassist.tools.web;
++
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.net.URISyntaxException;
++import java.net.URL;
++import java.nio.file.Files;
++
++import javassist.ClassPool;
++import javassist.tools.rmi.AppletServer;
++
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Test;
++
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++public class WebserverClassPoolPathTest {
++
++    private static final String SECRET =
++        "CG_SECRET_MARKER_CLASSPOOL_PATH_DO_NOT_LEAK";
++
++    private File scratchParent;
++    private File classRoot;     // the DirClassPath's configured directory
++    private File secretDir;     // sibling directory OUTSIDE classRoot
++    private File secretClassFile;
++
++    private AppletServer applet;
++
++    @Before
++    public void setUp() throws Exception {
++        scratchParent = Files.createTempDirectory("cgbypass8339").toFile();
++        classRoot = new File(scratchParent, "classroot");
++        classRoot.mkdirs();
++        secretDir = new File(scratchParent, "secret");
++        secretDir.mkdirs();
++
++        // A real, parseable .class file (copy of an existing compiled class)
++        // placed OUTSIDE classRoot.
++        secretClassFile = new File(secretDir, "Secret.class");
++        File realClass = locateCompiledClass("/javassist/tools/web/BadHttpRequest.class");
++        assertTrue("precondition: a real compiled .class file must exist to copy",
++                   realClass.isFile());
++        Files.copy(realClass.toPath(), secretClassFile.toPath());
++        // Also drop a non-class secret to prove no *file* content of any kind
++        // escapes, not just class-shaped content.
++        try (OutputStream os = new FileOutputStream(new File(secretDir, "secret.txt"))) {
++            os.write((SECRET + "\n").getBytes("UTF-8"));
++        }
++
++        // AppletServer ALWAYS has classPool != null (set in its constructor
++        // via addTranslator). Build with the default pool first (so internal
++        // Sample/ObjectImporter/Proxy/RemoteException resolve), then swap in
++        // a ClassPool whose OWN classpath is exactly `classRoot`, simulating
++        // an application that scoped its class-serving ClassPool to a
++        // specific directory the same way htmlfileBase scopes file serving.
++        applet = new AppletServer(0);
++        ClassPool scoped = new ClassPool(ClassPool.getDefault());
++        scoped.appendClassPath(classRoot.getCanonicalPath());
++        applet.setClassPool(scoped);
++    }
++
++    @After
++    public void tearDown() throws Exception {
++        if (applet != null) {
++            try { applet.end(); } catch (Exception ignore) { }
++        }
++        deleteRecursively(scratchParent);
++    }
++
++    private static File locateCompiledClass(String resourcePath) throws URISyntaxException {
++        URL url = WebserverClassPoolPathTest.class.getResource(resourcePath);
++        if (url == null) return new File(resourcePath); // will fail the precondition assert
++        return new File(url.toURI());
++    }
++
++    private static void deleteRecursively(File f) {
++        if (f == null || !f.exists()) return;
++        File[] kids = f.listFiles();
++        if (kids != null) for (File k : kids) deleteRecursively(k);
++        f.delete();
++    }
++
++    private byte[] reply(String cmd) throws Exception {
++        InputStream in = new ByteArrayInputStream(new byte[0]);
++        ByteArrayOutputStream out = new ByteArrayOutputStream();
++        try {
++            applet.doReply(in, out, cmd);
++        } catch (BadHttpRequest refused) {
++            return null;
++        }
++        return out.toByteArray();
++    }
++
++    private static boolean containsSecretText(byte[] response) {
++        if (response == null) return false;
++        return new String(response).contains(SECRET);
++    }
++
++    /**
++     * Relative ".."-traversal request whose path ends in ".class", routed
++     * through letUsersSendClassfile() -- a call chain that runs BEFORE
++     * checkFilename()'s own ".." deny-list AND BEFORE the new
++     * rejectAbsolutePath()/checkContained() chokepoint. If this served the
++     * secret .class file's bytes, the fix would be incomplete (a sibling,
++     * entirely unguarded sink reaching the same "read a file outside the
++     * configured root" harm).
++     */
++    @Test
++    public void classfileSink_relativeDotDotTraversal_doesNotEscapeConfiguredClassRoot()
++            throws Exception {
++        // classRoot's sibling "secret" dir holds Secret.class; from inside
++        // classRoot a relative "../secret/Secret.class" names it.
++        byte[] response = reply("GET /../secret/Secret.class HTTP/1.0");
++        boolean servedBytes = response != null && response.length > 0
++                && new String(response, 0, Math.min(response.length, 16))
++                       .startsWith("HTTP/1.0 200 OK");
++        assertFalse("BYPASS (CWE-36, sibling sink letUsersSendClassfile/"
++                    + "ClassPool.get): a relative '../' request ending in "
++                    + ".class reached the classfile-serving sink -- which "
++                    + "runs before checkFilename/rejectAbsolutePath/"
++                    + "checkContained -- and served bytes for a file outside "
++                    + "the ClassPool's configured search root.",
++                    servedBytes);
++    }
++
++    /**
++     * Absolute-path (double-slash) request whose path ends in ".class",
++     * targeting the secret .class file's real absolute location, routed
++     * through the same unguarded letUsersSendClassfile() call chain.
++     */
++    @Test
++    public void classfileSink_absolutePathToSecretClassFile_doesNotEscapeConfiguredClassRoot()
++            throws Exception {
++        String abs = secretClassFile.getCanonicalPath(); // e.g. /tmp/.../secret/Secret.class
++        byte[] response = reply("GET /" + abs + " HTTP/1.0"); // -> urlName/filename == abs (leading '/')
++        boolean servedBytes = response != null && response.length > 0
++                && new String(response, 0, Math.min(response.length, 16))
++                       .startsWith("HTTP/1.0 200 OK");
++        assertFalse("BYPASS (CWE-36, sibling sink letUsersSendClassfile/"
++                    + "ClassPool.get): an absolute-path '.class' request "
++                    + "reached the classfile-serving sink -- which runs "
++                    + "before rejectAbsolutePath()/checkContained() -- and "
++                    + "served the secret class file's bytes from outside "
++                    + "the ClassPool's configured search root.",
++                    servedBytes);
++    }
++
++    /**
++     * Same absolute-path idea but targeting the plain-text secret (not
++     * .class-suffixed) to double-check no generic file-read side door opens
++     * up via this call chain for non-class content either (it should not,
++     * since letUsersSendClassfile only engages for fileType == typeClass;
++     * a non-.class absolute path here instead falls through to
++     * checkFilename()/rejectAbsolutePath(), which the main RED suite already
++     * covers -- this is a belt-and-suspenders confirmation, not new surface).
++     */
++    @Test
++    public void nonClassAbsolutePath_stillGovernedByMainChokepoint() throws Exception {
++        File secretTxt = new File(secretDir, "secret.txt");
++        byte[] response = reply("GET /" + secretTxt.getCanonicalPath() + " HTTP/1.0");
++        assertFalse("VULNERABLE (CWE-36): a non-.class absolute path leaked "
++                    + "secret file content; the main chokepoint "
++                    + "(rejectAbsolutePath/checkContained) must still cover it.",
++                    containsSecretText(response));
++    }
++}
+diff --git a/src/test/javassist/tools/web/WebserverTraversalTest.java b/src/test/javassist/tools/web/WebserverTraversalTest.java
+new file mode 100644
+index 0000000..2c85af4
+--- /dev/null
++++ b/src/test/javassist/tools/web/WebserverTraversalTest.java
+@@ -0,0 +1,361 @@
++/*
++ * Exploit harness for CGP-8339-r3p5-6gh4 (CWE-36 absolute path traversal in
++ * javassist.tools.web.Webserver.doReply).
++ *
++ * SECURITY PROPERTY UNDER TEST:
++ *   No value derived from the client-supplied HTTP request-line path may cause
++ *   Webserver (or a subclass delegating to super.doReply) to return the bytes of
++ *   a file whose canonical location lies outside the canonical servable root
++ *   (htmlfileBase, or the current working directory when htmlfileBase is null).
++ *
++ * Each @Test asserts that a malicious absolute-path request does NOT leak
++ * out-of-docroot bytes. On the UNPATCHED build the bytes leak, so the assertion
++ * fails and the test run exits non-zero (RED). Once the sink is contained the
++ * requests are refused with BadHttpRequest (the project's existing bad-request
++ * convention), no bytes are returned, and the run exits zero (GREEN).
++ *
++ * The sink driven is the public entry point
++ *   javassist.tools.web.Webserver.doReply(InputStream,OutputStream,String)
++ * at src/main/javassist/tools/web/Webserver.java:285 (new File(filename) /
++ * file.canRead() / FileInputStream) — the exact runtime path, reached with a
++ * real GET request string, never a File constructed in isolation.
++ */
++package javassist.tools.web;
++
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.InputStream;
++import java.io.OutputStream;
++import java.nio.file.Files;
++import java.nio.file.Path;
++
++import javassist.tools.rmi.AppletServer;
++
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Test;
++
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertNull;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
++
++public class WebserverTraversalTest {
++
++    /** A unique sentinel written into a file that lives OUTSIDE any document root. */
++    private static final String SECRET =
++        "CG_SECRET_MARKER_8339_TOPSECRET_DO_NOT_LEAK";
++
++    /**
++     * Directory + file used only via characters checkFilename() permits
++     * (letters, digits, '_', '.', '/'), so the absolute-path payload reaches the
++     * file-read sink instead of being incidentally rejected by the char check.
++     */
++    private File secretDir;
++    private File secretFile;
++
++    /** A legitimate document root and an in-root file (positive control). */
++    private File docroot;
++    private File legitFile;
++
++    /** Servers are bound to real ephemeral ports; doReply is exercised directly. */
++    private Webserver web;
++    private AppletServer applet;
++
++    @Before
++    public void setUp() throws Exception {
++        // Secret file OUTSIDE the docroot, at an allowed-char absolute path.
++        secretDir = new File("/tmp/cgvuln8339");
++        secretDir.mkdirs();
++        secretFile = new File(secretDir, "secret.txt");
++        try (OutputStream os = new FileOutputStream(secretFile)) {
++            os.write((SECRET + "\n").getBytes("UTF-8"));
++        }
++        assertTrue("precondition: secret file must be readable",
++                   secretFile.canRead());
++
++        // A legitimate document root with a real in-root file (positive control).
++        docroot = File.createTempFile("cgdocroot", "dir");
++        docroot.delete();
++        docroot.mkdirs();
++        legitFile = new File(docroot, "index.html");
++        try (OutputStream os = new FileOutputStream(legitFile)) {
++            os.write("<html>ok</html>".getBytes("UTF-8"));
++        }
++
++        // Bind real servers on ephemeral ports (port 0). doReply is public.
++        web = new Webserver(0);
++        applet = new AppletServer(0);
++    }
++
++    @After
++    public void tearDown() throws Exception {
++        if (web != null) {
++            try { web.end(); } catch (Exception ignore) { }
++        }
++        if (applet != null) {
++            try { applet.end(); } catch (Exception ignore) { }
++        }
++        if (secretFile != null) secretFile.delete();
++        if (secretDir != null) secretDir.delete();
++        if (legitFile != null) legitFile.delete();
++        if (docroot != null) docroot.delete();
++    }
++
++    /**
++     * Drive doReply with a GET command string and return the raw bytes the
++     * server wrote back to the client. A BadHttpRequest (the convention the fix
++     * uses to reject a bad path, caught by process() to send HTTP 400) is
++     * reported as "refused" — the caller decides whether refusal is expected.
++     */
++    private byte[] reply(Webserver server, String cmd) throws Exception {
++        InputStream in = new ByteArrayInputStream(new byte[0]);
++        ByteArrayOutputStream out = new ByteArrayOutputStream();
++        try {
++            server.doReply(in, out, cmd);
++        } catch (BadHttpRequest refused) {
++            // The path was refused before any bytes could leak. Signal it with
++            // a distinct, empty-marker so callers can distinguish "refused"
++            // (a fix is present) from "served" (harmful effect happened).
++            return null;
++        }
++        return out.toByteArray();
++    }
++
++    private static boolean containsSecret(byte[] response) {
++        if (response == null) {
++            return false;
++        }
++        String s = new String(response);
++        return s.contains(SECRET);
++    }
++
++    // ------------------------------------------------------------------
++    // HARMFUL-EFFECT TESTS — each is RED on the unpatched build.
++    // ------------------------------------------------------------------
++
++    /**
++     * Documented payload, verbatim: GET //etc/passwd HTTP/1.0 against the base
++     * Webserver with htmlfileBase == null. On the unpatched build the contents
++     * of /etc/passwd (the Unix account database) are served to the client.
++     */
++    @Test
++    public void documentedPayload_etcPasswd_isNotServed() throws Exception {
++        byte[] response = reply(web, "GET //etc/passwd HTTP/1.0");
++        boolean leaked = response != null
++                && new String(response).contains("root:");
++        if (leaked) {
++            fail("VULNERABLE (CWE-36): 'GET //etc/passwd HTTP/1.0' served the "
++                 + "contents of /etc/passwd from outside the document root. "
++                 + "First bytes: "
++                 + new String(response, 0, Math.min(response.length, 80)));
++        }
++        // Post-fix contract: the absolute-path request is REFUSED with the
++        // project's BadHttpRequest convention (reply() returns null), not merely
++        // "served empty" — a specific rejection, no catch-all.
++        assertNull("EXPECTED REJECTION (CWE-36): the documented payload "
++                   + "'GET //etc/passwd HTTP/1.0' must be refused with "
++                   + "BadHttpRequest, returning no bytes to the client.",
++                   response);
++    }
++
++    /**
++     * Deterministic proof of arbitrary out-of-docroot file read: request an
++     * absolute path to a secret file this test created outside the docroot.
++     * On the unpatched build the unique sentinel comes back in the response.
++     * (htmlfileBase == null => new File("/tmp/cgvuln8339/secret.txt").)
++     */
++    @Test
++    public void absolutePath_secretFile_isNotServed() throws Exception {
++        byte[] response = reply(web, "GET /" + secretFile.getPath() + " HTTP/1.0");
++        assertFalse("VULNERABLE (CWE-36): an absolute-path GET request read a "
++                    + "file outside the document root; the secret sentinel was "
++                    + "returned to the client.",
++                    containsSecret(response));
++        assertNull("EXPECTED REJECTION (CWE-36): an absolute-path GET request "
++                   + "must be refused with BadHttpRequest.", response);
++    }
++
++    /**
++     * Non-enumerated axis (slash-count variant): three leading slashes.
++     * 'GET ///tmp/...' strips the 'GET /' prefix leaving '//tmp/...', still an
++     * absolute path. Proves the weakness is the absolute-path PROPERTY, not the
++     * literal two-slash string, so a fix that only special-cases '//' still
++     * fails here.
++     */
++    @Test
++    public void tripleSlashAbsolutePath_isNotServed() throws Exception {
++        byte[] response = reply(web, "GET //" + secretFile.getPath() + " HTTP/1.0");
++        assertFalse("VULNERABLE (CWE-36): a triple-slash absolute-path request "
++                    + "(//" + secretFile.getPath() + ") read a file outside the "
++                    + "document root; the secret sentinel was returned.",
++                    containsSecret(response));
++        assertNull("EXPECTED REJECTION (CWE-36): a triple-slash absolute-path "
++                   + "request must be refused with BadHttpRequest.", response);
++    }
++
++    /**
++     * Non-enumerated entry point: the same absolute-path read driven through the
++     * AppletServer subclass, whose doReply overrides delegate to
++     * super.doReply(in,out,cmd) for any non-RMI GET. Proves the base-class fix
++     * must actually be inherited, not bypassed by routing through a subclass.
++     */
++    @Test
++    public void absolutePath_viaAppletServerSubclass_isNotServed() throws Exception {
++        byte[] response = reply(applet, "GET /" + secretFile.getPath() + " HTTP/1.0");
++        assertFalse("VULNERABLE (CWE-36): the absolute-path read was still "
++                    + "reachable through AppletServer.doReply -> super.doReply; "
++                    + "the secret sentinel was returned to the client.",
++                    containsSecret(response));
++        assertNull("EXPECTED REJECTION (CWE-36): the absolute-path read through "
++                   + "AppletServer.doReply -> super.doReply must be refused with "
++                   + "BadHttpRequest (the base-class fix must be inherited).",
++                   response);
++    }
++
++    /**
++     * Non-enumerated axis (non-null htmlfileBase): even with a configured
++     * document root, an absolute-path-shaped request must be rejected on the
++     * absolute-path SHAPE rather than silently (mis)contained by string
++     * concatenation. This asserts the invariant holds regardless of the
++     * htmlfileBase configuration. (On the unpatched build the concat neutralises
++     * the /etc/passwd disk read, but the absolute SHAPE is still accepted, which
++     * a shape-rejecting fix must refuse; see positive control below for the
++     * legitimate case that must keep working.)
++     */
++    @Test
++    public void absolutePath_withNonNullHtmlfileBase_secretNotServed() throws Exception {
++        web.htmlfileBase = docroot.getCanonicalPath() + "/";
++        byte[] response = reply(web, "GET //" + secretFile.getPath() + " HTTP/1.0");
++        assertFalse("VULNERABLE (CWE-36): with a configured htmlfileBase, an "
++                    + "absolute-path request still leaked out-of-docroot bytes.",
++                    containsSecret(response));
++        // With the fix the absolute SHAPE is refused at the entry point,
++        // independent of htmlfileBase configuration.
++        assertNull("EXPECTED REJECTION (CWE-36): with a configured htmlfileBase "
++                   + "an absolute-path-shaped request must still be refused.",
++                   response);
++    }
++
++    // ------------------------------------------------------------------
++    // POSITIVE CONTROL — must stay GREEN before AND after the fix.
++    // Blocking this would be an over-broad regression, not a win.
++    // ------------------------------------------------------------------
++
++    /**
++     * A legitimate, relative, in-root request must still be served. This proves
++     * the containment fix is not a denial of service on valid traffic.
++     */
++    @Test
++    public void legitimateInRootFile_isStillServed() throws Exception {
++        web.htmlfileBase = docroot.getCanonicalPath() + "/";
++        byte[] response = reply(web, "GET /index.html HTTP/1.0");
++        if (response == null) {
++            fail("REGRESSION: a legitimate in-root request 'GET /index.html' was "
++                 + "refused; the fix must not break valid traffic.");
++        }
++        assertTrue("REGRESSION: legitimate in-root file content was not served.",
++                   new String(response).contains("<html>ok</html>"));
++    }
++
++    /**
++     * Preservation control (Plan #2): the documented, intentional classpath
++     * fallback must keep serving a legitimate, RELATIVE, non-absolute
++     * .class-suffixed resource that is not present on disk under the servable
++     * root but IS present on the classpath. The containment fix must not
++     * over-restrict this feature for in-scope relative names. Webserver.class
++     * is guaranteed on the test classpath and is not under the temp docroot.
++     */
++    @Test
++    public void legitimateRelativeClassResource_viaClasspathFallback_isStillServed()
++            throws Exception {
++        web.htmlfileBase = docroot.getCanonicalPath() + "/";
++        byte[] response =
++            reply(web, "GET /javassist/tools/web/Webserver.class HTTP/1.0");
++        assertNotNull("REGRESSION: a legitimate relative .class resource served "
++                      + "only via the classpath fallback was refused; the fix "
++                      + "must not disable the intentional getResourceAsStream "
++                      + "fallback for in-scope relative names.", response);
++        // The response is the HTTP header followed by the actual .class bytes.
++        // Assert it was served with 200 OK and carries a non-empty body.
++        String head = new String(response, 0,
++                                 Math.min(response.length, 32), "ISO-8859-1");
++        assertTrue("REGRESSION: the classpath .class resource was not served "
++                   + "with HTTP 200 OK; got: " + head,
++                   head.startsWith("HTTP/1.0 200 OK"));
++        assertTrue("REGRESSION: the classpath .class resource returned no body.",
++                   response.length > 40);
++    }
++
++    // ------------------------------------------------------------------
++    // Coverage for two containment escapes: a symlink inside the root pointing
++    // outside it, and a base path configured without a trailing separator.
++    // ------------------------------------------------------------------
++
++    /**
++     * Symlink escape: a symlink INSIDE
++     * the servable root that points OUTSIDE it must not let the resolved
++     * target escape containment. Path.normalize()/string checks would miss
++     * this; File.getCanonicalPath() must follow the symlink for checkContained
++     * to catch it.
++     */
++    @Test
++    public void symlinkInsideDocrootPointingOutside_isNotServed() throws Exception {
++        Path link = new File(docroot, "escape").toPath();
++        Files.createSymbolicLink(link, secretDir.toPath());
++
++        web.htmlfileBase = docroot.getCanonicalPath() + "/";
++        byte[] response = reply(web, "GET /escape/secret.txt HTTP/1.0");
++        assertFalse("VULNERABLE (CWE-36): a symlink inside the servable root "
++                    + "pointing outside it was followed and the secret sentinel "
++                    + "was returned; checkContained() must canonicalize (which "
++                    + "follows symlinks), not merely normalize.",
++                    containsSecret(response));
++        assertNull("EXPECTED REJECTION (CWE-36): a symlink escaping the "
++                   + "servable root must be refused with BadHttpRequest.",
++                   response);
++    }
++
++    /**
++     * Base path missing a trailing separator: when htmlfileBase is configured WITHOUT a trailing
++     * separator, plain string concatenation (htmlfileBase + filename) can
++     * literally resolve into a sibling directory whose name extends the
++     * base's name (e.g. base "/tmp/probebase" + filename "Evil/secret.txt"
++     * = "/tmp/probebaseEvil/secret.txt"). The containment check must compare
++     * canonical paths with a File.separator suffix, not a bare
++     * String.startsWith(htmlfileBase).
++     */
++    @Test
++    public void siblingDirectoryViaMissingTrailingSeparator_isNotServed() throws Exception {
++        File base = File.createTempFile("cgbase", "dir");
++        base.delete();
++        base.mkdirs();
++        File sibling = new File(base.getCanonicalPath() + "Evil");
++        sibling.mkdirs();
++        File siblingSecret = new File(sibling, "secret.txt");
++        try (OutputStream os = new FileOutputStream(siblingSecret)) {
++            os.write((SECRET + "\n").getBytes("UTF-8"));
++        }
++
++        try {
++            // Deliberately NOT trailing with a separator, per the bypass.
++            web.htmlfileBase = base.getCanonicalPath();
++            byte[] response = reply(web, "GET /Evil/secret.txt HTTP/1.0");
++            assertFalse("VULNERABLE (CWE-36): a sibling directory whose name "
++                        + "extends htmlfileBase's own name (missing trailing "
++                        + "separator) was reachable via string concatenation; "
++                        + "the secret sentinel was returned.",
++                        containsSecret(response));
++            assertNull("EXPECTED REJECTION (CWE-36): a sibling-directory escape "
++                       + "caused by a htmlfileBase without a trailing separator "
++                       + "must be refused with BadHttpRequest.", response);
++        } finally {
++            siblingSecret.delete();
++            sibling.delete();
++            base.delete();
++        }
++    }
++}
+-- 
+2.55.0
+

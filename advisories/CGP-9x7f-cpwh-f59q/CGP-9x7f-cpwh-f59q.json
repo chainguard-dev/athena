@@ -1,0 +1,48 @@
+{
+  "id": "CGP-9x7f-cpwh-f59q",
+  "schema_version": "1.6.0",
+  "summary": "Webserver.process() does not close the client socket on exception, leaking file descriptors; a malformed request line also causes StringIndexOutOfBoundsException.",
+  "details": "### Root Cause\n\n`Webserver.process(Socket clnt)` at line ~258 of `src/main/javassist/tools/web/Webserver.java`:\n\n```java\ntry {\n    doReply(in, out, cmd);\n}\ncatch (BadHttpRequest e) {\n    replyError(out, e);\n}\n// clnt.close() is called here, but only if no other exception escapes\n```\n\nThe `doReply` method calls `cmd.substring(5, cmd.indexOf(' ', 5))`. If the request line has no space after position 5 (e.g., `GET /`), `cmd.indexOf(' ', 5)` returns -1, and `cmd.substring(5, -1)` throws `StringIndexOutOfBoundsException`. This exception is not caught by the `BadHttpRequest` handler, escapes `process()`, and the socket is not closed. Each such request leaks one file descriptor.\n\n### Affected Locations\n\n- `src/main/javassist/tools/web/Webserver.java`, line 258 — `process(Socket)`: missing `try/finally` for `clnt.close()`; malformed request line causes `StringIndexOutOfBoundsException` and FD leak.\n\n### Attack Vectors\n\n- **Malformed HTTP request line**: An attacker sends a request line with no space after the path (e.g., `GET /`). `doReply` throws `StringIndexOutOfBoundsException`, the socket is not closed, and a file descriptor is leaked.\n- **FD exhaustion via repeated malformed requests**: An attacker repeatedly sends malformed requests, eventually exhausting the process's file descriptor limit and causing all subsequent socket operations to fail.\n\n### Impact\n\nDenial of service (file descriptor exhaustion) for any application that starts `Webserver`. The server binds to all interfaces by default and requires no authentication.",
+  "severity": [
+    {
+      "type": "CVSS_V3",
+      "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:L"
+    }
+  ],
+  "affected": [
+    {
+      "package": {
+        "ecosystem": "Maven",
+        "name": "org.javassist:javassist",
+        "purl": "pkg:maven/org.javassist/javassist"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "3.32.0-GA"
+            }
+          ]
+        }
+      ],
+      "database_specific": {
+        "cwe_ids": [
+          "CWE-404"
+        ],
+        "sink_locator": [
+          {
+            "class": "javassist.tools.web.Webserver",
+            "method": "process(Socket)",
+            "file_line": "src/main/javassist/tools/web/Webserver.java:258"
+          }
+        ]
+      }
+    }
+  ],
+  "published": "2026-11-12T16:00:00Z",
+  "modified": "2026-11-12T16:00:00Z"
+}

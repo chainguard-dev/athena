@@ -1,0 +1,1338 @@
+From 24d0037df3fa238dd34292a706658dc70c66ca86 Mon Sep 17 00:00:00 2001
+From: Vuln Patch Pipeline <vuln-patch@chainguard.dev>
+Date: Tue, 29 Sep 2026 09:26:49 +0000
+Subject: [PATCH] Block external entities and remote schemas in XML schema
+ matching
+
+XmlSchemaValidator set the JAXP properties ACCESS_EXTERNAL_DTD and
+ACCESS_EXTERNAL_SCHEMA to "all" (CWE-611, CWE-918). A schema in an
+xmlSchema body matcher, and every request body validated against it,
+could read local files through external entities, external DTDs,
+xs:include and xs:import, and could open connections to any host. A
+schema value ending in ".xsd" was read from any path (CWE-22).
+StringToXmlDocumentParser, which XPath matching and JSON schema
+matching of XML bodies use, also read external entities in a body.
+
+XmlSchemaValidator now turns on secure processing, sets
+ACCESS_EXTERNAL_DTD to "" and ACCESS_EXTERNAL_SCHEMA to "file", and
+sets both to "" on each Validator. A resource resolver loads
+xs:include, xs:import and xs:redefine only from a regular file under
+the XML schema resource root. Any other reference gets an empty
+schema, and nothing is fetched from the network. External DTDs and
+external entities in a schema are refused, also when they name a file
+under the root. A ".xsd" value is read from the classpath, or from a
+regular file under the root. The root is the working directory, or
+the directory named by the new mockserver.xmlSchemaResourceRoot
+setting (system property, property file or
+MOCKSERVER_XML_SCHEMA_RESOURCE_ROOT). The filesystem root is never
+used as the root.
+
+StringToXmlDocumentParser now turns on secure processing and turns
+off external general entities, external parameter entities and
+loading of the external DTD.
+
+A DOCTYPE with an internal subset is still accepted in schemas and in
+bodies, and its internal entities still expand. Schema files under
+the root keep loading.
+
+Adds XmlSchemaValidatorExternalReferenceTest,
+StringToXmlDocumentParserExternalEntityTest.
+
+Cgp-Finding: CGP-pqgh-898g-975x
+---
+ .../xmlschema/XmlSchemaValidator.java         | 317 +++++++-
+ .../xml/StringToXmlDocumentParser.java        |   6 +
+ ...lSchemaValidatorExternalReferenceTest.java | 697 ++++++++++++++++++
+ ...ToXmlDocumentParserExternalEntityTest.java | 175 +++++
+ 4 files changed, 1182 insertions(+), 13 deletions(-)
+ create mode 100644 mockserver-core/src/test/java/org/mockserver/validator/xmlschema/XmlSchemaValidatorExternalReferenceTest.java
+ create mode 100644 mockserver-core/src/test/java/org/mockserver/xml/StringToXmlDocumentParserExternalEntityTest.java
+
+diff --git a/mockserver-core/src/main/java/org/mockserver/validator/xmlschema/XmlSchemaValidator.java b/mockserver-core/src/main/java/org/mockserver/validator/xmlschema/XmlSchemaValidator.java
+index a34d25620..6c6f0742f 100644
+--- a/mockserver-core/src/main/java/org/mockserver/validator/xmlschema/XmlSchemaValidator.java
++++ b/mockserver-core/src/main/java/org/mockserver/validator/xmlschema/XmlSchemaValidator.java
+@@ -1,12 +1,13 @@
+ package org.mockserver.validator.xmlschema;
+ 
+-import org.mockserver.file.FileReader;
++import org.mockserver.configuration.ConfigurationProperties;
+ import org.mockserver.formatting.StringFormatter;
+ import org.mockserver.log.model.LogEntry;
+ import org.mockserver.logging.MockServerLogger;
+ import org.mockserver.model.ObjectWithReflectiveEqualsHashCodeToString;
+ import org.mockserver.validator.Validator;
+ import org.slf4j.event.Level;
++import org.w3c.dom.ls.LSInput;
+ import org.xml.sax.SAXException;
+ import org.xml.sax.SAXNotRecognizedException;
+ import org.xml.sax.SAXNotSupportedException;
+@@ -16,16 +17,30 @@ import javax.xml.transform.stream.StreamSource;
+ import javax.xml.validation.Schema;
+ import javax.xml.validation.SchemaFactory;
+ import java.io.ByteArrayInputStream;
++import java.io.File;
++import java.io.FileInputStream;
++import java.io.FileNotFoundException;
++import java.io.IOException;
++import java.io.InputStream;
++import java.io.InputStreamReader;
++import java.io.Reader;
+ import java.io.StringReader;
++import java.net.URI;
++import java.net.URISyntaxException;
++import java.nio.file.Files;
++import java.util.Properties;
+ 
+ import static java.nio.charset.StandardCharsets.UTF_8;
+ import static org.apache.commons.lang3.StringUtils.isBlank;
++import static org.apache.commons.lang3.StringUtils.isNotBlank;
+ 
+ /**
+  * @author jamesdbloom
+  */
+ public class XmlSchemaValidator extends ObjectWithReflectiveEqualsHashCodeToString implements Validator<String> {
+ 
++    private static final String RESOURCE_ROOT_PROPERTY = "mockserver.xmlSchemaResourceRoot";
++    private static final String RESOURCE_ROOT_ENVIRONMENT_VARIABLE = "MOCKSERVER_XML_SCHEMA_RESOURCE_ROOT";
+     private static SchemaFactory schemaFactory;
+     private final MockServerLogger mockServerLogger;
+     private final Schema schema;
+@@ -33,15 +48,25 @@ public class XmlSchemaValidator extends ObjectWithReflectiveEqualsHashCodeToStri
+     public XmlSchemaValidator(MockServerLogger mockServerLogger, String schema) {
+         this.mockServerLogger = mockServerLogger;
+         try {
+-            if (schemaFactory == null) {
+-                schemaFactory = buildSchemaFactory();
+-            }
+-            if (schema.trim().endsWith(">") || isBlank(schema)) {
+-                this.schema = schemaFactory.newSchema(new StreamSource(new StringReader(schema)));
+-            } else if (schema.trim().endsWith(".xsd")) {
+-                this.schema = schemaFactory.newSchema(new StreamSource(FileReader.openReaderToFileFromClassPathOrPath(schema)));
+-            } else {
+-                throw new IllegalArgumentException("Schema must either be a path reference to a *.xsd file or an xml string");
++            File resourceRoot = resourceRoot(mockServerLogger);
++            synchronized (XmlSchemaValidator.class) {
++                if (schemaFactory == null) {
++                    schemaFactory = buildSchemaFactory();
++                }
++                schemaFactory.setResourceResolver((type, namespaceURI, publicId, systemId, baseURI) ->
++                    resolveSchemaDocument(mockServerLogger, resourceRoot, type, namespaceURI, publicId, systemId, baseURI)
++                );
++                try {
++                    if (schema.trim().endsWith(">") || isBlank(schema)) {
++                        this.schema = schemaFactory.newSchema(new StreamSource(new StringReader(schema)));
++                    } else if (schema.trim().endsWith(".xsd")) {
++                        this.schema = schemaFactory.newSchema(new StreamSource(openSchemaFile(resourceRoot, schema)));
++                    } else {
++                        throw new IllegalArgumentException("Schema must either be a path reference to a *.xsd file or an xml string");
++                    }
++                } finally {
++                    schemaFactory.setResourceResolver(null);
++                }
+             }
+         } catch (Exception e) {
+             mockServerLogger.logEvent(
+@@ -57,17 +82,194 @@ public class XmlSchemaValidator extends ObjectWithReflectiveEqualsHashCodeToStri
+ 
+     private SchemaFactory buildSchemaFactory() throws SAXNotRecognizedException, SAXNotSupportedException {
+         SchemaFactory schemaFactory = SchemaFactory.newInstance(XMLConstants.W3C_XML_SCHEMA_NS_URI);
+-        schemaFactory.setProperty(XMLConstants.ACCESS_EXTERNAL_DTD, "all");
+-        schemaFactory.setProperty(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "all");
++        schemaFactory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
++        // external DTDs and entities are never loaded; xs:include, xs:import and xs:redefine are
++        // loaded by the resource resolver, which reads files under the resource root itself
++        schemaFactory.setProperty(XMLConstants.ACCESS_EXTERNAL_DTD, "");
++        schemaFactory.setProperty(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "file");
+         return schemaFactory;
+     }
+ 
++    /**
++     * Returns the directory schema files may be loaded from: the value of mockserver.xmlSchemaResourceRoot
++     * (read like the other mockserver properties: system property, then property file, then the
++     * MOCKSERVER_XML_SCHEMA_RESOURCE_ROOT environment variable) or, when that is not set, the working directory.
++     * The filesystem root is never used, whether it is configured or is the working directory, because every
++     * file would be under it; null is returned when no other directory is available, and then no file is loaded.
++     */
++    private static File resourceRoot(MockServerLogger mockServerLogger) throws IOException {
++        File workingDirectory = new File(System.getProperty("user.dir", ".")).getCanonicalFile();
++        boolean workingDirectoryIsFilesystemRoot = workingDirectory.getParentFile() == null;
++        String environmentVariable = System.getenv(RESOURCE_ROOT_ENVIRONMENT_VARIABLE);
++        String defaultOrEnvironmentVariable = isNotBlank(environmentVariable) ? environmentVariable : "";
++        Properties properties = ConfigurationProperties.PROPERTIES;
++        String configured = System.getProperty(RESOURCE_ROOT_PROPERTY, properties != null ? properties.getProperty(RESOURCE_ROOT_PROPERTY, defaultOrEnvironmentVariable) : defaultOrEnvironmentVariable);
++        if (configured != null && configured.startsWith("\"") && configured.endsWith("\"")) {
++            configured = configured.replaceAll("^\"|\"$", "");
++        }
++        if (isNotBlank(configured)) {
++            File resourceRoot = new File(configured.trim()).getCanonicalFile();
++            if (resourceRoot.getParentFile() != null) {
++                if (!resourceRoot.isDirectory()) {
++                    logWarning(mockServerLogger, RESOURCE_ROOT_PROPERTY + " value{}is not a directory, so no XML schema file can be loaded", configured);
++                }
++                return resourceRoot;
++            }
++            if (workingDirectoryIsFilesystemRoot) {
++                logWarning(mockServerLogger, "ignoring " + RESOURCE_ROOT_PROPERTY + " value{}because it names the filesystem root", configured);
++            } else {
++                logWarning(mockServerLogger, "ignoring " + RESOURCE_ROOT_PROPERTY + " value{}because it names the filesystem root, the working directory{}is used instead", configured, workingDirectory);
++            }
++        }
++        if (workingDirectoryIsFilesystemRoot) {
++            logWarning(mockServerLogger, "no XML schema file is loaded from the filesystem because the working directory{}is the filesystem root, set " + RESOURCE_ROOT_PROPERTY + " to the directory that holds the schema files", workingDirectory);
++            return null;
++        }
++        return workingDirectory;
++    }
++
++    /**
++     * Opens a *.xsd schema from the classpath or, failing that, from a regular file under the resource root.
++     */
++    private static Reader openSchemaFile(File resourceRoot, String schema) throws IOException {
++        InputStream inputStream = XmlSchemaValidator.class.getClassLoader().getResourceAsStream(schema);
++        if (inputStream == null) {
++            File file = new File(schema);
++            if (!file.isAbsolute()) {
++                file = new File(resourceRoot, schema);
++            }
++            file = containedCanonicalFile(resourceRoot, file);
++            if (file == null) {
++                throw new FileNotFoundException(schema + " (not a file under the XML schema resource root, see " + RESOURCE_ROOT_PROPERTY + ")");
++            }
++            if (!Files.isRegularFile(file.toPath())) {
++                // absent, a directory, or a device or named pipe, which is not opened because it could block or never end
++                throw new FileNotFoundException(schema + " (no such regular file under the XML schema resource root, see " + RESOURCE_ROOT_PROPERTY + ")");
++            }
++            inputStream = new FileInputStream(file);
++        }
++        return new InputStreamReader(inputStream);
++    }
++
++    /**
++     * Resolves xs:include, xs:import and xs:redefine. A reference to a regular file under the resource root is
++     * read here. Any other reference gets an empty schema and is never fetched: a file under the resource root
++     * that is absent, cannot be read or is not a regular file (such as a device or named pipe, which is not opened
++     * because it could block or never end), or a file outside it, so compilation continues as it does when the
++     * parser cannot read a reference; for another scheme (http, https, ftp, jar) the parser's access check then
++     * rejects the schema. External DTDs and entities are not resolved here, and the parser refuses them.
++     */
++    private static LSInput resolveSchemaDocument(MockServerLogger mockServerLogger, File resourceRoot, String type, String namespaceURI, String publicId, String systemId, String baseURI) {
++        if (!XMLConstants.W3C_XML_SCHEMA_NS_URI.equals(type) || systemId == null) {
++            return null;
++        }
++        URI location = resolveLocation(resourceRoot, systemId, baseURI);
++        File file = containedFile(resourceRoot, location);
++        if (file != null) {
++            if (Files.isRegularFile(file.toPath())) {
++                try {
++                    return new SchemaDocumentInput(publicId, location.toString(), baseURI, Files.readAllBytes(file.toPath()));
++                } catch (IOException ioe) {
++                    // unreadable: continue with an empty schema
++                }
++            }
++        } else {
++            logWarning(mockServerLogger, "XML schema reference{}was not loaded because it is not a file under the XML schema resource root (see " + RESOURCE_ROOT_PROPERTY + "), an empty schema is used instead", systemId);
++        }
++        String targetNamespace = isBlank(namespaceURI) ? "" : " targetNamespace=\"" + namespaceURI.replace("&", "&amp;").replace("<", "&lt;").replace("\"", "&quot;") + "\"";
++        return new SchemaDocumentInput(publicId, systemId, baseURI, ("<xs:schema xmlns:xs=\"" + XMLConstants.W3C_XML_SCHEMA_NS_URI + "\"" + targetNamespace + "/>").getBytes(UTF_8));
++    }
++
++    /**
++     * Resolves a reference against its base URI (or the resource root when it has none) without decoding
++     * the base URI first; percent escapes are decoded once, when the result is turned into a file.
++     */
++    private static URI resolveLocation(File resourceRoot, String systemId, String baseURI) {
++        URI reference = toUri(systemId);
++        if (reference == null || reference.isAbsolute()) {
++            return reference;
++        }
++        URI base = baseURI != null ? toUri(baseURI) : resourceRoot != null ? resourceRoot.toURI() : null;
++        return base == null ? null : base.resolve(reference);
++    }
++
++    private static URI toUri(String value) {
++        String location = value.trim().replace('\\', '/');
++        if (location.matches("[A-Za-z]:/.*")) {
++            // a Windows drive letter is a path, not a scheme, as the parser reads it
++            location = "/" + location;
++        }
++        try {
++            return new URI(location);
++        } catch (URISyntaxException use) {
++            // escape characters a URI cannot hold (such as a space), as the parser does before opening a location
++            byte[] bytes = location.getBytes(UTF_8);
++            StringBuilder escaped = new StringBuilder();
++            for (int i = 0; i < bytes.length; i++) {
++                int c = bytes[i] & 0xff;
++                boolean escapeSequence = c == '%' && i + 2 < bytes.length && Character.digit(bytes[i + 1], 16) >= 0 && Character.digit(bytes[i + 2], 16) >= 0;
++                if (c > ' ' && c < 0x7f && "\"<>[]^`{|}".indexOf(c) < 0 && (c != '%' || escapeSequence)) {
++                    escaped.append((char) c);
++                } else {
++                    escaped.append('%').append(Character.toUpperCase(Character.forDigit(c >> 4, 16))).append(Character.toUpperCase(Character.forDigit(c & 0xf, 16)));
++                }
++            }
++            try {
++                return new URI(escaped.toString());
++            } catch (URISyntaxException ignore) {
++                return null;
++            }
++        }
++    }
++
++    /**
++     * Returns the canonical file a file: URI names (read as the file URL handler reads it: host empty or
++     * localhost, query and fragment ignored) when that file is under the resource root, otherwise null.
++     */
++    private static File containedFile(File resourceRoot, URI location) {
++        if (location == null || !"file".equalsIgnoreCase(location.getScheme()) || location.getPath() == null
++            || (location.getRawAuthority() != null && !"localhost".equalsIgnoreCase(location.getRawAuthority()))) {
++            return null;
++        }
++        try {
++            return containedCanonicalFile(resourceRoot, new File(new URI("file", null, location.getPath(), null, null)));
++        } catch (IllegalArgumentException | IOException | URISyntaxException e) {
++            return null;
++        }
++    }
++
++    /**
++     * Returns the canonical file when it is under the resource root, otherwise null. A network (UNC) path is
++     * refused before it is canonicalized, because canonicalizing it can contact its host.
++     */
++    private static File containedCanonicalFile(File resourceRoot, File file) throws IOException {
++        if (resourceRoot == null || file.getPath().startsWith(File.separator + File.separator)) {
++            return null;
++        }
++        File canonicalFile = file.getCanonicalFile();
++        return canonicalFile.toPath().startsWith(resourceRoot.toPath()) ? canonicalFile : null;
++    }
++
++    private static void logWarning(MockServerLogger mockServerLogger, String messageFormat, Object... arguments) {
++        if (mockServerLogger != null) {
++            mockServerLogger.logEvent(
++                new LogEntry()
++                    .setLogLevel(Level.WARN)
++                    .setMessageFormat(messageFormat)
++                    .setArguments(arguments)
++            );
++        }
++    }
++
+     @Override
+     public String isValid(String xml) {
+         String errorMessage = "";
+         try {
+             try {
+-                schema.newValidator().validate(new StreamSource(new ByteArrayInputStream(xml.getBytes(UTF_8))));
++                javax.xml.validation.Validator validator = schema.newValidator();
++                validator.setProperty(XMLConstants.ACCESS_EXTERNAL_DTD, "");
++                validator.setProperty(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "");
++                validator.validate(new StreamSource(new ByteArrayInputStream(xml.getBytes(UTF_8))));
+             } catch (SAXException e) {
+                 errorMessage = e.getMessage();
+             }
+@@ -82,4 +284,93 @@ public class XmlSchemaValidator extends ObjectWithReflectiveEqualsHashCodeToStri
+         }
+         return errorMessage;
+     }
++
++    private static final class SchemaDocumentInput implements LSInput {
++        private String publicId;
++        private String systemId;
++        private String baseURI;
++        private final byte[] content;
++
++        SchemaDocumentInput(String publicId, String systemId, String baseURI, byte[] content) {
++            this.publicId = publicId;
++            this.systemId = systemId;
++            this.baseURI = baseURI;
++            this.content = content;
++        }
++
++        @Override
++        public Reader getCharacterStream() {
++            return null;
++        }
++
++        @Override
++        public void setCharacterStream(Reader characterStream) {
++        }
++
++        @Override
++        public InputStream getByteStream() {
++            return new ByteArrayInputStream(content);
++        }
++
++        @Override
++        public void setByteStream(InputStream byteStream) {
++        }
++
++        @Override
++        public String getStringData() {
++            return null;
++        }
++
++        @Override
++        public void setStringData(String stringData) {
++        }
++
++        @Override
++        public String getSystemId() {
++            return systemId;
++        }
++
++        @Override
++        public void setSystemId(String systemId) {
++            this.systemId = systemId;
++        }
++
++        @Override
++        public String getPublicId() {
++            return publicId;
++        }
++
++        @Override
++        public void setPublicId(String publicId) {
++            this.publicId = publicId;
++        }
++
++        @Override
++        public String getBaseURI() {
++            return baseURI;
++        }
++
++        @Override
++        public void setBaseURI(String baseURI) {
++            this.baseURI = baseURI;
++        }
++
++        @Override
++        public String getEncoding() {
++            return null;
++        }
++
++        @Override
++        public void setEncoding(String encoding) {
++        }
++
++        @Override
++        public boolean getCertifiedText() {
++            return false;
++        }
++
++        @Override
++        public void setCertifiedText(boolean certifiedText) {
++        }
++    }
+ }
+diff --git a/mockserver-core/src/main/java/org/mockserver/xml/StringToXmlDocumentParser.java b/mockserver-core/src/main/java/org/mockserver/xml/StringToXmlDocumentParser.java
+index 1032f955c..98a7720eb 100644
+--- a/mockserver-core/src/main/java/org/mockserver/xml/StringToXmlDocumentParser.java
++++ b/mockserver-core/src/main/java/org/mockserver/xml/StringToXmlDocumentParser.java
+@@ -7,6 +7,7 @@ import org.xml.sax.InputSource;
+ import org.xml.sax.SAXException;
+ import org.xml.sax.SAXParseException;
+ 
++import javax.xml.XMLConstants;
+ import javax.xml.parsers.DocumentBuilder;
+ import javax.xml.parsers.DocumentBuilderFactory;
+ import javax.xml.parsers.ParserConfigurationException;
+@@ -24,6 +25,11 @@ public class StringToXmlDocumentParser extends ObjectWithReflectiveEqualsHashCod
+ 
+     public Document buildDocument(final String matched, final ErrorLogger errorLogger, boolean namespaceAware) throws ParserConfigurationException, IOException, SAXException {
+         DocumentBuilderFactory documentBuilderFactory = DocumentBuilderFactory.newInstance();
++        // a DOCTYPE and its internal subset are still read; external entities and external DTDs are not loaded
++        documentBuilderFactory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true);
++        documentBuilderFactory.setFeature("http://xml.org/sax/features/external-general-entities", false);
++        documentBuilderFactory.setFeature("http://xml.org/sax/features/external-parameter-entities", false);
++        documentBuilderFactory.setFeature("http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
+         documentBuilderFactory.setNamespaceAware(namespaceAware);
+         DocumentBuilder documentBuilder = documentBuilderFactory.newDocumentBuilder();
+         documentBuilder.setErrorHandler(new ErrorHandler() {
+diff --git a/mockserver-core/src/test/java/org/mockserver/validator/xmlschema/XmlSchemaValidatorExternalReferenceTest.java b/mockserver-core/src/test/java/org/mockserver/validator/xmlschema/XmlSchemaValidatorExternalReferenceTest.java
+new file mode 100644
+index 000000000..206c4d4ce
+--- /dev/null
++++ b/mockserver-core/src/test/java/org/mockserver/validator/xmlschema/XmlSchemaValidatorExternalReferenceTest.java
+@@ -0,0 +1,697 @@
++package org.mockserver.validator.xmlschema;
++
++import org.junit.AfterClass;
++import org.junit.Assume;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.mockserver.configuration.ConfigurationProperties;
++import org.mockserver.log.model.LogEntry;
++import org.mockserver.logging.MockServerLogger;
++import org.mockserver.mock.Expectation;
++import org.mockserver.mock.HttpState;
++import org.mockserver.model.Body;
++import org.mockserver.model.HttpRequest;
++import org.mockserver.model.HttpResponse;
++import org.mockserver.responsewriter.ResponseWriter;
++import org.mockserver.scheduler.Scheduler;
++import org.mockserver.serialization.ExpectationSerializer;
++
++import java.io.File;
++import java.io.FileOutputStream;
++import java.io.IOException;
++import java.net.InetAddress;
++import java.net.ServerSocket;
++import java.net.Socket;
++import java.nio.file.Files;
++import java.util.concurrent.ExecutionException;
++import java.util.concurrent.FutureTask;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import static java.nio.charset.StandardCharsets.UTF_8;
++import static org.hamcrest.CoreMatchers.containsString;
++import static org.hamcrest.CoreMatchers.is;
++import static org.hamcrest.CoreMatchers.not;
++import static org.hamcrest.CoreMatchers.startsWith;
++import static org.hamcrest.MatcherAssert.assertThat;
++import static org.mockito.Mockito.mock;
++import static org.mockserver.configuration.Configuration.configuration;
++import static org.mockserver.model.HttpRequest.request;
++import static org.mockserver.model.HttpResponse.response;
++import static org.mockserver.model.XPathBody.xpath;
++import static org.mockserver.model.XmlBody.xml;
++import static org.mockserver.model.XmlSchemaBody.xmlSchema;
++
++/**
++ * Schema references (xs:include, xs:import, *.xsd paths) load from files under the XML schema resource root,
++ * which is the working directory unless mockserver.xmlSchemaResourceRoot names another directory; remote
++ * references, files outside the resource root, files that are not regular files, external DTDs and external
++ * entities are not loaded, and the filesystem root is never the resource root.
++ */
++public class XmlSchemaValidatorExternalReferenceTest {
++
++    private static final String ROOT_PROPERTY = "mockserver.xmlSchemaResourceRoot";
++    private static final String SECRET = "XMLSCHEMAINROOTSECRET";
++    private static final String OUTSIDE_SECRET = "XMLSCHEMAOUTSIDESECRET";
++    private static final String DTD_MARKER = "XMLSCHEMADTDMARKER";
++    private static final String BASE = "target/xml-schema-reference-test";
++    private static final String NOTE_XSD = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++        + "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" elementFormDefault=\"qualified\">\n"
++        + "  <xs:element name=\"note\"><xs:complexType><xs:sequence>\n"
++        + "    <xs:element name=\"to\" type=\"xs:string\"/>\n"
++        + "  </xs:sequence></xs:complexType></xs:element>\n"
++        + "</xs:schema>\n";
++    private static final String NOTE_XML = "<note><to>Bob</to></note>";
++    private static final String OUTER_XSD = "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"><xs:element name=\"outer\" type=\"xs:string\"/></xs:schema>";
++    private static final String OUTER_XML = "<outer>x</outer>";
++    private static final String CHAIN_B = "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" elementFormDefault=\"qualified\">\n"
++        + "  <xs:include schemaLocation=\"chain-c.xsd\"/>\n"
++        + "  <xs:element name=\"mid\"><xs:complexType><xs:sequence><xs:element ref=\"leaf\"/></xs:sequence></xs:complexType></xs:element>\n"
++        + "</xs:schema>\n";
++    private static final String CHAIN_C = "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" elementFormDefault=\"qualified\">\n"
++        + "  <xs:element name=\"leaf\" type=\"xs:string\"/>\n"
++        + "</xs:schema>\n";
++    private static final String CHAIN_XML = "<top><mid><leaf>x</leaf></mid></top>";
++    private static final AtomicInteger CONNECTIONS = new AtomicInteger();
++
++    private static File workingDirectory;
++    private static File base;
++    private static File outside;
++    private static ServerSocket listener;
++    private static String hostPort;
++
++    @BeforeClass
++    public static void createFilesAndListener() throws IOException {
++        workingDirectory = new File(System.getProperty("user.dir")).getCanonicalFile();
++        base = new File(BASE).getCanonicalFile();
++        write(new File(base, "note.xsd"), NOTE_XSD);
++        write(new File(base, "child-ns.xsd"), namespaceSchema("urn:test:child"));
++        write(new File(base, "secret.txt"), SECRET);
++        write(new File(base, "ents.dtd"), "<!ENTITY e \"" + DTD_MARKER + "\">\n");
++        for (String directory : new String[]{"sub", "dir with space/sub", "extra root/sub"}) {
++            write(new File(base, directory + "/chain-b.xsd"), CHAIN_B);
++            write(new File(base, directory + "/chain-c.xsd"), CHAIN_C);
++        }
++        write(new File(base, "extra root/extra-ns.xsd"), namespaceSchema("urn:test:extra"));
++        outside = Files.createTempDirectory("xml-schema-outside").toFile().getCanonicalFile();
++        write(new File(outside, "outside-ns.xsd"), namespaceSchema("urn:test:outside"));
++        write(new File(outside, "outer.xsd"), OUTER_XSD);
++        write(new File(outside, "secret.txt"), OUTSIDE_SECRET);
++        write(new File(outside, "outside.dtd"), "<!ENTITY e \"" + DTD_MARKER + "\">\n");
++        write(new File(base, "sub/escape.xsd"), includeOnly(relative(new File(base, "sub"), new File(outside, "outer.xsd"))));
++        listener = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
++        hostPort = "127.0.0.1:" + listener.getLocalPort();
++        Thread acceptor = new Thread(() -> {
++            while (!listener.isClosed()) {
++                try (Socket ignored = listener.accept()) {
++                    CONNECTIONS.incrementAndGet();
++                } catch (IOException e) {
++                    return;
++                }
++            }
++        });
++        acceptor.setDaemon(true);
++        acceptor.start();
++    }
++
++    @AfterClass
++    public static void deleteOutsideFilesAndStopListener() throws IOException {
++        listener.close();
++        File[] files = outside.listFiles();
++        if (files != null) {
++            for (File file : files) {
++                Files.delete(file.toPath());
++            }
++        }
++        Files.delete(outside.toPath());
++    }
++
++    // ---- schema files under the working directory keep loading
++
++    @Test
++    public void shouldLoadImportUnderWorkingDirectory() {
++        assertThat(outcome(importing(BASE + "/child-ns.xsd", "urn:test:child"), importingXml("urn:test:child")), is(""));
++    }
++
++    @Test
++    public void shouldLoadImportByAbsoluteFileUriUnderWorkingDirectory() {
++        assertThat(outcome(importing(new File(base, "child-ns.xsd").toURI().toString(), "urn:test:child"), importingXml("urn:test:child")), is(""));
++        assertThat(outcome(importing("file://localhost" + new File(base, "child-ns.xsd").toURI().getRawPath(), "urn:test:child"), importingXml("urn:test:child")), is(""));
++        assertThat(outcome(importing(new File(base, "child-ns.xsd").getPath(), "urn:test:child"), importingXml("urn:test:child")), is(""));
++    }
++
++    @Test
++    public void shouldRegisterExpectationWithIncludeUnderWorkingDirectory() {
++        HttpState httpState = httpState();
++        assertThat(putExpectation(httpState, xmlSchema(chainTop(BASE + "/sub/chain-b.xsd"))), is("201"));
++        assertThat(matches(httpState, request().withBody(CHAIN_XML)), is(true));
++    }
++
++    @Test
++    public void shouldLoadNestedIncludeChain() {
++        assertThat(outcome(chainTop(BASE + "/sub/chain-b.xsd"), CHAIN_XML), is(""));
++    }
++
++    @Test
++    public void shouldLoadNestedIncludeChainInDirectoryWithSpace() {
++        assertThat(outcome(chainTop(BASE + "/dir%20with%20space/sub/chain-b.xsd"), CHAIN_XML), is(""));
++        assertThat(outcome(chainTop(BASE + "/dir with space/sub/chain-b.xsd"), CHAIN_XML), is(""));
++        assertThat(outcome(chainTop(new File(base, "dir with space/sub/chain-b.xsd").toURI().toString()), CHAIN_XML), is(""));
++    }
++
++    @Test
++    public void shouldRegisterExpectationWithNestedIncludeChainInDirectoryWithSpace() {
++        HttpState httpState = httpState();
++        assertThat(putExpectation(httpState, xmlSchema(chainTop(BASE + "/dir%20with%20space/sub/chain-b.xsd"))), is("201"));
++        assertThat(matches(httpState, request().withBody(CHAIN_XML)), is(true));
++    }
++
++    @Test
++    public void shouldCompileWhenIncludedFileUnderWorkingDirectoryIsAbsent() {
++        assertThat(outcome(NOTE_XSD.replace("qualified\">\n", "qualified\">\n  <xs:include schemaLocation=\"" + BASE + "/absent.xsd\"/>\n"), NOTE_XML), is(""));
++    }
++
++    @Test
++    public void shouldCompileWhenImportedFileUnderWorkingDirectoryIsAbsent() {
++        assertThat(outcome(NOTE_XSD.replace("qualified\">\n", "qualified\">\n  <xs:import namespace=\"urn:test:absent\" schemaLocation=\"" + BASE + "/absent-ns.xsd\"/>\n"), NOTE_XML), is(""));
++    }
++
++    @Test
++    public void shouldRegisterExpectationWhenIncludedOrImportedFileIsAbsent() {
++        HttpState httpState = httpState();
++        assertThat(putExpectation(httpState, xmlSchema(NOTE_XSD.replace("qualified\">\n", "qualified\">\n  <xs:include schemaLocation=\"" + BASE + "/absent.xsd\"/>\n"))), is("201"));
++        assertThat(matches(httpState, request().withBody(NOTE_XML)), is(true));
++        httpState = httpState();
++        assertThat(putExpectation(httpState, xmlSchema(NOTE_XSD.replace("qualified\">\n", "qualified\">\n  <xs:import namespace=\"urn:test:absent\" schemaLocation=\"" + BASE + "/absent-ns.xsd\"/>\n"))), is("201"));
++        assertThat(matches(httpState, request().withBody(NOTE_XML)), is(true));
++    }
++
++    @Test
++    public void shouldLoadXsdPathRelativeToWorkingDirectory() {
++        assertThat(outcome(BASE + "/note.xsd", NOTE_XML), is(""));
++    }
++
++    @Test
++    public void shouldLoadAbsoluteXsdPathUnderWorkingDirectory() {
++        assertThat(outcome(new File(base, "note.xsd").getPath(), NOTE_XML), is(""));
++    }
++
++    @Test
++    public void shouldRegisterExpectationWithXsdPath() {
++        HttpState httpState = httpState();
++        assertThat(putExpectation(httpState, xmlSchema(BASE + "/note.xsd")), is("201"));
++        assertThat(matches(httpState, request().withBody(NOTE_XML)), is(true));
++    }
++
++    @Test
++    public void shouldLoadXsdFromClasspath() {
++        assertThat(outcome("org/mockserver/validator/xmlschema/embedded.xsd", "<embedded><numeric>1</numeric></embedded>"), is(""));
++    }
++
++    @Test
++    public void shouldAcceptSchemaWithInternalDoctype() {
++        assertThat(outcome(doctypeSchema(), NOTE_XML), is(""));
++        HttpState httpState = httpState();
++        assertThat(putExpectation(httpState, xmlSchema(doctypeSchema())), is("201"));
++        assertThat(matches(httpState, request().withBody(NOTE_XML)), is(true));
++    }
++
++    @Test
++    public void shouldAcceptBodyWithInternalDoctypeEntity() {
++        assertThat(outcome(NOTE_XSD, "<!DOCTYPE note [ <!ENTITY b \"Bob\"> ]><note><to>&b;</to></note>"), is(""));
++    }
++
++    @Test
++    public void shouldMatchPlainBodiesWithXmlAndXpathMatchers() {
++        HttpState httpState = httpState();
++        assertThat(putExpectation(httpState, xml(NOTE_XML)), is("201"));
++        assertThat(matches(httpState, request().withBody(NOTE_XML)), is(true));
++        httpState = httpState();
++        assertThat(putExpectation(httpState, xpath("/note[to='Bob']")), is("201"));
++        assertThat(matches(httpState, request().withBody(NOTE_XML)), is(true));
++    }
++
++    @Test
++    public void shouldKeepParserLimitOnMaxOccurs() {
++        // unchanged from the line head: the parser's own limit of 5000
++        assertThat(outcome("<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"><xs:element name=\"r\"><xs:complexType><xs:choice maxOccurs=\"6000\">"
++            + "<xs:element name=\"a\" type=\"xs:string\"/></xs:choice></xs:complexType></xs:element></xs:schema>", "<r><a>x</a></r>"), startsWith("not compiled"));
++    }
++
++    // ---- files outside the resource root are not loaded
++
++    @Test
++    public void shouldNotLoadXsdPathOutsideWorkingDirectory() {
++        assertThat(outcome(new File(outside, "outer.xsd").getPath(), OUTER_XML), startsWith("not compiled"));
++        assertThat(outcome(relative(workingDirectory, new File(outside, "outer.xsd")), OUTER_XML), startsWith("not compiled"));
++    }
++
++    @Test
++    public void shouldNotLoadImportEscapingWorkingDirectory() {
++        String escaping = relative(workingDirectory, new File(outside, "outside-ns.xsd"));
++        assertThat(escaping, startsWith("../"));
++        assertNotLoaded(importing(escaping, "urn:test:outside"), importingXml("urn:test:outside"));
++        assertNotLoaded(importing(escaping.replace("../", "%2e%2e/"), "urn:test:outside"), importingXml("urn:test:outside"));
++        assertNotLoaded(importing(escaping.replace("../", "%2E%2E%2F"), "urn:test:outside"), importingXml("urn:test:outside"));
++        assertNotLoaded(importing(escaping.replace("../", "%252e%252e/"), "urn:test:outside"), importingXml("urn:test:outside"));
++        assertNotLoaded(importing(escaping.replace("../", "..\\"), "urn:test:outside"), importingXml("urn:test:outside"));
++        assertNotLoaded(importing(BASE + "/sub/../../../" + escaping, "urn:test:outside"), importingXml("urn:test:outside"));
++    }
++
++    @Test
++    public void shouldNotLoadIncludeEscapingWorkingDirectory() {
++        String escaping = relative(workingDirectory, new File(outside, "outer.xsd"));
++        assertNotLoaded(includeOnly(escaping), OUTER_XML);
++        assertNotLoaded(includeOnly(escaping.replace("../", "%2e%2e/")), OUTER_XML);
++        // a file under the working directory whose own include escapes it
++        assertNotLoaded(includeOnly(BASE + "/sub/escape.xsd"), OUTER_XML);
++    }
++
++    @Test
++    public void shouldNotLoadAbsoluteReferenceOutsideWorkingDirectory() {
++        assertNotLoaded(importing(new File(outside, "outside-ns.xsd").toURI().toString(), "urn:test:outside"), importingXml("urn:test:outside"));
++        assertNotLoaded(includeOnly(new File(outside, "outer.xsd").toURI().toString()), OUTER_XML);
++        assertNotLoaded(includeOnly(new File(outside, "outer.xsd").getPath()), OUTER_XML);
++        assertNotLoaded(includeOnly("file://localhost" + new File(outside, "outer.xsd").toURI().getRawPath()), OUTER_XML);
++    }
++
++    @Test
++    public void shouldNotLoadFileThroughSymbolicLinkLeavingWorkingDirectory() throws IOException {
++        File link = new File(base, "link-out");
++        Files.deleteIfExists(link.toPath());
++        try {
++            Files.createSymbolicLink(link.toPath(), outside.toPath());
++        } catch (UnsupportedOperationException | IOException e) {
++            Assume.assumeNoException(e);
++        }
++        assertNotLoaded(includeOnly(BASE + "/link-out/outer.xsd"), OUTER_XML);
++        assertThat(outcome(BASE + "/link-out/outer.xsd", OUTER_XML), startsWith("not compiled"));
++    }
++
++    @Test
++    public void shouldLogReferenceThatWasNotLoaded() {
++        StringBuilder logged = new StringBuilder();
++        new XmlSchemaValidator(capturingLogger(logged), includeOnly(new File(outside, "outer.xsd").toURI().toString()));
++        assertThat(logged.toString(), containsString("was not loaded because it is not a file under the XML schema resource root"));
++    }
++
++    // ---- only regular files are read, and the filesystem root is never the resource root
++
++    @Test
++    public void shouldNotReadDeviceFileUnderResourceRoot() {
++        Assume.assumeTrue(new File("/dev/zero").exists() && new File("/dev/urandom").exists());
++        System.setProperty(ROOT_PROPERTY, "/dev");
++        try {
++            // the device is under the configured root but is not a regular file, so it is not read (it never ends)
++            // and the include gets an empty schema
++            for (String location : new String[]{"/dev/zero", "file:///dev/zero", "/dev/urandom"}) {
++                assertThat(location, outcome(includeWithElement(location), "<v>x</v>"), is(""));
++            }
++        } finally {
++            System.clearProperty(ROOT_PROPERTY);
++        }
++    }
++
++    @Test
++    public void shouldNotOpenNamedPipeUnderWorkingDirectory() throws Exception {
++        File pipe = new File(base, "pipe.xsd");
++        Files.deleteIfExists(pipe.toPath());
++        try {
++            Assume.assumeTrue(new ProcessBuilder("mkfifo", pipe.getPath()).start().waitFor() == 0);
++        } catch (IOException e) {
++            Assume.assumeNoException(e);
++        }
++        // opening a pipe waits for a writer, and would hold every other schema compilation behind it: an include
++        // of the pipe gets an empty schema, and a *.xsd value naming it is refused, both without opening it
++        assertThat(outcomeWithin(pipe, includeWithElement(BASE + "/pipe.xsd"), "<v>x</v>"), is(""));
++        assertThat(outcomeWithin(pipe, BASE + "/pipe.xsd", "<v>x</v>"), startsWith("not compiled"));
++        assertThat(outcome(NOTE_XSD, NOTE_XML), is(""));
++    }
++
++    @Test
++    public void shouldLoadNoFileWhenWorkingDirectoryIsFilesystemRoot() {
++        String filesystemRoot = File.listRoots()[0].getPath();
++        String inRootImport = importing(new File(base, "child-ns.xsd").toURI().toString(), "urn:test:child");
++        String inRootXsd = new File(base, "note.xsd").getPath();
++        StringBuilder logged = new StringBuilder();
++        String workingDirectoryProperty = System.getProperty("user.dir");
++        System.setProperty("user.dir", filesystemRoot);
++        try {
++            // treated as a configured filesystem root: no file is loaded, as every file would be under it
++            assertNotLoaded(inRootImport, importingXml("urn:test:child"));
++            assertNotLoaded(includeOnly(new File(outside, "outer.xsd").getPath()), OUTER_XML);
++            assertThat(outcome(inRootXsd, NOTE_XML), startsWith("not compiled"));
++            if (new File("/dev/zero").exists()) {
++                assertThat(outcome(includeWithElement("/dev/zero"), "<v>x</v>"), is(""));
++            }
++            assertThat(outcome("org/mockserver/validator/xmlschema/embedded.xsd", "<embedded><numeric>1</numeric></embedded>"), is(""));
++            new XmlSchemaValidator(capturingLogger(logged), NOTE_XSD);
++            // a configured filesystem root does not change that, a configured directory does
++            System.setProperty(ROOT_PROPERTY, filesystemRoot);
++            assertNotLoaded(inRootImport, importingXml("urn:test:child"));
++            System.setProperty(ROOT_PROPERTY, base.getPath());
++            assertThat(outcome(inRootImport, importingXml("urn:test:child")), is(""));
++            assertThat(outcome(inRootXsd, NOTE_XML), is(""));
++        } finally {
++            System.clearProperty(ROOT_PROPERTY);
++            System.setProperty("user.dir", workingDirectoryProperty);
++        }
++        assertThat(logged.toString(), containsString("is the filesystem root, set " + ROOT_PROPERTY));
++    }
++
++    // ---- external entities and external DTDs in schemas are not loaded, even from files under the working directory
++
++    @Test
++    public void shouldNotReadExternalEntityInSchema() {
++        assertNotRead(contentEntitySchema("<!DOCTYPE xs:schema [ <!ENTITY e SYSTEM \"" + BASE + "/secret.txt\"> ]>"), SECRET);
++        assertNotRead(contentEntitySchema("<!DOCTYPE xs:schema [ <!ENTITY e SYSTEM \"" + new File(base, "secret.txt").toURI() + "\"> ]>"), SECRET);
++        assertNotRead(contentEntitySchema("<!DOCTYPE xs:schema [ <!ENTITY e SYSTEM \"" + new File(outside, "secret.txt").toURI() + "\"> ]>"), OUTSIDE_SECRET);
++    }
++
++    @Test
++    public void shouldNotReadExternalEntityInSchemaRegisteredByExpectationOrLogIt() {
++        String schema = contentEntitySchema("<!DOCTYPE xs:schema [ <!ENTITY e SYSTEM \"" + BASE + "/secret.txt\"> ]>");
++        String status = putExpectation(httpState(), xmlSchema(schema));
++        assertThat(status, not("201"));
++        assertThat(status, not(containsString(SECRET)));
++        StringBuilder logged = new StringBuilder();
++        try {
++            new XmlSchemaValidator(capturingLogger(logged), schema);
++        } catch (RuntimeException e) {
++            logged.append(messages(e));
++        }
++        assertThat(logged.toString(), not(containsString(SECRET)));
++    }
++
++    @Test
++    public void shouldNotLoadExternalDtdInSchema() {
++        assertThat(outcome(enumerationSchema("<!DOCTYPE xs:schema SYSTEM \"" + BASE + "/ents.dtd\">"), "<v>" + DTD_MARKER + "</v>"), startsWith("not compiled"));
++        assertThat(outcome(enumerationSchema("<!DOCTYPE xs:schema SYSTEM \"" + new File(outside, "outside.dtd").toURI() + "\">"), "<v>" + DTD_MARKER + "</v>"), startsWith("not compiled"));
++    }
++
++    @Test
++    public void shouldNotLoadExternalParameterEntityInSchema() {
++        assertThat(outcome(enumerationSchema("<!DOCTYPE xs:schema [ <!ENTITY % p SYSTEM \"" + BASE + "/ents.dtd\"> %p; ]>"), "<v>" + DTD_MARKER + "</v>"), startsWith("not compiled"));
++    }
++
++    @Test
++    public void shouldNotReadExternalEntityOrDtdInValidatedBody() {
++        String secretPattern = "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"><xs:element name=\"v\"><xs:simpleType><xs:restriction base=\"xs:string\">"
++            + "<xs:pattern value=\"" + SECRET + "\"/></xs:restriction></xs:simpleType></xs:element></xs:schema>";
++        assertThat(outcome(secretPattern, "<!DOCTYPE v [ <!ENTITY x SYSTEM \"" + new File(base, "secret.txt").toURI() + "\"> ]><v>&x;</v>"), not(""));
++        assertThat(outcome(NOTE_XSD, "<!DOCTYPE note SYSTEM \"" + BASE + "/ents.dtd\"><note><to>Bob</to></note>"), not(""));
++    }
++
++    // ---- no network connection
++
++    @Test
++    public void shouldNotConnectForRemoteSchemaReferences() throws InterruptedException {
++        String http = "http://" + hostPort;
++        String[] locations = {http + "/x.xsd", "https://" + hostPort + "/x.xsd", "jar:" + http + "/x.jar!/x.xsd", "ftp://" + hostPort + "/x.xsd", "//" + hostPort + "/x.xsd"};
++        for (String location : locations) {
++            assertThat(location, connectionsDuring(() -> outcome(importing(location, "urn:test:child"), importingXml("urn:test:child"))), is(0));
++            assertThat(location, connectionsDuring(() -> outcome(includeOnly(location), OUTER_XML)), is(0));
++            assertThat(location, outcome(importing(location, "urn:test:child"), importingXml("urn:test:child")), not(""));
++        }
++    }
++
++    @Test
++    public void shouldNotConnectForRemoteDtdOrEntityInSchema() throws InterruptedException {
++        String http = "http://" + hostPort;
++        String entity = "<?xml version=\"1.0\"?>\n<!DOCTYPE xs:schema [ <!ENTITY x SYSTEM \"" + http + "/e\"> ]>\n"
++            + "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"><xs:annotation><xs:documentation>&x;</xs:documentation></xs:annotation>"
++            + "<xs:element name=\"note\" type=\"xs:string\"/></xs:schema>";
++        String dtd = "<?xml version=\"1.0\"?>\n<!DOCTYPE xs:schema SYSTEM \"" + http + "/s.dtd\">\n"
++            + "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"><xs:element name=\"note\" type=\"xs:string\"/></xs:schema>";
++        String parameterEntity = "<?xml version=\"1.0\"?>\n<!DOCTYPE xs:schema [ <!ENTITY % p SYSTEM \"" + http + "/p\"> %p; ]>\n"
++            + "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"><xs:element name=\"note\" type=\"xs:string\"/></xs:schema>";
++        for (String schema : new String[]{entity, dtd, parameterEntity}) {
++            assertThat(schema, connectionsDuring(() -> outcome(schema, "<note>a</note>")), is(0));
++        }
++    }
++
++    @Test
++    public void shouldNotConnectForRemoteDtdEntityOrSchemaLocationInValidatedBody() throws InterruptedException {
++        String http = "http://" + hostPort;
++        String[] bodies = {
++            "<?xml version=\"1.0\"?><!DOCTYPE note SYSTEM \"" + http + "/x.dtd\"><note><to>Bob</to></note>",
++            "<?xml version=\"1.0\"?><!DOCTYPE note [ <!ENTITY x SYSTEM \"" + http + "/b\"> ]><note><to>&x;</to></note>",
++            "<note xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:noNamespaceSchemaLocation=\"" + http + "/n.xsd\"><to>Bob</to></note>"
++        };
++        for (String body : bodies) {
++            assertThat(body, connectionsDuring(() -> outcome(NOTE_XSD, body)), is(0));
++        }
++    }
++
++    // ---- configuration
++
++    @Test
++    public void shouldLoadFilesUnderConfiguredResourceRootInsteadOfWorkingDirectory() {
++        File extraRoot = new File(base, "extra root");
++        System.setProperty(ROOT_PROPERTY, extraRoot.getPath());
++        try {
++            assertThat(outcome(importing(new File(extraRoot, "extra-ns.xsd").toURI().toString(), "urn:test:extra"), importingXml("urn:test:extra")), is(""));
++            assertThat(outcome(chainTop("sub/chain-b.xsd"), CHAIN_XML), is(""));
++            assertThat(outcome(chainTop(new File(extraRoot, "sub/chain-b.xsd").toURI().toString()), CHAIN_XML), is(""));
++            assertThat(outcome("extra-ns.xsd", "<c:child xmlns:c=\"urn:test:extra\">x</c:child>"), is(""));
++            // the configured root replaces the working directory
++            assertNotLoaded(chainTop(BASE + "/sub/chain-b.xsd"), CHAIN_XML);
++            assertNotLoaded(importing(new File(base, "child-ns.xsd").toURI().toString(), "urn:test:child"), importingXml("urn:test:child"));
++            assertNotLoaded(importing(new File(outside, "outside-ns.xsd").toURI().toString(), "urn:test:outside"), importingXml("urn:test:outside"));
++        } finally {
++            System.clearProperty(ROOT_PROPERTY);
++        }
++    }
++
++    @Test
++    public void shouldReadResourceRootFromPropertyFile() {
++        File extraRoot = new File(base, "extra root");
++        ConfigurationProperties.PROPERTIES.setProperty(ROOT_PROPERTY, "\"" + extraRoot.getPath() + "\"");
++        try {
++            assertThat(outcome(importing(new File(extraRoot, "extra-ns.xsd").toURI().toString(), "urn:test:extra"), importingXml("urn:test:extra")), is(""));
++            assertNotLoaded(chainTop(BASE + "/sub/chain-b.xsd"), CHAIN_XML);
++        } finally {
++            ConfigurationProperties.PROPERTIES.remove(ROOT_PROPERTY);
++        }
++    }
++
++    @Test
++    public void shouldNotWidenResourceRootToWildcardOrFilesystemRoot() {
++        for (String value : new String[]{"*", File.listRoots()[0].getPath()}) {
++            System.setProperty(ROOT_PROPERTY, value);
++            try {
++                assertNotLoaded(importing(new File(outside, "outside-ns.xsd").toURI().toString(), "urn:test:outside"), importingXml("urn:test:outside"));
++                assertThat(outcome(new File(outside, "outer.xsd").getPath(), OUTER_XML), startsWith("not compiled"));
++            } finally {
++                System.clearProperty(ROOT_PROPERTY);
++            }
++        }
++    }
++
++    @Test
++    public void shouldIgnoreSettingsThatWouldTurnProtectionOff() throws InterruptedException {
++        String[][] settings = {
++            {"mockserver.disableXmlSchemaResourceContainment", "true"},
++            {"mockserver.disableXmlSchemaResourceContainment", "false"},
++            {"mockserver.xmlExternalSchemaAccessProtocols", "file"},
++            {"mockserver.xmlExternalSchemaAccessProtocols", "all"},
++            {"mockserver.disableXmlEntityProtection", "true"}
++        };
++        for (String[] setting : settings) {
++            System.setProperty(setting[0], setting[1]);
++            try {
++                assertNotLoaded(importing(new File(outside, "outside-ns.xsd").toURI().toString(), "urn:test:outside"), importingXml("urn:test:outside"));
++                assertNotRead(contentEntitySchema("<!DOCTYPE xs:schema [ <!ENTITY e SYSTEM \"" + new File(outside, "secret.txt").toURI() + "\"> ]>"), OUTSIDE_SECRET);
++                assertThat(outcome(enumerationSchema("<!DOCTYPE xs:schema SYSTEM \"" + new File(outside, "outside.dtd").toURI() + "\">"), "<v>" + DTD_MARKER + "</v>"), startsWith("not compiled"));
++                assertThat(connectionsDuring(() -> outcome(importing("http://" + hostPort + "/k.xsd", "urn:test:child"), importingXml("urn:test:child"))), is(0));
++                // schema files under the working directory keep loading
++                assertThat(outcome(chainTop(BASE + "/sub/chain-b.xsd"), CHAIN_XML), is(""));
++                assertThat(outcome(BASE + "/note.xsd", NOTE_XML), is(""));
++                assertThat(outcome(doctypeSchema(), NOTE_XML), is(""));
++            } finally {
++                System.clearProperty(setting[0]);
++            }
++        }
++    }
++
++    // ---- helpers
++
++    /**
++     * "" when the schema compiles and the body is valid, the validation error when it is not, or "not compiled: ..."
++     */
++    private static String outcome(String schema, String xml) {
++        XmlSchemaValidator validator;
++        try {
++            validator = new XmlSchemaValidator(new MockServerLogger(), schema);
++        } catch (RuntimeException e) {
++            return "not compiled: " + messages(e);
++        }
++        return validator.isValid(xml);
++    }
++
++    /**
++     * outcome(schema, xml), or "blocked" when it has not finished after ten seconds; the pipe is then opened for
++     * writing and closed, so the waiting compilation reads end of file and releases the lock other tests need
++     */
++    private static String outcomeWithin(File pipe, String schema, String xml) throws Exception {
++        FutureTask<String> task = new FutureTask<>(() -> outcome(schema, xml));
++        Thread compilation = new Thread(task);
++        compilation.setDaemon(true);
++        compilation.start();
++        try {
++            return task.get(10, TimeUnit.SECONDS);
++        } catch (TimeoutException e) {
++            Thread release = new Thread(() -> {
++                try (FileOutputStream ignored = new FileOutputStream(pipe)) {
++                    // opening and closing the pipe for writing gives its reader end of file
++                } catch (IOException ignore) {
++                    // the compilation is reported as blocked either way
++                }
++            });
++            release.setDaemon(true);
++            release.start();
++            try {
++                task.get(10, TimeUnit.SECONDS);
++            } catch (TimeoutException | ExecutionException ignore) {
++                // the compilation is reported as blocked either way
++            }
++            return "blocked";
++        }
++    }
++
++    private static void assertNotLoaded(String schema, String xml) {
++        assertThat(schema, outcome(schema, xml), not(""));
++    }
++
++    private static void assertNotRead(String schema, String marker) {
++        String outcome = outcome(schema, "<v>x</v>");
++        assertThat(outcome, startsWith("not compiled"));
++        assertThat(outcome, not(containsString(marker)));
++    }
++
++    private static String messages(Throwable throwable) {
++        StringBuilder messages = new StringBuilder();
++        for (Throwable cause = throwable; cause != null; cause = cause.getCause() == cause ? null : cause.getCause()) {
++            messages.append(' ').append(cause.getMessage());
++        }
++        return messages.toString();
++    }
++
++    private static int connectionsDuring(Runnable action) throws InterruptedException {
++        CONNECTIONS.set(0);
++        action.run();
++        Thread.sleep(300);
++        return CONNECTIONS.get();
++    }
++
++    private static HttpState httpState() {
++        return new HttpState(configuration(), new MockServerLogger(), mock(Scheduler.class));
++    }
++
++    /**
++     * PUT /mockserver/expectation; returns the status code, or "failed: " and the exception text
++     */
++    private static String putExpectation(HttpState httpState, Body<?> body) {
++        String json = new ExpectationSerializer(new MockServerLogger()).serialize(new Expectation(request("/probe").withBody(body)).thenRespond(response("ok")));
++        CapturingResponseWriter writer = new CapturingResponseWriter();
++        try {
++            httpState.handle(request("/mockserver/expectation").withMethod("PUT").withBody(json), writer, false);
++        } catch (RuntimeException e) {
++            return "failed: " + messages(e);
++        }
++        return writer.response == null ? "no response" : String.valueOf(writer.response.getStatusCode());
++    }
++
++    private static boolean matches(HttpState httpState, HttpRequest request) {
++        return httpState.firstMatchingExpectation(request.withPath("/probe")) != null;
++    }
++
++    private static MockServerLogger capturingLogger(StringBuilder logged) {
++        return new MockServerLogger() {
++            @Override
++            public void logEvent(LogEntry logEntry) {
++                logged.append(logEntry.getMessage()).append(' ');
++                if (logEntry.getThrowable() != null) {
++                    logged.append(messages(logEntry.getThrowable())).append(' ');
++                }
++            }
++        };
++    }
++
++    private static final class CapturingResponseWriter extends ResponseWriter {
++        private HttpResponse response;
++
++        CapturingResponseWriter() {
++            super(configuration(), new MockServerLogger());
++        }
++
++        @Override
++        public void sendResponse(HttpRequest request, HttpResponse response) {
++            this.response = response;
++        }
++    }
++
++    private static void write(File file, String content) throws IOException {
++        Files.createDirectories(file.getParentFile().toPath());
++        Files.write(file.toPath(), content.getBytes(UTF_8));
++    }
++
++    private static String relative(File from, File to) {
++        return from.toPath().relativize(to.toPath()).toString().replace(File.separatorChar, '/');
++    }
++
++    private static String namespaceSchema(String namespace) {
++        return "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" targetNamespace=\"" + namespace + "\" elementFormDefault=\"qualified\">"
++            + "<xs:element name=\"child\" type=\"xs:string\"/></xs:schema>";
++    }
++
++    private static String importing(String location, String namespace) {
++        return "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:c=\"" + namespace + "\" elementFormDefault=\"qualified\">\n"
++            + "  <xs:import namespace=\"" + namespace + "\" schemaLocation=\"" + location + "\"/>\n"
++            + "  <xs:element name=\"parent\"><xs:complexType><xs:sequence><xs:element ref=\"c:child\"/></xs:sequence></xs:complexType></xs:element>\n"
++            + "</xs:schema>";
++    }
++
++    private static String importingXml(String namespace) {
++        return "<parent xmlns:c=\"" + namespace + "\"><c:child>x</c:child></parent>";
++    }
++
++    private static String includeOnly(String location) {
++        return "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"><xs:include schemaLocation=\"" + location + "\"/></xs:schema>";
++    }
++
++    private static String includeWithElement(String location) {
++        return "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"><xs:include schemaLocation=\"" + location + "\"/>"
++            + "<xs:element name=\"v\" type=\"xs:string\"/></xs:schema>";
++    }
++
++    private static String chainTop(String location) {
++        return "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" elementFormDefault=\"qualified\">\n"
++            + "  <xs:include schemaLocation=\"" + location + "\"/>\n"
++            + "  <xs:element name=\"top\"><xs:complexType><xs:sequence><xs:element ref=\"mid\"/></xs:sequence></xs:complexType></xs:element>\n"
++            + "</xs:schema>";
++    }
++
++    private static String doctypeSchema() {
++        return NOTE_XSD.replace("<xs:schema", "<!DOCTYPE xs:schema [ <!ENTITY str \"xs:string\"> ]>\n<xs:schema").replace("type=\"xs:string\"", "type=\"&str;\"");
++    }
++
++    /**
++     * the entity is character content of xs:schema, so the parser's error names its text if it is read
++     */
++    private static String contentEntitySchema(String doctype) {
++        return "<?xml version=\"1.0\"?>\n" + doctype + "\n"
++            + "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">&e;<xs:element name=\"v\" type=\"xs:string\"/></xs:schema>";
++    }
++
++    /**
++     * compiles only if the DTD is loaded, since the entity e is declared there
++     */
++    private static String enumerationSchema(String doctype) {
++        return "<?xml version=\"1.0\"?>\n" + doctype + "\n"
++            + "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"><xs:element name=\"v\"><xs:simpleType>"
++            + "<xs:restriction base=\"xs:string\"><xs:enumeration value=\"&e;\"/></xs:restriction>"
++            + "</xs:simpleType></xs:element></xs:schema>";
++    }
++}
+diff --git a/mockserver-core/src/test/java/org/mockserver/xml/StringToXmlDocumentParserExternalEntityTest.java b/mockserver-core/src/test/java/org/mockserver/xml/StringToXmlDocumentParserExternalEntityTest.java
+new file mode 100644
+index 000000000..6b9b38405
+--- /dev/null
++++ b/mockserver-core/src/test/java/org/mockserver/xml/StringToXmlDocumentParserExternalEntityTest.java
+@@ -0,0 +1,175 @@
++package org.mockserver.xml;
++
++import org.junit.AfterClass;
++import org.junit.BeforeClass;
++import org.junit.Test;
++import org.mockserver.logging.MockServerLogger;
++import org.mockserver.mock.Expectation;
++import org.mockserver.mock.HttpState;
++import org.mockserver.model.Body;
++import org.mockserver.model.HttpRequest;
++import org.mockserver.model.HttpResponse;
++import org.mockserver.responsewriter.ResponseWriter;
++import org.mockserver.scheduler.Scheduler;
++import org.mockserver.serialization.ExpectationSerializer;
++
++import java.io.File;
++import java.io.IOException;
++import java.net.InetAddress;
++import java.net.ServerSocket;
++import java.net.Socket;
++import java.nio.file.Files;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import static java.nio.charset.StandardCharsets.UTF_8;
++import static org.hamcrest.CoreMatchers.containsString;
++import static org.hamcrest.CoreMatchers.is;
++import static org.hamcrest.CoreMatchers.not;
++import static org.hamcrest.MatcherAssert.assertThat;
++import static org.mockito.Mockito.mock;
++import static org.mockserver.configuration.Configuration.configuration;
++import static org.mockserver.model.HttpRequest.request;
++import static org.mockserver.model.HttpResponse.response;
++import static org.mockserver.model.JsonSchemaBody.jsonSchema;
++import static org.mockserver.model.XPathBody.xpath;
++import static org.mockserver.model.XmlBody.xml;
++
++/**
++ * Bodies matched by XPath, and XML bodies matched by a JSON schema, may carry a DOCTYPE with an internal subset;
++ * external entities and external DTDs in them are not loaded.
++ */
++public class StringToXmlDocumentParserExternalEntityTest {
++
++    private static final String SECRET = "XMLPARSERSECRET";
++    private static final String DOCTYPE_BODY = "<!DOCTYPE note [ <!ELEMENT note ANY> ]><note><to>Bob</to></note>";
++    private static final String DOCTYPE_ENTITY_BODY = "<!DOCTYPE note [ <!ENTITY b \"Bob\"> ]><note><to>&b;</to></note>";
++    private static final String JSON_SCHEMA = "{\"type\": \"object\", \"properties\": {\"to\": {\"enum\": [\"Bob\"]}}, \"required\": [\"to\"]}";
++    private static final AtomicInteger CONNECTIONS = new AtomicInteger();
++
++    private static File secret;
++    private static File dtd;
++    private static ServerSocket listener;
++    private static String http;
++
++    @BeforeClass
++    public static void createFilesAndListener() throws IOException {
++        secret = new File("target/xml-parser-entity-test/secret.txt").getCanonicalFile();
++        dtd = new File("target/xml-parser-entity-test/note.dtd").getCanonicalFile();
++        Files.createDirectories(secret.getParentFile().toPath());
++        Files.write(secret.toPath(), SECRET.getBytes(UTF_8));
++        Files.write(dtd.toPath(), ("<!ENTITY b \"" + SECRET + "\">").getBytes(UTF_8));
++        listener = new ServerSocket(0, 50, InetAddress.getLoopbackAddress());
++        http = "http://127.0.0.1:" + listener.getLocalPort();
++        Thread acceptor = new Thread(() -> {
++            while (!listener.isClosed()) {
++                try (Socket ignored = listener.accept()) {
++                    CONNECTIONS.incrementAndGet();
++                } catch (IOException e) {
++                    return;
++                }
++            }
++        });
++        acceptor.setDaemon(true);
++        acceptor.start();
++    }
++
++    @AfterClass
++    public static void stopListener() throws IOException {
++        listener.close();
++    }
++
++    @Test
++    public void shouldExpandInternalEntity() throws Exception {
++        assertThat(text(DOCTYPE_ENTITY_BODY), is("Bob"));
++    }
++
++    @Test
++    public void shouldNotReadExternalEntity() throws Exception {
++        assertThat(text("<!DOCTYPE v [ <!ENTITY x SYSTEM \"" + secret.toURI() + "\"> ]><v>&x;</v>"), not(containsString(SECRET)));
++        assertThat(text("<!DOCTYPE v [ <!ENTITY x SYSTEM \"target/xml-parser-entity-test/secret.txt\"> ]><v>&x;</v>"), not(containsString(SECRET)));
++    }
++
++    @Test
++    public void shouldNotLoadExternalDtdOrParameterEntity() {
++        // the entity b is declared only in the external file; the document is refused or parsed without it
++        assertThat(textOrRefusal("<!DOCTYPE note SYSTEM \"" + dtd.toURI() + "\"><note>&b;</note>"), not(containsString(SECRET)));
++        assertThat(textOrRefusal("<!DOCTYPE note [ <!ENTITY % p SYSTEM \"" + dtd.toURI() + "\"> %p; ]><note>&b;</note>"), not(containsString(SECRET)));
++    }
++
++    @Test
++    public void shouldNotConnectForExternalEntityDtdOrParameterEntity() throws Exception {
++        String[] bodies = {
++            "<!DOCTYPE v [ <!ENTITY x SYSTEM \"" + http + "/e\"> ]><v>&x;</v>",
++            "<!DOCTYPE v SYSTEM \"" + http + "/d.dtd\"><v>x</v>",
++            "<!DOCTYPE v [ <!ENTITY % p SYSTEM \"" + http + "/p\"> %p; ]><v>x</v>"
++        };
++        for (String body : bodies) {
++            CONNECTIONS.set(0);
++            try {
++                text(body);
++            } catch (Exception ignore) {
++                // a refused document is also an acceptable outcome
++            }
++            Thread.sleep(300);
++            assertThat(body, CONNECTIONS.get(), is(0));
++        }
++    }
++
++    @Test
++    public void shouldMatchXpathForBodyWithDoctype() {
++        assertThat(matches(xpath("/note[to='Bob']"), DOCTYPE_BODY), is(true));
++        assertThat(matches(xpath("/note[to='Bob']"), DOCTYPE_ENTITY_BODY), is(true));
++        // the external DTD is not loaded, the rest of the document still matches
++        assertThat(matches(xpath("/note[to='Bob']"), "<!DOCTYPE note SYSTEM \"" + dtd.toURI() + "\"><note><to>Bob</to></note>"), is(true));
++    }
++
++    @Test
++    public void shouldNotMatchXpathOrXmlOnExternalEntityContent() throws Exception {
++        String body = "<?xml version=\"1.0\"?><!DOCTYPE v [ <!ENTITY x SYSTEM \"" + secret.toURI() + "\"> ]><v>&x;</v>";
++        assertThat(matches(xpath("/v[text()='" + SECRET + "']"), body), is(false));
++        assertThat(matches(xml("<v>" + SECRET + "</v>"), body), is(false));
++        CONNECTIONS.set(0);
++        matches(xpath("/note"), "<?xml version=\"1.0\"?><!DOCTYPE note [ <!ENTITY x SYSTEM \"" + http + "/p\"> ]><note>&x;</note>");
++        Thread.sleep(300);
++        assertThat(CONNECTIONS.get(), is(0));
++    }
++
++    @Test
++    public void shouldMatchJsonSchemaForXmlBody() {
++        assertThat(matches(jsonSchema(JSON_SCHEMA), "<note><to>Bob</to></note>", "application/xml"), is(true));
++        // as on the line head: the decoder converts the first child node, which is the DOCTYPE, so this does not match
++        assertThat(matches(jsonSchema(JSON_SCHEMA), DOCTYPE_BODY, "application/xml"), is(false));
++    }
++
++    private static String text(String body) throws Exception {
++        return new StringToXmlDocumentParser().buildDocument(body, (xml, exception, level) -> {
++        }, false).getDocumentElement().getTextContent();
++    }
++
++    private static String textOrRefusal(String body) {
++        try {
++            return text(body);
++        } catch (Exception e) {
++            return "refused: " + e.getMessage();
++        }
++    }
++
++    private static boolean matches(Body<?> body, String requestBody) {
++        return matches(body, requestBody, null);
++    }
++
++    private static boolean matches(Body<?> body, String requestBody, String contentType) {
++        HttpState httpState = new HttpState(configuration(), new MockServerLogger(), mock(Scheduler.class));
++        String json = new ExpectationSerializer(new MockServerLogger()).serialize(new Expectation(request("/probe").withBody(body)).thenRespond(response("ok")));
++        httpState.handle(request("/mockserver/expectation").withMethod("PUT").withBody(json), new ResponseWriter(configuration(), new MockServerLogger()) {
++            @Override
++            public void sendResponse(HttpRequest request, HttpResponse response) {
++            }
++        }, false);
++        HttpRequest request = request("/probe").withBody(requestBody);
++        if (contentType != null) {
++            request.withHeader("Content-Type", contentType);
++        }
++        return httpState.firstMatchingExpectation(request) != null;
++    }
++}
+-- 
+2.55.0
+

@@ -1,0 +1,415 @@
+From 204644a26891b2ea89ee7f7a322073e3bf754224 Mon Sep 17 00:00:00 2001
+From: Vuln Patch Pipeline <vuln-patch@chainguard.dev>
+Date: Mon, 9 Nov 2026 17:07:19 -0700
+Subject: [PATCH] Require a signed JWT for token pre-authentication over HTTPS
+
+TokenPreauth.verify() guarded its signature check with
+"if (!tokenDecoder.isSigned() && !kdcRequest.isHttps())". For a request
+marked as HTTPS the check was skipped, so a forged, unsigned alg=none
+JWT, or an encrypted JWT wrapping unsigned claims, carrying an arbitrary
+subject was accepted, the token was set on the request, and the KDC
+would issue a ticket for the named principal (CWE-347, related CWE-287
+and CWE-345). TLS on the transport does not prove the client's identity
+and must not stand in for a verified token signature.
+
+The isHttps() term is removed, so a token that is not signed is refused
+with "Token should be signed." on every request. The token decoder, key
+loading, the HTTPS and armor-key decoding of PA-TOKEN-REQUEST, the
+issuer and audience checks, and requests not marked as HTTPS are
+unchanged. Signed tokens from a configured issuer are still accepted.
+HAS hands the KDC HTTPS-marked requests carrying unsigned tokens, so
+those now fail until the tokens are signed.
+
+Adds TokenPreauthHttpsSignatureBypassTest, which drives a real
+TokenPreauth and KdcContext with an HTTPS-marked request and asserts
+that an unsigned PlainJWT and an EncryptedJWT wrapping unsigned claims
+are refused before any token is attached, and that an RSA-signed JWT
+still authenticates with its subject attached.
+
+Cgp-Finding: CGP-3x2p-3qw2-2ghh
+---
+ .../TokenPreauthHttpsSignatureBypassTest.java | 355 ++++++++++++++++++
+ .../server/preauth/token/TokenPreauth.java    |   5 +-
+ 2 files changed, 359 insertions(+), 1 deletion(-)
+ create mode 100644 kerby-kerb/integration-test/src/test/java/org/apache/kerby/kerberos/kerb/integration/test/TokenPreauthHttpsSignatureBypassTest.java
+
+diff --git a/kerby-kerb/integration-test/src/test/java/org/apache/kerby/kerberos/kerb/integration/test/TokenPreauthHttpsSignatureBypassTest.java b/kerby-kerb/integration-test/src/test/java/org/apache/kerby/kerberos/kerb/integration/test/TokenPreauthHttpsSignatureBypassTest.java
+new file mode 100644
+index 00000000..49a6be65
+--- /dev/null
++++ b/kerby-kerb/integration-test/src/test/java/org/apache/kerby/kerberos/kerb/integration/test/TokenPreauthHttpsSignatureBypassTest.java
+@@ -0,0 +1,355 @@
++/**
++ *  Licensed to the Apache Software Foundation (ASF) under one
++ *  or more contributor license agreements.  See the NOTICE file
++ *  distributed with this work for additional information
++ *  regarding copyright ownership.  The ASF licenses this file
++ *  to you under the Apache License, Version 2.0 (the
++ *  "License"); you may not use this file except in compliance
++ *  with the License.  You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ *  Unless required by applicable law or agreed to in writing,
++ *  software distributed under the License is distributed on an
++ *  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ *  KIND, either express or implied.  See the License for the
++ *  specific language governing permissions and limitations
++ *  under the License.
++ *
++ */
++package org.apache.kerby.kerberos.kerb.integration.test;
++
++import com.nimbusds.jose.EncryptionMethod;
++import com.nimbusds.jose.JWEAlgorithm;
++
++import org.apache.kerby.kerberos.kerb.KrbCodec;
++import org.apache.kerby.kerberos.kerb.KrbException;
++import org.apache.kerby.kerberos.kerb.KrbRuntime;
++import org.apache.kerby.kerberos.kerb.identity.backend.BackendConfig;
++import org.apache.kerby.kerberos.kerb.preauth.PluginRequestContext;
++import org.apache.kerby.kerberos.kerb.provider.TokenEncoder;
++import org.apache.kerby.kerberos.kerb.server.KdcConfig;
++import org.apache.kerby.kerberos.kerb.server.KdcConfigKey;
++import org.apache.kerby.kerberos.kerb.server.KdcContext;
++import org.apache.kerby.kerberos.kerb.server.KdcSetting;
++import org.apache.kerby.kerberos.kerb.server.preauth.PreauthHandler;
++import org.apache.kerby.kerberos.kerb.server.preauth.token.TokenPreauth;
++import org.apache.kerby.kerberos.kerb.server.request.KdcRequest;
++import org.apache.kerby.kerberos.kerb.type.base.AuthToken;
++import org.apache.kerby.kerberos.kerb.type.base.KrbTokenBase;
++import org.apache.kerby.kerberos.kerb.type.base.NameType;
++import org.apache.kerby.kerberos.kerb.type.base.PrincipalName;
++import org.apache.kerby.kerberos.kerb.type.base.TokenFormat;
++import org.apache.kerby.kerberos.kerb.type.kdc.AsReq;
++import org.apache.kerby.kerberos.kerb.type.kdc.KdcReqBody;
++import org.apache.kerby.kerberos.kerb.type.pa.PaDataEntry;
++import org.apache.kerby.kerberos.kerb.type.pa.PaDataType;
++import org.apache.kerby.kerberos.kerb.type.pa.token.PaTokenRequest;
++import org.apache.kerby.kerberos.kerb.type.pa.token.TokenInfo;
++import org.junit.Test;
++
++import java.io.File;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.security.KeyPair;
++import java.security.KeyPairGenerator;
++import java.util.ArrayList;
++import java.util.Base64;
++import java.util.Date;
++import java.util.List;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertNotNull;
++import static org.junit.Assert.assertTrue;
++import static org.junit.Assert.fail;
++
++/**
++ * Regression test for CGP-3x2p-3qw2-2ghh (CWE-347, related CWE-287 / CWE-345): TokenPreauth in
++ * kerb-server skipped JWT signature verification when the request arrived over HTTPS.
++ *
++ * <p>On the unpatched build the sink (kerb-server/.../preauth/token/TokenPreauth.java) read:
++ * <pre>
++ *   authToken = tokenDecoder.decodeFromBytes(token.getTokenValue());
++ *   if (!tokenDecoder.isSigned() &amp;&amp; !kdcRequest.isHttps()) {
++ *       throw new KrbException("Token should be signed.");
++ *   }
++ *   ...
++ *   kdcRequest.setToken(authToken);   // attacker-controlled AuthToken attached to the request
++ *   return true;                      // authentication SUCCESS for the forged subject
++ * </pre>
++ *
++ * <p>The {@code && !kdcRequest.isHttps()} conjunct meant the "Token should be signed." guard was
++ * SKIPPED whenever {@code isHttps()} was true. An attacker who reached the HTTPS KDC endpoint could
++ * therefore present an UNSIGNED (alg:none) JWT with an arbitrary {@code sub} and have it accepted
++ * as proof of identity, obtaining a TGT for any principal whose issuer is configured. This test
++ * ships with the fix, which removes that conjunct.
++ *
++ * <p>Security invariant: {@code verify()} must never return true and attach the token unless
++ * {@code tokenDecoder.isSigned() == true}, INDEPENDENT of {@code isHttps()} and INDEPENDENT of
++ * which decode branch produced the AuthToken. Each attack test treats the harmful effect
++ * (verify() returned true AND the forged subject is attached) as a FAILURE, so it fails against
++ * the unpatched guard and passes once the guard fires on {@code !isSigned()} alone.
++ *
++ * <p>Two attack routes are exercised:
++ * <ul>
++ *   <li>{@link #unsignedPlainJwtOverHttpsIsRejected()}: a top-level PlainJWT
++ *       (no signature at all), {@code isSigned()==false}.</li>
++ *   <li>{@link #encryptedJwtWrappingUnsignedClaimsOverHttpsIsRejected()}: an EncryptedJWT whose
++ *       decrypted payload is a plain (unsigned) claims set, decrypted with a configured RSA
++ *       decryption key, {@code toSignedJWT()==null} so {@code isSigned()==false}.</li>
++ * </ul>
++ * A positive control ({@link #genuinelySignedJwtOverHttpsStillAuthenticates()}) proves the fix does
++ * NOT reject a validly signed token over HTTPS.
++ */
++public class TokenPreauthHttpsSignatureBypassTest {
++
++    private static final String ISSUER = "token-service";
++    private static final String REALM = "EXAMPLE.COM";
++    // The server principal (audience) the forged token targets. Matches serverPrincipal.getName().
++    private static final String SERVER_PRINCIPAL = "krbtgt/" + REALM + "@" + REALM;
++    private static final String ATTACKER_SUBJECT = "attacker-admin";
++    private static final String LEGIT_SUBJECT = "legit-user";
++
++    /** Minimal concrete KdcRequest for driving TokenPreauth.verify() through its real runtime path. */
++    private static final class TestKdcRequest extends KdcRequest {
++        TestKdcRequest(org.apache.kerby.kerberos.kerb.type.kdc.KdcReq kdcReq, KdcContext kdcContext) {
++            super(kdcReq, kdcContext);
++        }
++
++        @Override
++        protected void makeReply() throws KrbException {
++            throw new UnsupportedOperationException("not used by this harness");
++        }
++
++        @Override
++        protected void checkClient() throws KrbException {
++            throw new UnsupportedOperationException("not used by this harness");
++        }
++
++        @Override
++        protected void issueTicket() throws KrbException {
++            throw new UnsupportedOperationException("not used by this harness");
++        }
++
++        /** Expose the protected attached token so the harness can measure the harmful effect. */
++        AuthToken attachedToken() {
++            return getToken();
++        }
++    }
++
++    private KdcContext newKdcContext(KdcConfig kdcConfig) {
++        PreauthHandler preauthHandler = new PreauthHandler();
++        preauthHandler.init();
++        KdcSetting kdcSetting = new KdcSetting(kdcConfig, new BackendConfig());
++        KdcContext kdcContext = new KdcContext(kdcSetting);
++        kdcContext.setPreauthHandler(preauthHandler);
++        return kdcContext;
++    }
++
++    private TestKdcRequest newTokenKdcRequest(KdcConfig kdcConfig, byte[] paTokenRequestBytes) {
++        AsReq asReq = new AsReq();
++        KdcReqBody reqBody = new KdcReqBody();
++        reqBody.setRealm(REALM);
++        reqBody.setSname(new PrincipalName("krbtgt/" + REALM, NameType.NT_SRV_INST));
++        asReq.setReqBody(reqBody);
++
++        PaDataEntry paDataEntry = new PaDataEntry(PaDataType.TOKEN_REQUEST, paTokenRequestBytes);
++        asReq.addPaData(paDataEntry);
++
++        TestKdcRequest kdcRequest = new TestKdcRequest(asReq, newKdcContext(kdcConfig));
++        // The vulnerable route: the request arrives over the HTTPS KDC transport.
++        kdcRequest.setHttps(true);
++        return kdcRequest;
++    }
++
++    private AuthToken newClaims(String subject) {
++        AuthToken authToken = KrbRuntime.getTokenProvider("JWT").createTokenFactory().createToken();
++        authToken.setIssuer(ISSUER);
++        authToken.setSubject(subject);
++
++        List<String> aud = new ArrayList<>();
++        aud.add(SERVER_PRINCIPAL);
++        authToken.setAudiences(aud);
++
++        Date now = new Date();
++        authToken.setExpirationTime(new Date(now.getTime() + 1000 * 60 * 60));
++        authToken.setNotBeforeTime(now);
++        authToken.setIssueTime(now);
++        return authToken;
++    }
++
++    /** Encode a PA-TOKEN-REQUEST carrying the given JWT value, as it arrives on the wire. */
++    private byte[] buildPaTokenRequestBytes(byte[] tokenValue) throws Exception {
++        KrbTokenBase krbToken = new KrbTokenBase();
++        krbToken.setTokenFormat(TokenFormat.JWT);
++        krbToken.setTokenValue(tokenValue);
++
++        TokenInfo tokenInfo = new TokenInfo();
++        tokenInfo.setTokenVendor(ISSUER);
++
++        PaTokenRequest paTokenRequest = new PaTokenRequest();
++        paTokenRequest.setToken(krbToken);
++        paTokenRequest.setTokenInfo(tokenInfo);
++
++        return KrbCodec.encode(paTokenRequest);
++    }
++
++    private KdcConfig baseConfig() {
++        KdcConfig kdcConfig = new KdcConfig();
++        kdcConfig.setBoolean(KdcConfigKey.ALLOW_TOKEN_PREAUTH, true);
++        kdcConfig.setString(KdcConfigKey.TOKEN_ISSUERS, ISSUER);
++        return kdcConfig;
++    }
++
++    private static KeyPair rsaKeyPair() throws Exception {
++        KeyPairGenerator kpg = KeyPairGenerator.getInstance("RSA");
++        kpg.initialize(2048);
++        return kpg.generateKeyPair();
++    }
++
++    /** Write an X.509 (SubjectPublicKeyInfo) PEM the KDC's PublicKeyReader can load as a verify key. */
++    private static String writePublicKeyPem(java.security.PublicKey key) throws Exception {
++        String b64 = Base64.getEncoder().encodeToString(key.getEncoded());
++        File f = Files.createTempFile("tp-verify", ".pem").toFile();
++        f.deleteOnExit();
++        Files.write(f.toPath(),
++            ("-----BEGIN PUBLIC KEY-----\n" + b64 + "\n-----END PUBLIC KEY-----\n")
++                .getBytes(StandardCharsets.UTF_8));
++        return f.getAbsolutePath();
++    }
++
++    /** Write a PKCS8 PEM the KDC's PrivateKeyReader can load as a decryption key. */
++    private static String writePrivateKeyPem(java.security.PrivateKey key) throws Exception {
++        String b64 = Base64.getEncoder().encodeToString(key.getEncoded());
++        File f = Files.createTempFile("tp-decrypt", ".pem").toFile();
++        f.deleteOnExit();
++        Files.write(f.toPath(),
++            ("-----BEGIN " + "PRIVATE KEY-----\n" + b64 + "\n-----END " + "PRIVATE KEY-----\n")
++                .getBytes(StandardCharsets.UTF_8));
++        return f.getAbsolutePath();
++    }
++
++    /**
++     * Drive the real TokenPreauth.verify() with a forged token and assert the CWE-347 invariant:
++     * verify() must throw a KrbException (fail closed) BEFORE it attaches the token — i.e. no
++     * attacker-controlled AuthToken may reach kdcRequest.setToken(). On the UNPATCHED build verify()
++     * instead returns true and attaches the forged subject, which this method reports as a failure
++     * (the concrete harmful effect).
++     */
++    private void assertForgedTokenRejected(KdcConfig kdcConfig, byte[] tokenValue, String route)
++        throws Exception {
++        byte[] paBytes = buildPaTokenRequestBytes(tokenValue);
++        TestKdcRequest kdcRequest = newTokenKdcRequest(kdcConfig, paBytes);
++
++        TokenPreauth tokenPreauth = new TokenPreauth();
++        PaDataEntry paData = kdcRequest.getKdcReq().getPaData().getElements().get(0);
++        PluginRequestContext requestContext = null;
++
++        boolean verified;
++        try {
++            verified = tokenPreauth.verify(kdcRequest, requestContext, paData);
++        } catch (KrbException e) {
++            // Fail-closed: the unsigned/forged token was refused before it could authenticate.
++            // This is the behavior the fix produces. Confirm nothing was attached.
++            assertTrue("(" + route + ") a rejected request must not have attached a token",
++                kdcRequest.attachedToken() == null);
++            return;
++        }
++
++        // No KrbException was raised. Measure the concrete harm: a forged UNSIGNED token was accepted
++        // and the attacker-chosen subject is now the authenticated identity the KDC will issue a TGT for.
++        AuthToken attached = kdcRequest.attachedToken();
++        if (verified && attached != null && ATTACKER_SUBJECT.equals(attached.getSubject())) {
++            fail("HTTPS SIGNATURE-CHECK BYPASS (" + route + "): TokenPreauth.verify() returned true and "
++                + "attached a forged UNSIGNED JWT over the HTTPS transport. The KDC would now issue a "
++                + "Kerberos TGT for attacker-chosen principal '" + attached.getSubject() + "'. "
++                + "Expected verify() to throw KrbException before setToken() because "
++                + "tokenDecoder.isSigned() was false (CWE-347).");
++        }
++        fail("HTTPS SIGNATURE-CHECK BYPASS (" + route + "): verify() did not fail closed for an "
++            + "unsigned token over HTTPS; returned=" + verified + ", attachedSubject="
++            + (attached == null ? "<none>" : attached.getSubject()) + ".");
++    }
++
++    // ---- Attack 1: unsigned PlainJWT over HTTPS ----------------------------------------------------
++    // No sign key and no encryption key on the encoder => a PlainJWT (alg:none). isSigned() stays
++    // false; over HTTPS the guard is skipped and the forged token authenticates on the vulnerable tree.
++    @Test
++    public void unsignedPlainJwtOverHttpsIsRejected() throws Exception {
++        TokenEncoder tokenEncoder = KrbRuntime.getTokenProvider("JWT").createTokenEncoder();
++        byte[] tokenValue = tokenEncoder.encodeAsBytes(newClaims(ATTACKER_SUBJECT));
++
++        // Sanity: the forged token really is an unsigned (alg:none) JWT (empty signature segment).
++        String tokenStr = new String(tokenValue, StandardCharsets.UTF_8);
++        String[] parts = tokenStr.split("\\.", -1);
++        assertTrue("expected an unsigned PlainJWT (header.payload.), got: " + tokenStr,
++            parts.length == 3 && parts[2].isEmpty());
++
++        assertForgedTokenRejected(baseConfig(), tokenValue, "PlainJWT / alg:none over HTTPS");
++    }
++
++    // ---- Attack 2: EncryptedJWT wrapping an UNSIGNED claims set ------------------------------------
++    // The attacker encrypts an unsigned claims set to the KDC's PUBLIC key (JWE encryption needs only
++    // the public/shared key, which is not secret). The KDC decrypts with its configured RSA private
++    // key; the decrypted payload is a plain claims set (toSignedJWT()==null) so isSigned() stays
++    // false. This pins the general isSigned() invariant, not just the PlainJWT shape.
++    @Test
++    public void encryptedJwtWrappingUnsignedClaimsOverHttpsIsRejected() throws Exception {
++        KeyPair encKeyPair = rsaKeyPair();
++
++        TokenEncoder tokenEncoder = KrbRuntime.getTokenProvider("JWT").createTokenEncoder();
++        // Only an encryption key set (no sign key) => JwtTokenEncoder emits an EncryptedJWT whose
++        // payload is the raw (unsigned) claims set, exactly the toSignedJWT()==null decode branch.
++        ((org.apache.kerby.kerberos.provider.token.JwtTokenEncoder) tokenEncoder)
++            .setEncryptionKey((java.security.interfaces.RSAPublicKey) encKeyPair.getPublic());
++        ((org.apache.kerby.kerberos.provider.token.JwtTokenEncoder) tokenEncoder)
++            .setJweAlgorithm(JWEAlgorithm.RSA_OAEP_256);
++        ((org.apache.kerby.kerberos.provider.token.JwtTokenEncoder) tokenEncoder)
++            .setEncryptionMethod(EncryptionMethod.A128GCM);
++        byte[] tokenValue = tokenEncoder.encodeAsBytes(newClaims(ATTACKER_SUBJECT));
++
++        // Sanity: the forged token is a 5-part JWE (JWE compact serialization has 5 segments).
++        String tokenStr = new String(tokenValue, StandardCharsets.UTF_8);
++        assertEquals("expected a JWE compact serialization (5 segments): " + tokenStr,
++            5, tokenStr.split("\\.", -1).length);
++
++        // The KDC is configured with the matching RSA private key so decryption succeeds; the
++        // signature check is the only thing standing between the forged claims and a TGT.
++        KdcConfig kdcConfig = baseConfig();
++        kdcConfig.setString(KdcConfigKey.TOKEN_DECRYPTION_KEYS,
++            writePrivateKeyPem(encKeyPair.getPrivate()));
++
++        assertForgedTokenRejected(kdcConfig, tokenValue, "EncryptedJWT wrapping unsigned claims over HTTPS");
++    }
++
++    // ---- Positive control (PRESERVATION): a genuinely signed JWT over HTTPS must still authenticate.
++    // A validly RS256-signed token whose verify key matches the KDC's configured TOKEN_VERIFY_KEYS
++    // must be ACCEPTED over HTTPS (isSigned()==true). This passes before and after the fix and
++    // guards against an over-broad fix that rejects legitimate signed tokens.
++    @Test
++    public void genuinelySignedJwtOverHttpsStillAuthenticates() throws Exception {
++        KeyPair signKeyPair = rsaKeyPair();
++
++        TokenEncoder tokenEncoder = KrbRuntime.getTokenProvider("JWT").createTokenEncoder();
++        ((org.apache.kerby.kerberos.provider.token.JwtTokenEncoder) tokenEncoder)
++            .setSignKey((java.security.interfaces.RSAPrivateKey) signKeyPair.getPrivate());
++        byte[] tokenValue = tokenEncoder.encodeAsBytes(newClaims(LEGIT_SUBJECT));
++
++        KdcConfig kdcConfig = baseConfig();
++        kdcConfig.setString(KdcConfigKey.TOKEN_VERIFY_KEYS,
++            writePublicKeyPem(signKeyPair.getPublic()));
++
++        byte[] paBytes = buildPaTokenRequestBytes(tokenValue);
++        TestKdcRequest kdcRequest = newTokenKdcRequest(kdcConfig, paBytes);
++        TokenPreauth tokenPreauth = new TokenPreauth();
++        PaDataEntry paData = kdcRequest.getKdcReq().getPaData().getElements().get(0);
++
++        boolean verified = tokenPreauth.verify(kdcRequest, null, paData);
++        assertTrue("a genuinely signed token over HTTPS must still authenticate (preservation)",
++            verified);
++        AuthToken attached = kdcRequest.attachedToken();
++        assertNotNull("the verified signed token must be attached", attached);
++        assertEquals("the authenticated subject must be the legitimate signed subject",
++            LEGIT_SUBJECT, attached.getSubject());
++    }
++}
+diff --git a/kerby-kerb/kerb-server/src/main/java/org/apache/kerby/kerberos/kerb/server/preauth/token/TokenPreauth.java b/kerby-kerb/kerb-server/src/main/java/org/apache/kerby/kerberos/kerb/server/preauth/token/TokenPreauth.java
+index 679011c1..75940849 100644
+--- a/kerby-kerb/kerb-server/src/main/java/org/apache/kerby/kerberos/kerb/server/preauth/token/TokenPreauth.java
++++ b/kerby-kerb/kerb-server/src/main/java/org/apache/kerby/kerberos/kerb/server/preauth/token/TokenPreauth.java
+@@ -97,7 +97,10 @@ public class TokenPreauth extends AbstractPreauthPlugin {
+             AuthToken authToken;
+             try {
+                 authToken = tokenDecoder.decodeFromBytes(token.getTokenValue());
+-                if (!tokenDecoder.isSigned() && !kdcRequest.isHttps()) {
++                // CGP-3x2p-3qw2-2ghh (CWE-347): the JWT signature requirement is enforced
++                // regardless of transport. TLS on the transport does not prove who the client
++                // claims to be, so a request marked as HTTPS must not skip this check.
++                if (!tokenDecoder.isSigned()) {
+                     throw new KrbException("Token should be signed.");
+                 }
+             } catch (IOException e) {
+-- 
+2.55.0
+

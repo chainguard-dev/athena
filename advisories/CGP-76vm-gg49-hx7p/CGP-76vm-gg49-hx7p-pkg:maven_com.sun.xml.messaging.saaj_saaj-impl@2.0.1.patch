@@ -1,0 +1,578 @@
+From 6649776502ac5769a07c1693e75c5af7b5206eb2 Mon Sep 17 00:00:00 2001
+From: Vuln Patch Pipeline <vuln-patch@chainguard.dev>
+Date: Fri, 25 Sep 2026 13:59:55 +0000
+Subject: [PATCH] Disable DTD processing in the lazy SOAP body StAX parser
+
+EnvelopeFactory.parseEnvelopeStax() parses the SOAP envelope when an
+application sets the saaj.lazy.soap.body property. It created its
+shared XMLInputFactory with XMLInputFactory.newInstance() and set no
+security properties, so a DOCTYPE in the envelope was processed. An
+external entity could read a local file or make the server fetch a
+URL, and nested internal entities could exhaust CPU and memory
+(CWE-611, CWE-776). The default SAX path already rejects any DOCTYPE
+with RejectDoctypeSaxFilter. The StAX path had no such guard.
+
+The factory now has SUPPORT_DTD and IS_SUPPORTING_EXTERNAL_ENTITIES set
+to false before it is stored in the static field. The parser no longer
+reads the declarations in a DOCTYPE, so it does not resolve external
+entities or expand internal ones. A reference to an entity declared in a
+DOCTYPE now fails the parse. Envelopes without a DOCTYPE, the default
+SAX path and readers passed in through a StAXSource are unchanged.
+
+Adds LazyStaxXXETest.
+
+Cgp-Finding: CGP-76vm-gg49-hx7p
+---
+ .../messaging/saaj/soap/EnvelopeFactory.java  |  20 +-
+ .../src/test/java/soap/LazyStaxXXETest.java   | 508 ++++++++++++++++++
+ 2 files changed, 527 insertions(+), 1 deletion(-)
+ create mode 100644 saaj-ri/src/test/java/soap/LazyStaxXXETest.java
+
+diff --git a/saaj-ri/src/main/java/com/sun/xml/messaging/saaj/soap/EnvelopeFactory.java b/saaj-ri/src/main/java/com/sun/xml/messaging/saaj/soap/EnvelopeFactory.java
+index df73696..b817fe7 100644
+--- a/saaj-ri/src/main/java/com/sun/xml/messaging/saaj/soap/EnvelopeFactory.java
++++ b/saaj-ri/src/main/java/com/sun/xml/messaging/saaj/soap/EnvelopeFactory.java
+@@ -115,7 +115,25 @@ public class EnvelopeFactory {
+         }
+         try {
+             if (streamReader == null) {
+-                if (xmlInputFactory == null) xmlInputFactory = XMLInputFactory.newInstance();
++                if (xmlInputFactory == null) {
++                    // Harden the shared StAX factory against XXE (CWE-611) and
++                    // entity-expansion DoS (CWE-776). A DOCTYPE is not legal content
++                    // in a SOAP envelope (the SAX path enforces this unconditionally
++                    // via RejectDoctypeSaxFilter), so refuse DOCTYPE declarations
++                    // outright rather than filtering entity URLs. SUPPORT_DTD=false is
++                    // the primary control: it rejects any DOCTYPE, closing external
++                    // file/SSRF entities AND internal entity-expansion (billion laughs)
++                    // in one move. IS_SUPPORTING_EXTERNAL_ENTITIES=false is
++                    // defense-in-depth for providers that still process a DTD subset.
++                    // The factory is fully configured locally and published to the
++                    // shared field only after configuration succeeds, so no unhardened
++                    // instance is ever cached. Any setProperty failure propagates via
++                    // the enclosing catch (rethrown as SOAPException) - never swallowed.
++                    XMLInputFactory factory = XMLInputFactory.newInstance();
++                    factory.setProperty(XMLInputFactory.SUPPORT_DTD, false);
++                    factory.setProperty(XMLInputFactory.IS_SUPPORTING_EXTERNAL_ENTITIES, false);
++                    xmlInputFactory = factory;
++                }
+                 streamReader = xmlInputFactory.createXMLStreamReader(src);
+             }
+ //            SaajStaxWriter saajWriter = new SaajStaxWriter(soapPart.message, soapPart.document);
+diff --git a/saaj-ri/src/test/java/soap/LazyStaxXXETest.java b/saaj-ri/src/test/java/soap/LazyStaxXXETest.java
+new file mode 100644
+index 0000000..fb67b4a
+--- /dev/null
++++ b/saaj-ri/src/test/java/soap/LazyStaxXXETest.java
+@@ -0,0 +1,508 @@
++/*
++ * Exploit harness for CGP-76vm-gg49-hx7p (CWE-611 / CWE-776):
++ * XXE / entity-expansion in the lazy StAX SOAP body path
++ * (EnvelopeFactory.parseEnvelopeStax -> XMLInputFactory.createXMLStreamReader).
++ *
++ * This test drives the REAL public entry point exactly as soap.LazySOAPTest does:
++ *   MessageFactory.newInstance().createMessage(headers, in)
++ *     -> msg.setProperty(MessageImpl.LAZY_SOAP_BODY_PARSING, "true")
++ *       -> msg.getSOAPPart().getEnvelope()  (triggers EnvelopeFactory.parseEnvelopeStax)
++ *
++ * It exercises the documented payloads verbatim over BOTH the documented plain-XML
++ * route AND the non-enumerated MIME-multipart (SOAP-with-attachments) route, which
++ * lands on the SAME cached xmlInputFactory chokepoint.
++ *
++ * Polarity: each test asserts the SECURITY PROPERTY (no DOCTYPE/entity may be
++ * processed). On the UNPATCHED build the harmful effect happens and the assertions
++ * FAIL (non-zero exit). Once SUPPORT_DTD=false is installed on the factory, parsing
++ * throws SOAPException, which each test treats as "this payload was refused" -> pass.
++ */
++package soap;
++
++import java.io.ByteArrayInputStream;
++import java.io.File;
++import java.io.FileWriter;
++import java.io.InputStream;
++import java.net.ServerSocket;
++import java.net.Socket;
++
++import jakarta.xml.soap.MessageFactory;
++import jakarta.xml.soap.MimeHeaders;
++import jakarta.xml.soap.SOAPBody;
++import jakarta.xml.soap.SOAPEnvelope;
++import jakarta.xml.soap.SOAPException;
++import jakarta.xml.soap.SOAPMessage;
++
++import com.sun.xml.messaging.saaj.soap.MessageImpl;
++
++import junit.framework.TestCase;
++
++public class LazyStaxXXETest extends TestCase {
++
++    // SOAP 1.1 namespace, matching the "text/xml" Content-Type the lazy StAX path uses.
++    private static final String SOAP_NS = "http://schemas.xmlsoap.org/soap/envelope/";
++
++    /* ------------------------------------------------------------------ *
++     * Helpers that reproduce LazySOAPTest's construction, per route.
++     * ------------------------------------------------------------------ */
++
++    /** Documented plain-XML route: text/xml SOAP message from an InputStream. */
++    private SOAPMessage lazyPlainMessage(String soapXml) throws Exception {
++        MimeHeaders headers = new MimeHeaders();
++        headers.addHeader("Content-Type", "text/xml");
++        InputStream in = new ByteArrayInputStream(soapXml.getBytes("UTF-8"));
++        SOAPMessage msg = MessageFactory.newInstance().createMessage(headers, in);
++        msg.setProperty(MessageImpl.LAZY_SOAP_BODY_PARSING, "true");
++        return msg;
++    }
++
++    /**
++     * Non-enumerated MIME-multipart (SOAP-with-attachments) route: the SOAP part
++     * bytes are carried inside a multipart/related body-part and reach the SAME
++     * StAX sink through MessageImpl's multipart branch
++     * (soapPart.setContent(new StreamSource(soapPartInputStream))).
++     */
++    private SOAPMessage lazyMultipartMessage(String soapXml) throws Exception {
++        String boundary = "----=_Part_XXE_0";
++        String cid = "<soap-part@saaj.test>";
++        StringBuilder mp = new StringBuilder();
++        mp.append("--").append(boundary).append("\r\n");
++        mp.append("Content-Type: text/xml; charset=UTF-8\r\n");
++        mp.append("Content-Transfer-Encoding: 8bit\r\n");
++        mp.append("Content-ID: ").append(cid).append("\r\n");
++        mp.append("\r\n");
++        mp.append(soapXml).append("\r\n");
++        mp.append("--").append(boundary).append("--\r\n");
++
++        MimeHeaders headers = new MimeHeaders();
++        headers.addHeader("Content-Type",
++                "multipart/related; type=\"text/xml\"; boundary=\"" + boundary
++                        + "\"; start=\"" + cid + "\"");
++        InputStream in = new ByteArrayInputStream(mp.toString().getBytes("UTF-8"));
++        SOAPMessage msg = MessageFactory.newInstance().createMessage(headers, in);
++        msg.setProperty(MessageImpl.LAZY_SOAP_BODY_PARSING, "true");
++        return msg;
++    }
++
++    /**
++     * Force full materialization of the (lazily parsed) SOAP body and return the
++     * serialized message text so the caller can look for leaked secrets.
++     *
++     * Serializing the message (writeTo) triggers the deferred StAX body parse (and
++     * thus entity resolution / expansion) and works regardless of body shape,
++     * including a raw-text body such as the documented "<S:Body>&xxe;</S:Body>".
++     * Any parse/serialize failure caused by the DTD being refused surfaces (wrapped)
++     * as a SOAPException, which callers treat as "this payload was refused".
++     */
++    private String materializeBodyText(SOAPMessage msg) throws Exception {
++        SOAPEnvelope env = msg.getSOAPPart().getEnvelope();
++        // Reference the body to kick off the lazy body bridge.
++        SOAPBody body = env.getBody();
++        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
++        try {
++            msg.writeTo(bos);
++        } catch (SOAPException e) {
++            throw e; // DTD refused -> propagate as the fix's exception
++        } catch (Exception e) {
++            // A serialize-time failure that is NOT the fix's refusal (e.g. the SAAJ
++            // bridge choking on an already-resolved raw-text body) still means the
++            // parser processed the DOCTYPE. Fall back to any DOM text we can reach so
++            // a leaked secret is still observable rather than masked as an error.
++            StringBuilder sb = new StringBuilder();
++            try { collectText(body, sb); } catch (Exception ignore) { }
++            if (sb.length() > 0) {
++                return sb.toString();
++            }
++            throw e;
++        }
++        return new String(bos.toByteArray(), "UTF-8");
++    }
++
++    private void collectText(org.w3c.dom.Node n, StringBuilder sb) {
++        if (n == null) {
++            return;
++        }
++        String v = n.getNodeValue();
++        if (v != null) {
++            sb.append(v);
++        }
++        org.w3c.dom.NodeList kids = n.getChildNodes();
++        for (int i = 0; kids != null && i < kids.getLength(); i++) {
++            collectText(kids.item(i), sb);
++        }
++    }
++
++    /* ------------------------------------------------------------------ *
++     * 1. External file read via DOCTYPE SYSTEM entity (documented payload).
++     * ------------------------------------------------------------------ */
++
++    public void testFileReadPlainRoute_documentedPayload() throws Exception {
++        // Documented payload, verbatim.
++        String payload =
++            "<!DOCTYPE foo [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]>"
++          + "<S:Envelope xmlns:S=\"http://schemas.xmlsoap.org/soap/envelope/\">"
++          + "<S:Body>&xxe;</S:Body></S:Envelope>";
++        assertFileReadBlocked(lazyPlainMessage(payload), "/etc/passwd", "root:");
++    }
++
++    public void testFileReadMultipartRoute_documentedPayload() throws Exception {
++        // Same documented payload, delivered through the non-enumerated multipart route.
++        String payload =
++            "<!DOCTYPE foo [<!ENTITY xxe SYSTEM \"file:///etc/passwd\">]>"
++          + "<S:Envelope xmlns:S=\"http://schemas.xmlsoap.org/soap/envelope/\">"
++          + "<S:Body>&xxe;</S:Body></S:Envelope>";
++        assertFileReadBlocked(lazyMultipartMessage(payload), "/etc/passwd", "root:");
++    }
++
++    /**
++     * Marker-file variant: unambiguous crisp observation of local file read via the
++     * DOCTYPE SYSTEM entity. The entity is placed inside a child element so the leaked
++     * bytes land in element text content regardless of body-child handling.
++     */
++    public void testFileReadPlainRoute_markerFile() throws Exception {
++        File secret = File.createTempFile("xxe-marker", ".txt");
++        secret.deleteOnExit();
++        final String marker = "TOP_SECRET_XXE_MARKER_9f3a2b";
++        FileWriter w = new FileWriter(secret);
++        try {
++            w.write(marker);
++        } finally {
++            w.close();
++        }
++        String uri = secret.toURI().toString(); // file:/...
++        String payload =
++            "<!DOCTYPE foo [<!ENTITY xxe SYSTEM \"" + uri + "\">]>"
++          + "<S:Envelope xmlns:S=\"" + SOAP_NS + "\">"
++          + "<S:Body><ns1:leak xmlns:ns1=\"urn:x\">&xxe;</ns1:leak></S:Body></S:Envelope>";
++        assertFileReadBlocked(lazyPlainMessage(payload), uri, marker);
++    }
++
++    public void testFileReadMultipartRoute_markerFile() throws Exception {
++        File secret = File.createTempFile("xxe-marker-mp", ".txt");
++        secret.deleteOnExit();
++        final String marker = "TOP_SECRET_XXE_MARKER_MP_5c7e";
++        FileWriter w = new FileWriter(secret);
++        try {
++            w.write(marker);
++        } finally {
++            w.close();
++        }
++        String uri = secret.toURI().toString();
++        String payload =
++            "<!DOCTYPE foo [<!ENTITY xxe SYSTEM \"" + uri + "\">]>"
++          + "<S:Envelope xmlns:S=\"" + SOAP_NS + "\">"
++          + "<S:Body><ns1:leak xmlns:ns1=\"urn:x\">&xxe;</ns1:leak></S:Body></S:Envelope>";
++        assertFileReadBlocked(lazyMultipartMessage(payload), uri, marker);
++    }
++
++    /**
++     * Drive the lazy StAX parse and force body materialization. If the DOCTYPE/entity
++     * were processed the secret appears in the parsed body -> harmful effect -> FAIL.
++     * A thrown SOAPException means the DOCTYPE was refused (the fix's behaviour) -> pass.
++     */
++    private void assertFileReadBlocked(SOAPMessage msg, String what, String secretNeedle)
++            throws Exception {
++        String bodyText;
++        try {
++            bodyText = materializeBodyText(msg);
++        } catch (SOAPException expected) {
++            // DOCTYPE refused at/after createXMLStreamReader -> vulnerability closed.
++            return;
++        }
++        assertFalse(
++            "XXE file read succeeded: contents of " + what
++                + " were resolved into the parsed SOAP body (leaked marker present)",
++            bodyText.contains(secretNeedle));
++        // A DOCTYPE-bearing document must NOT parse successfully at all.
++        fail("DOCTYPE-bearing SOAP envelope parsed without being rejected (file: " + what
++                + "); the lazy StAX path processed the DTD. Parsed body text=[" + bodyText + "]");
++    }
++
++    /* ------------------------------------------------------------------ *
++     * 2. SSRF via parameter-entity fetching (documented payload), zero-egress.
++     * ------------------------------------------------------------------ */
++
++    public void testSsrfParameterEntity_plainRoute() throws Exception {
++        assertNoOutboundFetch(false);
++    }
++
++    public void testSsrfParameterEntity_multipartRoute() throws Exception {
++        assertNoOutboundFetch(true);
++    }
++
++    /**
++     * Stand up a local loopback listener and point the parameter entity at it. If the
++     * unhardened parser fetches the external DTD, the listener records a connection ->
++     * harmful effect (SSRF) -> FAIL. If parsing throws (DOCTYPE refused) and no
++     * connection is recorded, the SSRF is closed -> pass. Zero-egress: we assert on
++     * the LOCAL listener, never on real network reachability.
++     */
++    private void assertNoOutboundFetch(boolean multipart) throws Exception {
++        final ServerSocket server = new ServerSocket(0, 1, java.net.InetAddress.getByName("127.0.0.1"));
++        server.setSoTimeout(4000);
++        final boolean[] connected = { false };
++        Thread acceptor = new Thread(new Runnable() {
++            public void run() {
++                try {
++                    Socket s = server.accept();
++                    connected[0] = true;
++                    // Respond with a trivial (harmless) external DTD so a fetching
++                    // parser proceeds far enough for the connection to count.
++                    try {
++                        byte[] req = new byte[512];
++                        s.getInputStream().read(req);
++                    } catch (Exception ignore) { }
++                    try {
++                        String dtd = "<!ENTITY exfil \"pwned\">";
++                        String http = "HTTP/1.1 200 OK\r\nContent-Type: application/xml-dtd\r\n"
++                                + "Content-Length: " + dtd.length() + "\r\n\r\n" + dtd;
++                        s.getOutputStream().write(http.getBytes("UTF-8"));
++                        s.getOutputStream().flush();
++                    } catch (Exception ignore) { }
++                    try { s.close(); } catch (Exception ignore) { }
++                } catch (Exception ignore) {
++                    // accept timed out -> no connection was made
++                }
++            }
++        });
++        acceptor.setDaemon(true);
++        acceptor.start();
++
++        int port = server.getLocalPort();
++        // Documented parameter-entity SSRF shape, pointed at our loopback listener.
++        String dtdUrl = "http://127.0.0.1:" + port + "/evil.dtd";
++        String payload =
++            "<!DOCTYPE foo [<!ENTITY % ext SYSTEM \"" + dtdUrl + "\"> %ext;]>"
++          + "<S:Envelope xmlns:S=\"" + SOAP_NS + "\">"
++          + "<S:Body><ns1:x xmlns:ns1=\"urn:x\">hi</ns1:x></S:Body></S:Envelope>";
++
++        SOAPMessage msg = multipart ? lazyMultipartMessage(payload) : lazyPlainMessage(payload);
++        // Drive the sink. Whether the parse throws is not the security property here:
++        // once the DOCTYPE is refused (SUPPORT_DTD=false) the parameter entity is simply
++        // ignored and the well-formed body parses fine WITHOUT any outbound request.
++        // The harmful effect is the OUTBOUND CONNECTION, so that is the only assertion.
++        try {
++            materializeBodyText(msg);
++        } catch (SOAPException ignore) {
++            // DOCTYPE refused -> also acceptable; either way, assert no connection below.
++        }
++        try { acceptor.join(4500); } catch (InterruptedException ignore) { }
++        try { server.close(); } catch (Exception ignore) { }
++
++        assertFalse("SSRF via parameter entity: the lazy StAX parser made an outbound "
++                + "connection to the attacker-controlled DTD URL " + dtdUrl
++                + " (multipart=" + multipart + ")", connected[0]);
++    }
++
++    /* ------------------------------------------------------------------ *
++     * 3. Billion-laughs entity-expansion DoS (documented payload), bounded.
++     * ------------------------------------------------------------------ */
++
++    public void testBillionLaughs_plainRoute() throws Exception {
++        assertBillionLaughsBlocked(false);
++    }
++
++    public void testBillionLaughs_multipartRoute() throws Exception {
++        assertBillionLaughsBlocked(true);
++    }
++
++    /**
++     * Feed the billion-laughs payload (internal entities only).
++     *
++     * Discriminator: the harmful effect for CWE-776 is that the parser PROCESSES the
++     * DOCTYPE and EXPANDS the internal entities. The JDK ships a default 64000
++     * entity-expansion cap, so an unhardened parser does not OOM here — instead it
++     * expands until the cap and reports "...encountered more than 64000 entity
++     * expansions...". THAT MESSAGE IS THE PROOF THE DTD WAS PROCESSED, so we FAIL on
++     * it (do NOT mistake the JDK cap for the fix). With SUPPORT_DTD=false the DTD is
++     * ignored entirely, so &lol9; is reported as an undeclared entity ("was referenced,
++     * but not declared") with NO expansion -> the DoS vector is closed -> pass.
++     *
++     * Bounded by a timeout thread so a hypothetical true OOM path is caught as a
++     * failure rather than hanging the suite.
++     */
++    private void assertBillionLaughsBlocked(final boolean multipart) throws Exception {
++        // Documented billion-laughs payload, verbatim (wrapped in a SOAP envelope so it
++        // travels the SOAP entry point; the entity is referenced inside the Body).
++        final String payload =
++            "<!DOCTYPE lolz [ "
++          + "<!ENTITY lol \"lol\"> "
++          + "<!ENTITY lol1 \"&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;\"> "
++          + "<!ENTITY lol2 \"&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;\"> "
++          + "<!ENTITY lol3 \"&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;\"> "
++          + "<!ENTITY lol4 \"&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;\"> "
++          + "<!ENTITY lol5 \"&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;&lol4;\"> "
++          + "<!ENTITY lol6 \"&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;&lol5;\"> "
++          + "<!ENTITY lol7 \"&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;&lol6;\"> "
++          + "<!ENTITY lol8 \"&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;&lol7;\"> "
++          + "<!ENTITY lol9 \"&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;&lol8;\"> "
++          + "]> "
++          + "<S:Envelope xmlns:S=\"" + SOAP_NS + "\">"
++          + "<S:Body><ns1:x xmlns:ns1=\"urn:x\">&lol9;</ns1:x></S:Body></S:Envelope>";
++
++        final String[] outcome = { null };   // serialized output if the parse completed
++        final Throwable[] err = { null };     // any thrown exception
++        Thread worker = new Thread(new Runnable() {
++            public void run() {
++                try {
++                    SOAPMessage msg = multipart ? lazyMultipartMessage(payload)
++                                                : lazyPlainMessage(payload);
++                    outcome[0] = materializeBodyText(msg);
++                } catch (Throwable t) {
++                    err[0] = t;
++                }
++            }
++        });
++        worker.setDaemon(true);
++        worker.start();
++        worker.join(20000);
++
++        if (worker.isAlive()) {
++            // Still expanding after the bound -> billion-laughs DoS is live.
++            fail("Billion-laughs entity expansion did not complete or reject within the "
++                    + "bound (multipart=" + multipart + "): the lazy StAX path is processing "
++                    + "the DTD and expanding internal entities (DoS).");
++        }
++        if (err[0] instanceof OutOfMemoryError) {
++            fail("Billion-laughs caused OutOfMemoryError (multipart=" + multipart + ").");
++        }
++
++        // Case 1: the parse completed and produced expanded output -> DTD processed.
++        if (outcome[0] != null && outcome[0].contains("lollollol")) {
++            fail("Billion-laughs internal entities were expanded into the parsed body "
++                    + "(multipart=" + multipart + "): the lazy StAX path processed the DTD.");
++        }
++        // Case 2: it threw. Inspect the whole cause chain. If any message shows entity
++        // expansion actually took place, the DTD was processed -> harmful effect.
++        String chain = messageChain(err[0]).toLowerCase();
++        if (chain.contains("entity expansion")) {
++            fail("Billion-laughs entity expansion occurred (JDK cap hit) — the lazy StAX "
++                    + "path PROCESSED the DOCTYPE and began expanding internal entities "
++                    + "(multipart=" + multipart + "): " + messageChain(err[0]));
++        }
++        // Reaching here means: no expansion happened. Either the DOCTYPE was refused
++        // outright (SUPPORT_DTD=false -> "entity ... was referenced, but not declared")
++        // or the parse otherwise did not expand. That is the remediated behaviour.
++        assertNotNull("Billion-laughs must be rejected once the DTD is refused "
++                + "(multipart=" + multipart + ")", err[0]);
++    }
++
++    /** Concatenate the message of a throwable and its entire cause chain. */
++    private String messageChain(Throwable t) {
++        StringBuilder sb = new StringBuilder();
++        int depth = 0;
++        while (t != null && depth < 12) {
++            sb.append(t.getClass().getName()).append(": ").append(t.getMessage()).append(" | ");
++            t = t.getCause();
++            depth++;
++        }
++        return sb.toString();
++    }
++
++    /* ------------------------------------------------------------------ *
++     * 3b. DOCTYPE processing / internal-entity expansion (CWE-776 core).
++     *     A crisp positive observation: an internal entity below the JDK cap is
++     *     expanded into the body. The DOCTYPE prohibition (SUPPORT_DTD=false) is
++     *     what closes this — external-entities-off alone does NOT, since this uses
++     *     only internal entities.
++     * ------------------------------------------------------------------ */
++
++    public void testInternalEntityExpansion_plainRoute() throws Exception {
++        assertDoctypeNotProcessed(false);
++    }
++
++    public void testInternalEntityExpansion_multipartRoute() throws Exception {
++        assertDoctypeNotProcessed(true);
++    }
++
++    private void assertDoctypeNotProcessed(boolean multipart) throws Exception {
++        final String marker = "HELLO_FROM_INTERNAL_ENTITY_" + (multipart ? "MP" : "PLAIN");
++        String payload =
++            "<!DOCTYPE foo [<!ENTITY greet \"" + marker + "\">]>"
++          + "<S:Envelope xmlns:S=\"" + SOAP_NS + "\">"
++          + "<S:Body><ns1:x xmlns:ns1=\"urn:x\">&greet;</ns1:x></S:Body></S:Envelope>";
++        SOAPMessage msg = multipart ? lazyMultipartMessage(payload) : lazyPlainMessage(payload);
++        String bodyText;
++        try {
++            bodyText = materializeBodyText(msg);
++        } catch (SOAPException expected) {
++            // DOCTYPE refused (SUPPORT_DTD=false) -> DTD not processed -> pass.
++            return;
++        }
++        assertFalse("DOCTYPE was processed: internal entity was expanded into the parsed "
++                + "SOAP body (multipart=" + multipart + "); SUPPORT_DTD is not disabled",
++                bodyText.contains(marker));
++        fail("DOCTYPE-bearing SOAP envelope parsed without being rejected (multipart="
++                + multipart + "); the lazy StAX path processed the DTD.");
++    }
++
++    /* ------------------------------------------------------------------ *
++     * Positive control: a legitimate DOCTYPE-free lazy SOAP message must still
++     * parse correctly through the SAME cached factory (must-not-break property).
++     * ------------------------------------------------------------------ */
++
++    public void testLegitimateLazyStillParses() throws Exception {
++        String soap =
++            "<S:Envelope xmlns:S=\"" + SOAP_NS + "\">"
++          + "<S:Header/>"
++          + "<S:Body><ns1:Hello xmlns:ns1=\"http://example.com/wsdl\">"
++          + "<String_1>Duke</String_1></ns1:Hello></S:Body></S:Envelope>";
++        String text = materializeBodyText(lazyPlainMessage(soap));
++        assertTrue("legitimate DOCTYPE-free lazy SOAP body must parse; got [" + text + "]",
++                text.contains("Duke"));
++    }
++
++    /**
++     * A legitimate, DOCTYPE-free lazy SOAP body delivered through the MIME-multipart
++     * (SOAP-with-attachments) route must still materialize correctly after the fix.
++     * This is the "legitimate caller on the widened surface" the fix must not break.
++     */
++    public void testLegitimateMultipartLazyStillParses() throws Exception {
++        String soap =
++            "<S:Envelope xmlns:S=\"" + SOAP_NS + "\">"
++          + "<S:Header/>"
++          + "<S:Body><ns1:Hello xmlns:ns1=\"http://example.com/wsdl\">"
++          + "<String_1>DukeMP</String_1></ns1:Hello></S:Body></S:Envelope>";
++        String text = materializeBodyText(lazyMultipartMessage(soap));
++        assertTrue("legitimate DOCTYPE-free multipart lazy SOAP body must parse; got ["
++                + text + "]", text.contains("DukeMP"));
++    }
++
++    /**
++     * The shared cached xmlInputFactory must stay hardened across reuse in the same
++     * JVM AND keep parsing legitimate input correctly. Parse a legitimate message,
++     * then a malicious DOCTYPE-bearing one (which must be refused), then a legitimate
++     * one again through the SAME cached factory. Proves the hardened configuration is
++     * not a one-shot on the first call and that hardening does not break subsequent
++     * legitimate parses (must-not-break: cached-instance reuse).
++     */
++    public void testCachedFactoryStaysHardenedAcrossReuse() throws Exception {
++        String legit1 =
++            "<S:Envelope xmlns:S=\"" + SOAP_NS + "\">"
++          + "<S:Body><ns1:x xmlns:ns1=\"urn:x\">BEFORE_ATTACK</ns1:x></S:Body></S:Envelope>";
++        assertTrue("legitimate parse before attack must succeed",
++                materializeBodyText(lazyPlainMessage(legit1)).contains("BEFORE_ATTACK"));
++
++        // A malicious DOCTYPE-bearing message must be refused: the internal entity must
++        // NOT be expanded into the parsed body (SUPPORT_DTD=false).
++        final String marker = "SHOULD_NOT_EXPAND_REUSE";
++        String attack =
++            "<!DOCTYPE foo [<!ENTITY greet \"" + marker + "\">]>"
++          + "<S:Envelope xmlns:S=\"" + SOAP_NS + "\">"
++          + "<S:Body><ns1:x xmlns:ns1=\"urn:x\">&greet;</ns1:x></S:Body></S:Envelope>";
++        try {
++            String attackText = materializeBodyText(lazyPlainMessage(attack));
++            assertFalse("cached factory must remain hardened: internal entity was expanded "
++                    + "on a reused factory", attackText.contains(marker));
++        } catch (SOAPException expected) {
++            // DOCTYPE refused -> also acceptable.
++        }
++
++        // The same cached factory must still parse legitimate input after the attack.
++        String legit2 =
++            "<S:Envelope xmlns:S=\"" + SOAP_NS + "\">"
++          + "<S:Body><ns1:x xmlns:ns1=\"urn:x\">AFTER_ATTACK</ns1:x></S:Body></S:Envelope>";
++        assertTrue("legitimate parse after attack must still succeed on the reused factory",
++                materializeBodyText(lazyPlainMessage(legit2)).contains("AFTER_ATTACK"));
++    }
++}
+-- 
+2.55.0
+

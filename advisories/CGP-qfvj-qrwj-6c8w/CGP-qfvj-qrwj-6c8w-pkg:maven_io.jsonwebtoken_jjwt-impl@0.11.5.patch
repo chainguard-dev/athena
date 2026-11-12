@@ -1,0 +1,571 @@
+From d3ea82ad2ba31249a9552efd00881167994aa155 Mon Sep 17 00:00:00 2001
+From: Vuln Patch Pipeline <vuln-patch@chainguard.dev>
+Date: Mon, 26 Oct 2026 17:12:25 +0000
+Subject: [PATCH] Refuse unsigned JWTs on parsers that hold a verification key
+
+DefaultJwtParser.parse(String) ran signature verification only when the
+compact token carried a signature segment. A token with an empty
+signature segment, such as "header.payload." or an alg:none header with a
+trailing dot, skipped verification. The parser then returned its claims
+as a plain Jwt even when a Key, key bytes or a SigningKeyResolver was
+configured (CWE-347). parse(String, JwtHandler), parseClaimsJwt and
+parsePlaintextJwt inherited the problem.
+
+parse(String) now throws UnsupportedJwtException for an unsigned token
+when the parser holds any verification material. The check runs before
+the resolver, claim validation, Jwt construction and any JwtHandler
+callback, and it does not read the token's alg header. Parsers without
+verification material and signed-token verification are unchanged.
+
+Adds UnsignedJwtWithVerificationKeyTest.
+
+Cgp-Finding: CGP-qfvj-qrwj-6c8w
+---
+ .../jsonwebtoken/impl/DefaultJwtParser.java   |  25 +
+ .../UnsignedJwtWithVerificationKeyTest.groovy | 491 ++++++++++++++++++
+ 2 files changed, 516 insertions(+)
+ create mode 100644 impl/src/test/groovy/io/jsonwebtoken/UnsignedJwtWithVerificationKeyTest.groovy
+
+diff --git a/impl/src/main/java/io/jsonwebtoken/impl/DefaultJwtParser.java b/impl/src/main/java/io/jsonwebtoken/impl/DefaultJwtParser.java
+index 1070acc..914b31f 100644
+--- a/impl/src/main/java/io/jsonwebtoken/impl/DefaultJwtParser.java
++++ b/impl/src/main/java/io/jsonwebtoken/impl/DefaultJwtParser.java
+@@ -315,6 +315,20 @@ public class DefaultJwtParser implements JwtParser {
+             claims = new DefaultClaims(claimsMap);
+         }
+ 
++        // =============== Unsigned token on a keyed parser =================
++        // CWE-347: a token without signature bytes (e.g. 'header.payload.' or an alg:none token with an empty
++        // third segment) would otherwise skip the signature block below entirely.  If this parser was given any
++        // verification material it must never return, validate or hand to a JwtHandler such an unverified token.
++        // The decision depends only on the absent signature and the parser's current key state, never on the
++        // token's declared 'alg' header.  It runs before any SigningKeyResolver call, exp/nbf and expected-claim
++        // validation, Jwt construction and JwtHandler callback, so every parse-family method funnels through it.
++        if (base64UrlEncodedDigest == null && hasVerificationMaterial()) {
++            String msg = claims != null ?
++                "Unsigned Claims JWTs are not supported." :
++                "Unsigned plaintext JWTs are not supported.";
++            throw new UnsupportedJwtException(msg);
++        }
++
+         // =============== Signature =================
+         if (base64UrlEncodedDigest != null) { //it is signed - validate the signature
+ 
+@@ -461,6 +475,17 @@ public class DefaultJwtParser implements JwtParser {
+         }
+     }
+ 
++    /**
++     * Returns {@code true} if this parser currently holds any signature verification material: a {@code Key},
++     * key bytes (including a zero-length array, e.g. a base64 key string that decodes to no bytes) or a
++     * {@link SigningKeyResolver}.  Read on every parse so that material set after construction is honored.
++     *
++     * @return whether a verification key, key bytes or a signing key resolver has been configured.
++     */
++    private boolean hasVerificationMaterial() {
++        return this.key != null || this.keyBytes != null || this.signingKeyResolver != null;
++    }
++
+     /**
+      * @since 0.10.0
+      */
+diff --git a/impl/src/test/groovy/io/jsonwebtoken/UnsignedJwtWithVerificationKeyTest.groovy b/impl/src/test/groovy/io/jsonwebtoken/UnsignedJwtWithVerificationKeyTest.groovy
+new file mode 100644
+index 0000000..507f0ab
+--- /dev/null
++++ b/impl/src/test/groovy/io/jsonwebtoken/UnsignedJwtWithVerificationKeyTest.groovy
+@@ -0,0 +1,491 @@
++/*
++ * Copyright (C) 2014 jsonwebtoken.io
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package io.jsonwebtoken
++
++import io.jsonwebtoken.io.Decoders
++import io.jsonwebtoken.io.Encoders
++import io.jsonwebtoken.lang.Strings
++import io.jsonwebtoken.security.Keys
++import io.jsonwebtoken.security.SignatureException
++import org.junit.Test
++
++import javax.crypto.SecretKey
++import java.security.Key
++import java.security.SecureRandom
++
++import static org.junit.Assert.*
++
++/**
++ * Regression tests for CGP-qfvj-qrwj-6c8w (CWE-347): a {@link JwtParser} that holds verification material (a
++ * {@code Key}, key bytes - including zero-length key bytes - or a {@link SigningKeyResolver}) must never accept a
++ * compact JWT whose signature segment is empty ({@code header.payload.}). Such a token must be refused with an
++ * {@link UnsupportedJwtException} before any claim validation, resolver call, Jwt construction or
++ * {@link JwtHandler} callback, on every parse overload and on both the legacy mutable parser
++ * ({@code Jwts.parser()}) and the builder-built parser ({@code Jwts.parserBuilder()...build()}).
++ *
++ * <p>Parsers without verification material keep parsing unsigned tokens, and signed-token behavior is unchanged
++ * (see the control tests at the end of this class).</p>
++ */
++class UnsignedJwtWithVerificationKeyTest {
++
++    private static final SecureRandom random = new SecureRandom() //doesn't need to be seeded - just testing
++
++    /** Documented payload from the advisory, verbatim: the literal placeholder form. */
++    static final String DOC_PLACEHOLDER = 'header.payload.'
++
++    /** Documented payload from the advisory, verbatim: {"alg":"none"}.{"sub":"admin","role":"superuser"}. */
++    static final String DOC_ALG_NONE_ADMIN = 'eyJhbGciOiJub25lIn0.eyJzdWIiOiJhZG1pbiIsInJvbGUiOiJzdXBlcnVzZXIifQ.'
++
++    static final String UNSIGNED_CLAIMS_MSG = 'Unsigned Claims JWTs are not supported.'
++
++    static final String UNSIGNED_PLAINTEXT_MSG = 'Unsigned plaintext JWTs are not supported.'
++
++    static final String FORGED_PLAINTEXT = 'forged plaintext: role=superuser'
++
++    protected static byte[] randomKey() {
++        //create random signing key for testing:
++        byte[] key = new byte[64]
++        random.nextBytes(key)
++        return key
++    }
++
++    protected static String base64Url(String s) {
++        byte[] bytes = s.getBytes(Strings.UTF_8)
++        return Encoders.BASE64URL.encode(bytes)
++    }
++
++    /** Removes the signature segment of a signed compact JWT, keeping the trailing period. */
++    protected static String stripSignature(String compact) {
++        return compact.substring(0, compact.lastIndexOf('.') + 1)
++    }
++
++    protected static String unsignedPlaintext() {
++        return Jwts.builder().setPayload(FORGED_PLAINTEXT).compact()
++    }
++
++    protected static String describe(Object returned) {
++        if (returned instanceof Jwt) {
++            Jwt jwt = (Jwt) returned
++            return "${returned.getClass().getSimpleName()}(header=${jwt.getHeader()}, body=${jwt.getBody()})".toString()
++        }
++        return String.valueOf(returned)
++    }
++
++    /**
++     * Asserts that {@code parseCall} refuses an unsigned token with {@link UnsupportedJwtException} carrying
++     * {@code expectedMessage}. A returned value (forged token accepted) or a claim-carrying exception (forged claims
++     * surfaced before the unsigned-token refusal) fails the test.
++     */
++    protected static void assertRefused(String label, String expectedMessage, Closure<?> parseCall,
++                                        Closure<String> evidence = { '' }) {
++        Object returned
++        try {
++            returned = parseCall.call()
++        } catch (UnsupportedJwtException expected) {
++            assertEquals("${label}: wrong refusal message".toString(), expectedMessage, expected.getMessage())
++            return
++        } catch (ClaimJwtException leaked) {
++            fail(("${label}: keyed parser acted on an UNVERIFIED token - its forged claims ${leaked.getClaims()} " +
++                    "surfaced via ${leaked.getClass().getSimpleName()} ('${leaked.getMessage()}') instead of an " +
++                    "unsigned-token refusal (CWE-347). ${evidence.call()}").toString())
++        }
++        fail(("${label}: keyed parser ACCEPTED an unsigned token and returned ${describe(returned)} " +
++                "(CWE-347 signature-verification bypass). ${evidence.call()}").toString())
++    }
++
++    protected static Map<String, JwtParser> keyParsers(Key key) {
++        return [
++                'Jwts.parser().setSigningKey(Key)'                : Jwts.parser().setSigningKey(key),
++                'Jwts.parserBuilder().setSigningKey(Key).build()' : Jwts.parserBuilder().setSigningKey(key).build()
++        ]
++    }
++
++    protected static Map<String, JwtParser> keyBytesParsers(byte[] bytes) {
++        String b64 = Encoders.BASE64.encode(bytes)
++        return [
++                'Jwts.parser().setSigningKey(byte[])'                : Jwts.parser().setSigningKey(bytes),
++                'Jwts.parserBuilder().setSigningKey(byte[]).build()' : Jwts.parserBuilder().setSigningKey(bytes).build(),
++                'Jwts.parser().setSigningKey(String)'                : Jwts.parser().setSigningKey(b64),
++                'Jwts.parserBuilder().setSigningKey(String).build()' : Jwts.parserBuilder().setSigningKey(b64).build()
++        ]
++    }
++
++    /** A resolver that records every invocation; it resolves to the supplied key. */
++    static class CountingResolver extends SigningKeyResolverAdapter {
++        final Key key
++        int calls = 0
++
++        CountingResolver(Key key) {
++            this.key = key
++        }
++
++        @Override
++        Key resolveSigningKey(JwsHeader header, Claims claims) {
++            calls++
++            return key
++        }
++
++        @Override
++        Key resolveSigningKey(JwsHeader header, String plaintext) {
++            calls++
++            return key
++        }
++    }
++
++    /** A handler that records every callback it receives. */
++    static class RecordingHandler extends JwtHandlerAdapter<Object> {
++        final List<String> calls = []
++
++        @Override
++        Object onPlaintextJwt(Jwt<Header, String> jwt) {
++            calls << 'onPlaintextJwt'
++            return jwt
++        }
++
++        @Override
++        Object onClaimsJwt(Jwt<Header, Claims> jwt) {
++            calls << 'onClaimsJwt'
++            return jwt
++        }
++
++        @Override
++        Object onPlaintextJws(Jws<String> jws) {
++            calls << 'onPlaintextJws'
++            return jws
++        }
++
++        @Override
++        Object onClaimsJws(Jws<Claims> jws) {
++            calls << 'onClaimsJws'
++            return jws
++        }
++    }
++
++    // ========================================================================
++    // Refusal tests: each FAILS on a parser that skips verification for unsigned tokens
++    // ========================================================================
++
++    /** Key-keyed parser, parse(String), documented payloads and a stripped-signature HS256 token. */
++    @Test
++    void testKeyParserRefusesUnsignedClaimsTokenViaParse() {
++        SecretKey key = Keys.secretKeyFor(SignatureAlgorithm.HS256)
++        String stripped = stripSignature(
++                Jwts.builder().setSubject('admin').claim('role', 'superuser').signWith(key).compact())
++
++        keyParsers(key).each { String name, JwtParser parser ->
++            // The literal placeholder is not valid base64url JSON; whatever the parser does it must never RETURN it.
++            try {
++                Object returned = parser.parse(DOC_PLACEHOLDER)
++                fail("${name}: '${DOC_PLACEHOLDER}' was accepted by a keyed parser: ${describe(returned)}".toString())
++            } catch (MalformedJwtException | UnsupportedJwtException refused) {
++                assertNotNull(refused.getMessage())
++            }
++
++            assertRefused("${name} parse(alg:none documented payload)".toString(), UNSIGNED_CLAIMS_MSG,
++                    { parser.parse(DOC_ALG_NONE_ADMIN) })
++            assertRefused("${name} parse(stripped HS256 token)".toString(), UNSIGNED_CLAIMS_MSG,
++                    { parser.parse(stripped) })
++        }
++
++        // I4: key material is read at parse time - a legacy parser keyed AFTER an earlier unkeyed parse.
++        JwtParser mutable = Jwts.parser()
++        assertEquals('admin', ((Claims) mutable.parse(DOC_ALG_NONE_ADMIN).getBody()).getSubject())
++        mutable.setSigningKey(key)
++        assertRefused('legacy parser keyed after a prior unkeyed parse', UNSIGNED_CLAIMS_MSG,
++                { mutable.parse(DOC_ALG_NONE_ADMIN) })
++    }
++
++    /** Key-bytes-keyed parser (byte[] and base64 String setters), parse(String), unsigned plaintext tokens. */
++    @Test
++    void testKeyBytesParserRefusesUnsignedPlaintextToken() {
++        byte[] bytes = randomKey()
++        String plaintext = unsignedPlaintext()
++        String stripped = stripSignature(
++                Jwts.builder().setPayload(FORGED_PLAINTEXT).signWith(Keys.hmacShaKeyFor(bytes)).compact())
++
++        keyBytesParsers(bytes).each { String name, JwtParser parser ->
++            assertRefused("${name} parse(alg:none plaintext)".toString(), UNSIGNED_PLAINTEXT_MSG,
++                    { parser.parse(plaintext) })
++            assertRefused("${name} parse(stripped HS512 plaintext)".toString(), UNSIGNED_PLAINTEXT_MSG,
++                    { parser.parse(stripped) })
++            assertRefused("${name} parse(alg:none documented payload)".toString(), UNSIGNED_CLAIMS_MSG,
++                    { parser.parse(DOC_ALG_NONE_ADMIN) })
++        }
++    }
++
++    /** Resolver-only parser: refused, and the resolver is never consulted for an unsigned token. */
++    @Test
++    void testResolverParserRefusesUnsignedTokenWithoutCallingResolver() {
++        SecretKey key = Keys.secretKeyFor(SignatureAlgorithm.HS256)
++        CountingResolver legacyResolver = new CountingResolver(key)
++        CountingResolver builderResolver = new CountingResolver(key)
++        Map<JwtParser, CountingResolver> parsers = new LinkedHashMap<>()
++        parsers.put(Jwts.parser().setSigningKeyResolver(legacyResolver), legacyResolver)
++        parsers.put(Jwts.parserBuilder().setSigningKeyResolver(builderResolver).build(), builderResolver)
++        String plaintext = unsignedPlaintext()
++
++        parsers.each { JwtParser parser, CountingResolver resolver ->
++            String name = "${parser.getClass().getSimpleName()} with SigningKeyResolver".toString()
++            assertRefused("${name} parse(alg:none documented payload)".toString(), UNSIGNED_CLAIMS_MSG,
++                    { parser.parse(DOC_ALG_NONE_ADMIN) }, { "resolver calls=${resolver.calls}".toString() })
++            assertRefused("${name} parse(alg:none plaintext)".toString(), UNSIGNED_PLAINTEXT_MSG,
++                    { parser.parse(plaintext) }, { "resolver calls=${resolver.calls}".toString() })
++            assertEquals("${name}: resolver must not be consulted for an unsigned token".toString(), 0,
++                    resolver.calls)
++        }
++    }
++
++    /** Zero-length key bytes (setSigningKey("A") decodes to an empty array) still count as verification material. */
++    @Test
++    void testZeroLengthKeyBytesCountAsVerificationMaterial() {
++        assertEquals('precondition: base64 "A" must decode to zero bytes', 0, Decoders.BASE64.decode('A').length)
++
++        Map<String, JwtParser> parsers = [
++                'Jwts.parser().setSigningKey("A")'                : Jwts.parser().setSigningKey('A'),
++                'Jwts.parserBuilder().setSigningKey("A").build()' : Jwts.parserBuilder().setSigningKey('A').build()
++        ]
++        String plaintext = unsignedPlaintext()
++
++        parsers.each { String name, JwtParser parser ->
++            assertRefused("${name} parse(alg:none documented payload)".toString(), UNSIGNED_CLAIMS_MSG,
++                    { parser.parse(DOC_ALG_NONE_ADMIN) })
++            assertRefused("${name} parse(alg:none plaintext)".toString(), UNSIGNED_PLAINTEXT_MSG,
++                    { parser.parse(plaintext) })
++        }
++    }
++
++    /** parse(String, JwtHandler): refused before any handler callback. */
++    @Test
++    void testParseWithHandlerRefusesUnsignedTokenWithoutInvokingHandler() {
++        SecretKey key = Keys.secretKeyFor(SignatureAlgorithm.HS256)
++        Map<String, JwtParser> parsers = new LinkedHashMap<>(keyParsers(key))
++        parsers.put('Jwts.parserBuilder().setSigningKeyResolver(..).build()',
++                Jwts.parserBuilder().setSigningKeyResolver(new CountingResolver(key)).build())
++        String plaintext = unsignedPlaintext()
++
++        parsers.each { String name, JwtParser parser ->
++            RecordingHandler claimsHandler = new RecordingHandler()
++            assertRefused("${name} parse(alg:none documented payload, handler)".toString(), UNSIGNED_CLAIMS_MSG,
++                    { parser.parse(DOC_ALG_NONE_ADMIN, claimsHandler) },
++                    { "handler callbacks=${claimsHandler.calls}".toString() })
++            assertEquals("${name}: handler must not be called".toString(), [], claimsHandler.calls)
++
++            RecordingHandler plaintextHandler = new RecordingHandler()
++            assertRefused("${name} parse(alg:none plaintext, handler)".toString(), UNSIGNED_PLAINTEXT_MSG,
++                    { parser.parse(plaintext, plaintextHandler) },
++                    { "handler callbacks=${plaintextHandler.calls}".toString() })
++            assertEquals("${name}: handler must not be called".toString(), [], plaintextHandler.calls)
++        }
++    }
++
++    /** parseClaimsJwt / parsePlaintextJwt on a keyed parser must not hand back an unverified Jwt. */
++    @Test
++    void testParseClaimsJwtAndParsePlaintextJwtRefuseUnsignedTokenOnKeyedParser() {
++        SecretKey key = Keys.secretKeyFor(SignatureAlgorithm.HS256)
++        byte[] bytes = randomKey()
++        Map<String, JwtParser> parsers = new LinkedHashMap<>(keyParsers(key))
++        parsers.put('Jwts.parserBuilder().setSigningKey(byte[]).build()',
++                Jwts.parserBuilder().setSigningKey(bytes).build())
++        String stripped = stripSignature(
++                Jwts.builder().setSubject('admin').claim('role', 'superuser').signWith(key).compact())
++        String plaintext = unsignedPlaintext()
++
++        parsers.each { String name, JwtParser parser ->
++            assertRefused("${name} parseClaimsJwt(alg:none documented payload)".toString(), UNSIGNED_CLAIMS_MSG,
++                    { parser.parseClaimsJwt(DOC_ALG_NONE_ADMIN) })
++            assertRefused("${name} parseClaimsJwt(stripped HS256 token)".toString(), UNSIGNED_CLAIMS_MSG,
++                    { parser.parseClaimsJwt(stripped) })
++            assertRefused("${name} parsePlaintextJwt(alg:none plaintext)".toString(), UNSIGNED_PLAINTEXT_MSG,
++                    { parser.parsePlaintextJwt(plaintext) })
++        }
++    }
++
++    /**
++     * Ordering: the unsigned-token refusal precedes exp/nbf and expected-claim validation, so a claim-carrying
++     * Expired/Premature/Missing/IncorrectClaim exception can never surface forged claims from a keyed parser.
++     */
++    @Test
++    void testUnsignedTokenRefusedBeforeClaimsValidation() {
++        SecretKey key = Keys.secretKeyFor(SignatureAlgorithm.HS256)
++        long now = System.currentTimeMillis()
++        String expired = Jwts.builder().setSubject('admin').claim('role', 'superuser')
++                .setExpiration(new Date(now - 60000)).compact()
++        String premature = Jwts.builder().setSubject('admin').claim('role', 'superuser')
++                .setNotBefore(new Date(now + 3600000)).compact()
++
++        keyParsers(key).each { String name, JwtParser parser ->
++            assertRefused("${name} parse(unsigned, exp in the past)".toString(), UNSIGNED_CLAIMS_MSG,
++                    { parser.parse(expired) })
++            assertRefused("${name} parse(unsigned, nbf in the future)".toString(), UNSIGNED_CLAIMS_MSG,
++                    { parser.parse(premature) })
++        }
++
++        JwtParser incorrect = Jwts.parserBuilder().setSigningKey(key).requireSubject('alice').build()
++        assertRefused('keyed parser requireSubject(alice) parse(unsigned sub=admin)', UNSIGNED_CLAIMS_MSG,
++                { incorrect.parse(DOC_ALG_NONE_ADMIN) })
++
++        JwtParser missing = Jwts.parser().setSigningKey(key).requireIssuer('trusted-issuer')
++        assertRefused('keyed parser requireIssuer(trusted-issuer) parse(unsigned, no iss)', UNSIGNED_CLAIMS_MSG,
++                { missing.parse(DOC_ALG_NONE_ADMIN) })
++
++        CountingResolver resolver = new CountingResolver(key)
++        JwtParser resolverParser = Jwts.parserBuilder().setSigningKeyResolver(resolver).build()
++        assertRefused('resolver parser parseClaimsJwt(unsigned, exp in the past)', UNSIGNED_CLAIMS_MSG,
++                { resolverParser.parseClaimsJwt(expired) }, { "resolver calls=${resolver.calls}".toString() })
++        assertEquals(0, resolver.calls)
++    }
++
++    // ========================================================================
++    // Controls: pass both before and after the fix
++    // ========================================================================
++
++    /** Parsers with no verification material keep parsing unsigned tokens exactly as before. */
++    @Test
++    void testUnkeyedParserStillParsesUnsignedTokens() {
++        String plaintext = unsignedPlaintext()
++        String emptyPayload = base64Url('{"alg":"none"}') + '..'
++        String expired = Jwts.builder().setSubject('admin').setExpiration(new Date(System.currentTimeMillis() - 60000)).compact()
++        String signed = Jwts.builder().setSubject('admin').signWith(Keys.secretKeyFor(SignatureAlgorithm.HS256)).compact()
++
++        Map<String, JwtParser> parsers = [
++                'Jwts.parser()'                : Jwts.parser(),
++                'Jwts.parserBuilder().build()' : Jwts.parserBuilder().build()
++        ]
++
++        parsers.each { String name, JwtParser parser ->
++            Jwt jwt = parser.parse(DOC_ALG_NONE_ADMIN)
++            assertFalse("${name}: unsigned token must yield a plain Jwt".toString(), jwt instanceof Jws)
++            Claims claims = (Claims) jwt.getBody()
++            assertEquals('admin', claims.getSubject())
++            assertEquals('superuser', claims.get('role'))
++            assertEquals('none', jwt.getHeader().get('alg'))
++
++            assertEquals('admin', parser.parseClaimsJwt(DOC_ALG_NONE_ADMIN).getBody().getSubject())
++            assertEquals(FORGED_PLAINTEXT, parser.parsePlaintextJwt(plaintext).getBody())
++            assertEquals('', parser.parse(emptyPayload).getBody())
++
++            RecordingHandler handler = new RecordingHandler()
++            parser.parse(DOC_ALG_NONE_ADMIN, handler)
++            assertEquals(['onClaimsJwt'], handler.calls)
++
++            try {
++                parser.parse(expired)
++                fail("${name}: expired unsigned token must still be rejected as expired".toString())
++            } catch (ExpiredJwtException e) {
++                assertTrue(e.getMessage().startsWith('JWT expired at '))
++            }
++
++            try {
++                parser.parse(signed)
++                fail("${name}: signed token on an unkeyed parser must still be rejected".toString())
++            } catch (IllegalArgumentException e) {
++                assertEquals('A signing key must be specified if the specified JWT is digitally signed.', e.getMessage())
++            }
++        }
++    }
++
++    /** Keyed parsers still verify genuinely signed tokens for every kind of verification material. */
++    @Test
++    void testKeyedParserStillVerifiesSignedTokens() {
++        SecretKey key = Keys.secretKeyFor(SignatureAlgorithm.HS256)
++        byte[] bytes = randomKey()
++        String keySigned = Jwts.builder().setSubject('alice').signWith(key).compact()
++        String bytesSigned = Jwts.builder().setSubject('alice').signWith(Keys.hmacShaKeyFor(bytes)).compact()
++
++        keyParsers(key).each { String name, JwtParser parser ->
++            Jwt jwt = parser.parse(keySigned)
++            assertTrue("${name}: signed token must yield a Jws".toString(), jwt instanceof Jws)
++            assertEquals('alice', ((Claims) jwt.getBody()).getSubject())
++            assertEquals('alice', parser.parseClaimsJws(keySigned).getBody().getSubject())
++        }
++
++        keyBytesParsers(bytes).each { String name, JwtParser parser ->
++            Jwt jwt = parser.parse(bytesSigned)
++            assertTrue("${name}: signed token must yield a Jws".toString(), jwt instanceof Jws)
++            assertEquals('alice', parser.parseClaimsJws(bytesSigned).getBody().getSubject())
++        }
++
++        CountingResolver resolver = new CountingResolver(key)
++        JwtParser resolverParser = Jwts.parserBuilder().setSigningKeyResolver(resolver).build()
++        Jws<Claims> jws = resolverParser.parseClaimsJws(keySigned)
++        assertEquals('alice', jws.getBody().getSubject())
++        assertEquals(1, resolver.calls)
++
++        String plainSigned = Jwts.builder().setPayload('hello').signWith(key).compact()
++        assertEquals('hello', Jwts.parserBuilder().setSigningKey(key).build().parsePlaintextJws(plainSigned).getBody())
++    }
++
++    /** Tampered, wrong-key and alg:none-with-signature tokens are still rejected with the existing types. */
++    @Test
++    void testTamperedWrongKeyAndAlgNoneSignedTokensStillRejected() {
++        SecretKey key = Keys.secretKeyFor(SignatureAlgorithm.HS256)
++        String signed = Jwts.builder().setSubject('alice').signWith(key).compact()
++        String[] parts = signed.split('\\.')
++        String tampered = parts[0] + '.' + base64Url('{"sub":"admin","role":"superuser"}') + '.' + parts[2]
++        String algNoneWithSig = DOC_ALG_NONE_ADMIN + parts[2]
++
++        keyParsers(key).each { String name, JwtParser parser ->
++            try {
++                parser.parse(tampered)
++                fail("${name}: tampered token must be rejected".toString())
++            } catch (SignatureException expected) {
++                assertEquals('JWT signature does not match locally computed signature. JWT validity cannot be ' +
++                        'asserted and should not be trusted.', expected.getMessage())
++            }
++
++            try {
++                parser.parse(algNoneWithSig)
++                fail("${name}: alg:none token with a signature must be rejected".toString())
++            } catch (MalformedJwtException expected) {
++                assertEquals('JWT string has a digest/signature, but the header does not reference a valid ' +
++                        'signature algorithm.', expected.getMessage())
++            }
++        }
++
++        try {
++            Jwts.parserBuilder().setSigningKey(Keys.secretKeyFor(SignatureAlgorithm.HS256)).build().parse(signed)
++            fail('token signed with a different key must be rejected')
++        } catch (SignatureException expected) {
++            assertNotNull(expected.getMessage())
++        }
++    }
++
++    /** The type-specific Jws overloads keep refusing unsigned tokens with the same type and wording. */
++    @Test
++    void testTypeSpecificJwsOverloadsKeepExistingUnsignedRefusal() {
++        SecretKey key = Keys.secretKeyFor(SignatureAlgorithm.HS256)
++        Map<String, JwtParser> parsers = new LinkedHashMap<>(keyParsers(key))
++        parsers.putAll(keyBytesParsers(randomKey()))
++        parsers.put('Jwts.parser().setSigningKeyResolver(..)', Jwts.parser().setSigningKeyResolver(new CountingResolver(key)))
++        String plaintext = unsignedPlaintext()
++
++        parsers.each { String name, JwtParser parser ->
++            try {
++                parser.parseClaimsJws(DOC_ALG_NONE_ADMIN)
++                fail("${name}: parseClaimsJws must refuse an unsigned token".toString())
++            } catch (UnsupportedJwtException expected) {
++                assertEquals(UNSIGNED_CLAIMS_MSG, expected.getMessage())
++            }
++
++            try {
++                parser.parsePlaintextJws(plaintext)
++                fail("${name}: parsePlaintextJws must refuse an unsigned token".toString())
++            } catch (UnsupportedJwtException expected) {
++                assertEquals(UNSIGNED_PLAINTEXT_MSG, expected.getMessage())
++            }
++        }
++    }
++}
+-- 
+2.55.0
+
